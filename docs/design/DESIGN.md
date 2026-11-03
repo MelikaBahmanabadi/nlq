@@ -103,25 +103,29 @@ policy / memory / default). Chart focus-vs-context is a **fourth**, narrow axis.
 
 ### 4.2 Palette (light)
 
-The product identity is **"Ember"**: a warm orange brand on warm paper in
-light mode, and on graphite in dark mode. Orange is an accent with intent —
-primary actions, active navigation, focus, data emphasis and key figures —
-never a background wash.
+The product identity is **"Aurora"**: a dark, instrument-grade analytics
+workspace — near-black navy ground, layered translucent surfaces, one
+electric blue for action and one cyan for data, soft ambient glow and
+generous radii. Dark is the default (see `web/js/state.js`'s `theme`), and
+`system` / `light` remain first-class choices in the account menu. Blue is
+an accent with intent — primary actions, active navigation, focus, chart
+strokes — never a background wash; the dark theme's cyan is reserved for
+data, icons and glows.
 
 | Token | Hex | Role |
 |---|---|---|
-| `--navy` | `#1c1917` | Strongest neutral surface, question bubbles |
-| `--navy-2` | `#292524` | Elevated neutral |
-| `--navy-3` | `#3b3531` | Neutral interactive |
-| `--teal` | `#c2410c` | Primary brand, primary action fill |
-| `--teal-d` | `#9a3412` | Brand hover / emphasis |
-| `--teal-l` | `#fdf1e7` | Brand soft fill |
-| `--bg` | `#faf8f5` | Page ground (warm paper) |
+| `--navy` | `#0b1526` | Strongest neutral surface, question bubbles |
+| `--navy-2` | `#16233a` | Elevated neutral |
+| `--navy-3` | `#22334e` | Neutral interactive |
+| `--teal` | `#2563eb` | Primary brand, primary action fill |
+| `--teal-d` | `#1d4ed8` | Brand hover / emphasis |
+| `--teal-l` | `#e8f0ff` | Brand soft fill |
+| `--bg` | `#f5f7fb` | Page ground (warm paper) |
 | `--card` | `#ffffff` | Surface |
-| `--card-2` | `#f6f2ec` | Nested surface |
-| `--border` | `#e8e1d7` | Hairline |
-| `--ink` | `#1a1714` | Body text |
-| `--muted` | `#6b655e` | Secondary text |
+| `--card-2` | `#f6f8fc` | Nested surface |
+| `--border` | `#e2e8f2` | Hairline |
+| `--ink` | `#0b1526` | Body text |
+| `--muted` | `#52627a` | Secondary text |
 
 `--navy`, `--teal` and `--teal-l` are retained as literal values because the
 existing stylesheets, the admin panel and the contrast tests resolve them by
@@ -129,13 +133,15 @@ name; new component code should use the semantic aliases (`--accent`,
 `--accent-bright`, `--surface`-style tokens) declared beside them.
 
 The ramp is **contrast-derived, not aesthetic**. `--teal` is the fill behind
-white button labels and measures 5.18:1 against `#ffffff` (WCAG 1.4.3's floor
-is 4.5 for a 15px bold label). `--muted` reaches 5.45:1 on `--bg` and 5.7:1 on
-`--card`. `--border-interactive` (`#8e867b`) marks a control boundary at 3.5:1
-(1.4.11). A brighter orange — `--accent-bright` `#ea580c` — exists for icons,
-strokes and emphasis on dark surfaces, never for small text on light ones.
-Restoring a brighter primary without re-checking those pairs reintroduces a
-failure `tests/web_ui/test_web_ui_contrast_and_failure.py` catches.
+white button labels and measures 5.17:1 against `#ffffff` (WCAG 1.4.3's floor
+is 4.5 for a 15px bold label). `--muted` reaches 5.78:1 on `--bg` and 6.2:1 on
+`--card`; in dark mode it reaches 7.05:1 on `--card`. `--border-interactive`
+(`#6b7a90` light, `#5b6b86` dark) marks a control boundary at 4.36:1 and
+3.42:1 (1.4.11's floor is 3:1). A brighter cyan — `--accent-bright`
+`#32c5ff` in dark, `#0ea5e9` in light — exists for icons, chart strokes and
+glows, never for small text on a light surface. Restoring a brighter primary
+without re-checking those pairs reintroduces a failure
+`tests/web_ui/test_web_ui_contrast_and_failure.py` catches.
 
 Status and source tokens stay as they are in `web/styles/tokens.css` (they
 are already correct), as do dark-mode values — copy from that file.
@@ -144,7 +150,7 @@ are already correct), as do dark-mode values — copy from that file.
 
 | Role | Family | Notes |
 |---|---|---|
-| UI / body | `Vazirmatn`, `Segoe UI`, Tahoma, sans-serif | Persian-first; self-hosted in `web/styles/fonts.css` |
+| UI / body | `Inter`, `Vazirmatn`, `Segoe UI`, Tahoma, sans-serif | Latin-first with Persian fallback per glyph; both self-hosted in `web/styles/fonts.css` |
 | Mono / SQL / ids | `Consolas`, `Cascadia Code`, monospace | Always `dir="ltr"` islands |
 | Marketing display | same stack as product | Site may keep a Latin display face **only** if it falls back cleanly and is self-hosted |
 
@@ -155,35 +161,35 @@ dependency"; a font request to Google is a brand lie.
 
 | Token | Size |
 |---|---|
-| `--fs-xs` | 11px |
-| `--fs-sm` | 12.5px |
+| `--fs-xs` | 11.5px |
+| `--fs-sm` | 13px |
 | `--fs-md` | 14px |
 | `--fs-lg` | 15px |
-| `--fs-xl` | 18px |
-| `--fs-2xl` | 22px |
-| `--radius` | 14px |
-| `--radius-sm` | 9px |
+| `--fs-xl` | 19px |
+| `--fs-2xl` | 24px |
+| `--radius` | 18px |
+| `--radius-sm` | 12px |
 | `--radius-pill` | 999px |
 
 Spacing uses a 4px base: 4 / 8 / 12 / 16 / 20 / 24 / 32.
 
 ### 4.5 SQL code surface
 
-The generated-SQL block follows the selected theme: a warm paper code ground
-in light mode, graphite in dark. Its colours are a **narrow, independent
+The generated-SQL block follows the selected theme: a cool near-white code
+ground in light mode, near-black navy in dark. Its colours are a **narrow, independent
 axis** — a code surface needs legible token contrast, not brand orange on
 every keyword; only the keyword hue leans toward the brand.
 
 | Token | Hex | Role |
 |---|---|---|
-| `--sql-bg` | `#fbf7f1` | Code ground |
-| `--sql-text` | `#2a2420` | Base text / identifiers |
-| `--sql-keyword` | `#b3400b` | SELECT, FROM, WHERE, TOP, AS, DESC |
+| `--sql-bg` | `#f7f9fd` | Code ground |
+| `--sql-text` | `#1c2740` | Base text / identifiers |
+| `--sql-keyword` | `#1d4ed8` | SELECT, FROM, WHERE, TOP, AS, DESC |
 | `--sql-number` | `#8a5a00` | Literals |
 | `--sql-function` | `#6d28d9` | SUM, COUNT, … |
 | `--sql-string` | `#0f766e` | Quoted strings |
-| `--sql-operator` | `#6b655e` | `=`, `<`, punctuation |
-| `--sql-comment` | `#928a80` | Comments (italic) |
+| `--sql-operator` | `#64748b` | `=`, `<`, punctuation |
+| `--sql-comment` | `#94a3b8` | Comments (italic) |
 
 **Prettify + highlight pipeline (display only) — `web/js/sql-display.js`:**
 

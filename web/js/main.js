@@ -33,6 +33,7 @@ import { renderSessionList } from "./render/sessions.js";
 import { memoryKeyForField, renderMemoryPanel } from "./render/memory.js";
 import { ensureTsqlPrismReady } from "./sql-display.js";
 import { t, loadLang, setLang, applyLang } from "./i18n.js";
+import { initDashboard, syncDashboard } from "./dashboard.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -163,6 +164,7 @@ wireComposer();
 wireTopbar();
 wireSidebar();
 wireMemoryPanel();
+initDashboard();
 setMode(state.mode);
 tickClock();
 setInterval(tickClock, 1000);
@@ -568,6 +570,15 @@ function renderSessionSidebar() {
     onRename: (sessionId, title) => renameSession(sessionId, title),
     onDelete: (sessionId) => deleteSessionAndFollowUp(sessionId),
   }));
+  // The dashboard reads the same resolved state the rail does; it never
+  // fetches anything of its own (see dashboard.js's docstring).
+  syncDashboard({
+    sessions: state.sessions,
+    turns: state.turns,
+    mode: state.mode,
+    baseUrl: state.baseUrl,
+    sessionId: state.sessionId,
+  });
 }
 
 /** (Re)resolves and loads the active session for the CURRENT mode.
@@ -645,8 +656,12 @@ async function switchToSession(sessionId) {
   if (state.sessionId) turnsCache.set(state.sessionId, state.turns);
   persistSessionId(sessionId);
 
+  // An empty cached transcript carries no information — restoring it only
+  // hides turns the server does have (and a double click on the same row
+  // used to cache its own empty list, then "restore" it, skipping the
+  // fetch entirely). Cache hits must have something to show.
   const cached = turnsCache.get(sessionId);
-  if (cached) {
+  if (cached && cached.length) {
     state.turns = cached;
   } else if (state.mode === "live") {
     try {
@@ -690,6 +705,13 @@ function renderTranscriptFromTurns(turns) {
   }
   if (turns.length === 0) renderTranscriptEmptyState();
   refreshSampleButtonsDisabledState();
+  syncDashboard({
+    sessions: state.sessions,
+    turns: state.turns,
+    mode: state.mode,
+    baseUrl: state.baseUrl,
+    sessionId: state.sessionId,
+  });
 }
 
 /** The empty-conversation placeholder — DESIGN.md §5.1's resolution for

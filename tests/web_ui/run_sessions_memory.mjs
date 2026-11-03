@@ -319,7 +319,7 @@ function lastCall() { return calls[calls.length - 1]; }
   const { state, loadPersisted } = await import(pathToFileURL(stateMjsPath).href);
   assert.doesNotThrow(() => loadPersisted(), "loadPersisted must not throw when localStorage.getItem throws");
   assert.equal(state.sessionId, null, "with storage unavailable, the app must start with no remembered session, not crash");
-  assert.equal(state.theme, "system", "other persisted fields must keep their defaults too, not just the session id");
+  assert.equal(state.theme, "dark", "other persisted fields must keep their defaults too, not just the session id");
 
   console.log("[ok] localStorage throwing on every read does not break start-up (loadPersisted degrades to defaults)");
 }
