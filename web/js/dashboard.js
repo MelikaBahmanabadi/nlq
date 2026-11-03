@@ -535,24 +535,12 @@ export function initDashboard() {
 
   // "New query" opens a fresh conversation — the same action the drawer's
   // own button performs — and puts the caret in the composer.
-  ["rail-new-query", "act-new-query"].forEach((id) => {
-    const btn = $(id);
-    if (btn) btn.addEventListener("click", () => {
-      const fresh = $("btn-new-session");
-      if (fresh) fresh.click();
-      setTimeout(focusComposer, 60);
-    });
+  const railNewQuery = $("rail-new-query");
+  if (railNewQuery) railNewQuery.addEventListener("click", () => {
+    const fresh = $("btn-new-session");
+    if (fresh) fresh.click();
+    setTimeout(focusComposer, 60);
   });
-
-  const connect = $("act-connect");
-  if (connect) connect.addEventListener("click", () => toggleStatusPanel(true));
-
-  // main.js owns the account popover (click-to-toggle + outside-click
-  // close), so the welcome action presses its button instead of opening
-  // the panel itself — a synthetic panel open would be closed again by
-  // the very click that requested it.
-  const settings = $("act-settings");
-  if (settings) settings.addEventListener("click", () => $("user-menu-btn")?.click());
 
   const statusBtn = $("status-btn");
   if (statusBtn) statusBtn.addEventListener("click", () => toggleStatusPanel());

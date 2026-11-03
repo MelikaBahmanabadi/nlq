@@ -584,7 +584,6 @@ body {
   color: var(--ink);
 }
 .welcome-sub { margin-top: 5px; font-size: var(--fs-md); color: var(--muted); }
-.welcome-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 
 .btn {
   display: inline-flex;
@@ -1221,7 +1220,6 @@ body {
   .sidebar { inset-inline-start: 0; max-width: none; width: 86vw; }
   .layout { padding: 18px 14px 8px; gap: 16px; }
   .welcome-title { font-size: 24px; }
-  .welcome-actions .btn { height: 40px; padding: 0 14px; font-size: var(--fs-xs); }
   .panel { padding: 16px; border-radius: var(--radius); }
   .kpi-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .chart-host { height: 200px; }
