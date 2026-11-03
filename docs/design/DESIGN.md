@@ -103,31 +103,39 @@ policy / memory / default). Chart focus-vs-context is a **fourth**, narrow axis.
 
 ### 4.2 Palette (light)
 
+The product identity is **"Ember"**: a warm orange brand on warm paper in
+light mode, and on graphite in dark mode. Orange is an accent with intent —
+primary actions, active navigation, focus, data emphasis and key figures —
+never a background wash.
+
 | Token | Hex | Role |
 |---|---|---|
-| `--navy` | `#0e2a47` | Deep chrome, question bubbles, admin mark |
-| `--navy-2` | `#14375c` | Elevated navy |
-| `--navy-3` | `#1b436e` | Navy interactive |
-| `--teal` | `#0b7a70` | Primary brand, primary action |
-| `--teal-d` | `#09675f` | Brand hover / emphasis |
-| `--teal-l` | `#e7f6f2` | Brand soft fill |
-| `--bg` | `#f4f6fa` | Page ground |
+| `--navy` | `#1c1917` | Strongest neutral surface, question bubbles |
+| `--navy-2` | `#292524` | Elevated neutral |
+| `--navy-3` | `#3b3531` | Neutral interactive |
+| `--teal` | `#c2410c` | Primary brand, primary action fill |
+| `--teal-d` | `#9a3412` | Brand hover / emphasis |
+| `--teal-l` | `#fdf1e7` | Brand soft fill |
+| `--bg` | `#faf8f5` | Page ground (warm paper) |
 | `--card` | `#ffffff` | Surface |
-| `--card-2` | `#f8fafc` | Nested surface |
-| `--border` | `#e2e8f0` | Hairline |
-| `--ink` | `#1f2937` | Body text |
-| `--muted` | `#5b6b81` | Secondary text |
+| `--card-2` | `#f6f2ec` | Nested surface |
+| `--border` | `#e8e1d7` | Hairline |
+| `--ink` | `#1a1714` | Body text |
+| `--muted` | `#6b655e` | Secondary text |
 
-The teal ramp and `--muted` are **contrast-derived, not aesthetic**. The
-original brand teal `#0d9488` measures 3.74:1 on `--card` and 3.46:1 on
-`--bg`; `--muted`'s earlier `#64748b` reached only 4.40:1 on `--bg`. All
-three sit under WCAG 1.4.3's 4.5:1 floor for body text. The shipped values
-move lightness only — hue and saturation are unchanged — and clear the bar
-at 5.21, 6.74 and 5.02 respectively. Restoring the brighter teal because it
-reads as more vivid reintroduces a failure that
-`tests/web_ui/test_web_ui_contrast_and_failure.py` will catch, and this
-table listed the pre-fix values for long enough that anyone implementing
-from it would have rebuilt the defect by hand.
+`--navy`, `--teal` and `--teal-l` are retained as literal values because the
+existing stylesheets, the admin panel and the contrast tests resolve them by
+name; new component code should use the semantic aliases (`--accent`,
+`--accent-bright`, `--surface`-style tokens) declared beside them.
+
+The ramp is **contrast-derived, not aesthetic**. `--teal` is the fill behind
+white button labels and measures 5.18:1 against `#ffffff` (WCAG 1.4.3's floor
+is 4.5 for a 15px bold label). `--muted` reaches 5.45:1 on `--bg` and 5.7:1 on
+`--card`. `--border-interactive` (`#8e867b`) marks a control boundary at 3.5:1
+(1.4.11). A brighter orange — `--accent-bright` `#ea580c` — exists for icons,
+strokes and emphasis on dark surfaces, never for small text on light ones.
+Restoring a brighter primary without re-checking those pairs reintroduces a
+failure `tests/web_ui/test_web_ui_contrast_and_failure.py` catches.
 
 Status and source tokens stay as they are in `web/styles/tokens.css` (they
 are already correct), as do dark-mode values — copy from that file.
@@ -152,29 +160,30 @@ dependency"; a font request to Google is a brand lie.
 | `--fs-md` | 14px |
 | `--fs-lg` | 15px |
 | `--fs-xl` | 18px |
-| `--fs-2xl` | 21px |
-| `--radius` | 12px |
-| `--radius-sm` | 8px |
+| `--fs-2xl` | 22px |
+| `--radius` | 14px |
+| `--radius-sm` | 9px |
 | `--radius-pill` | 999px |
 
-Spacing uses an 4px base: 4 / 8 / 12 / 16 / 20 / 24 / 32.
+Spacing uses a 4px base: 4 / 8 / 12 / 16 / 20 / 24 / 32.
 
 ### 4.5 SQL code surface
 
-The generated-SQL block is an **always-dark editor surface** in both UI
-themes. Its colours are **not** chrome brand aliases — brand teal is wrong
-for reading a SELECT list against near-black.
+The generated-SQL block follows the selected theme: a warm paper code ground
+in light mode, graphite in dark. Its colours are a **narrow, independent
+axis** — a code surface needs legible token contrast, not brand orange on
+every keyword; only the keyword hue leans toward the brand.
 
 | Token | Hex | Role |
 |---|---|---|
-| `--sql-bg` | `#0d1117` | Code ground |
-| `--sql-text` | `#e6edf3` | Base text / identifiers |
-| `--sql-keyword` | `#79c0ff` | SELECT, FROM, WHERE, TOP, AS, DESC |
-| `--sql-number` | `#e3b341` | Literals |
-| `--sql-function` | `#d2a8ff` | SUM, COUNT, … |
-| `--sql-string` | `#a5d6ff` | Quoted strings |
-| `--sql-operator` | `#8b949e` | `=`, `<`, punctuation |
-| `--sql-comment` | `#8b949e` | Comments (italic) |
+| `--sql-bg` | `#fbf7f1` | Code ground |
+| `--sql-text` | `#2a2420` | Base text / identifiers |
+| `--sql-keyword` | `#b3400b` | SELECT, FROM, WHERE, TOP, AS, DESC |
+| `--sql-number` | `#8a5a00` | Literals |
+| `--sql-function` | `#6d28d9` | SUM, COUNT, … |
+| `--sql-string` | `#0f766e` | Quoted strings |
+| `--sql-operator` | `#6b655e` | `=`, `<`, punctuation |
+| `--sql-comment` | `#928a80` | Comments (italic) |
 
 **Prettify + highlight pipeline (display only) — `web/js/sql-display.js`:**
 

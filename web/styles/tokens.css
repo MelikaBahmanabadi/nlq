@@ -1,278 +1,338 @@
-/* web/styles/tokens.css — the only place colours, radii, and focus rings
- * are defined for the product UI. style.css and admin.css consume these;
- * they never redefine a hex value.
+/* web/styles/tokens.css — the single source of truth for colour, type,
+ * geometry and motion in the product UI. style.css and admin.css consume
+ * these tokens and never redefine a colour.
  *
- * Light mode on bare :root. Dark mode ONLY redefines the same custom
- * properties — never introduces a colour that exists solely inside a
- * media query or [data-theme] block. --sql-* is the exception that
- * proves the rule: the SQL code surface is always-dark, so those tokens
- * are declared once and never flipped.
+ * Visual identity: "Foundry" — a precise, architectural workspace built
+ * from warm stone, ink and one molten orange accent. The accent is a
+ * material, not a mood: it marks primary actions, the active index item,
+ * focus and the question rail. Everything else is neutral and ruled.
  *
- * See docs/design/DESIGN.md §4.
+ * Geometry is intentionally squared: hairlines, right angles, flat
+ * surfaces. Depth comes from rules and offset blocks, never from soft
+ * floating cards. Meta text is monospaced and tracked, which is what gives
+ * the interface its instrument-panel reading.
+ *
+ * Light mode lives on plain :root. Dark mode redefines the SAME custom
+ * properties only — nothing exists solely inside one theme. Legacy token
+ * names (--navy*, --teal*) are kept as aliases with literal values so the
+ * existing stylesheets, admin panel and contrast tests keep resolving;
+ * new code should use the semantic names (--accent, --surface-*).
+ *
+ * WCAG: every pair used for text clears 4.5:1 (see
+ * tests/web_ui/test_web_ui_contrast_and_failure.py). --teal is the fill
+ * behind white button labels and is deliberately deep: #C2410C is 5.2:1
+ * against #ffffff. --accent-bright is for icons, strokes and glows on
+ * dark surfaces only, never for small text on light ones.
  */
 
 :root {
-  /* Brand / chrome
-   *
-   * --teal is the fill behind WHITE button labels (.btn-ask and every
-   * other `background: var(--teal); color: #fff` control) — that pairing
-   * is checked by tests/web_ui/test_web_ui_contrast_and_failure.py and
-   * must clear 4.5:1 (a 15px bold label is not "large text"; that
-   * exemption starts at 18.66px bold, so the ordinary text ratio
-   * applies). The original brand hue (#0d9488) is only 3.74:1 — same hue
-   * and saturation, darkened from lightness .32 to .26 to reach 5.21,
-   * which is exactly where the palette's own --teal-d already sat, so
-   * light mode's fix is that value promoted rather than a new one.
-   * --teal-d steps one lightness stop further down (.22) for :hover.
-   * --chart-focus below keeps the ORIGINAL, brighter hue on purpose: a
-   * chart line is read next to a grey context line, not printed with
-   * white text on top of it, so it never had a contrast problem and
-   * DESIGN-INVARIANTS.md §10 fixes it by lightening --chart-context
-   * instead of touching this. Flattening every teal in the app to one
-   * accessible-for-white-text shade would have been simpler and is
-   * exactly what "do not flatten the brand" (§11) rules out. */
-  --navy: #0e2a47;
-  --navy-2: #14375c;
-  --navy-3: #1b436e;
-  --teal: #0b7a70;
-  --teal-d: #09675f;
-  --teal-l: #e7f6f2;
+  color-scheme: light;
 
-  /* Surface */
-  --bg: #f4f6fa;
-  --card: #ffffff;
-  --card-2: #f8fafc;
-  --border: #e2e8f0;
-  /* --border is for decorative hairlines (card edges, dividers) and
-   * deliberately stays low-contrast — 1.4.11's 3:1 floor is for what
-   * IDENTIFIES an interactive control, not for chrome that just
-   * separates regions. --border-interactive is that control boundary:
-   * the ask textarea (and every other input/textarea) previously relied
-   * on --border for its edge (1.23:1 against --card) with a fill that
-   * only differed from the page by 1.05 — neither signal reached 3:1, so
-   * nothing marked the field as a field. Same hue family as --muted
-   * (secondary text), one step more saturated so it reads as a boundary
-   * rather than as text that wandered onto an edge. */
-  --border-interactive: #7c8ba3;
-  --ink: #1f2937;
-  /* #64748b on --card was 4.76 (fine) but only 4.40 on --bg — the page
-   * ground is very slightly lighter than the card, and that was enough
-   * to drop secondary text below 4.5 wherever it sits directly on the
-   * page rather than inside a card. #5b6b81 is the same hue, one step
-   * darker, and clears both surfaces (5.02 on --bg, 5.43 on --card).
-   * Dark mode's --muted already passes (7.30) and is unchanged. */
-  --muted: #5b6b81;
+  /* ── Brand ──────────────────────────────────────────────────────── */
+  --navy: #1b1913;          /* strongest neutral surface (legacy name) */
+  --navy-2: #26231b;
+  --navy-3: #353027;
+  --teal: #c2410c;          /* primary action fill; white label 5.2:1 */
+  --teal-d: #9a3412;        /* hover */
+  --teal-l: #f7e7d8;        /* brand-soft fill */
 
-  /* Legacy aliases still used by a few components */
-  --green: #10b981;
-  --red: #e5484d;
-  --amber: #f59e0b;
+  --accent: #c2410c;
+  --accent-hover: #9a3412;
+  --accent-press: #7c2d12;
+  --accent-bright: #ea580c;
+  --accent-soft: #f7e7d8;
+  --accent-soft-2: #f0d7c1;
+  --accent-line: #e2b48f;
+  --on-accent: #ffffff;
 
-  /* SQL code surface — always-dark editor palette. Not chrome brand. */
-  --sql-bg: #0d1117;
-  --sql-text: #e6edf3;
-  --sql-keyword: #79c0ff;
-  --sql-number: #e3b341;
-  --sql-function: #d2a8ff;
-  --sql-string: #a5d6ff;
-  --sql-operator: #8b949e;
-  --sql-comment: #8b949e;
+  /* ── Surfaces ───────────────────────────────────────────────────── */
+  --bg: #f1eee7;            /* warm stone page ground */
+  --bg-deep: #e9e5db;
+  --card: #fbf9f4;
+  --card-2: #f3efe7;
+  --card-3: #e7e1d5;
+  --raised: #fffdf8;
+  --border: #d8d2c4;
+  --border-strong: #c2bbab;
+  --border-interactive: #7b7466;   /* 4.2:1 vs --card */
+  --overlay: rgba(27, 25, 19, .45);
 
-  /* Status — a fact about the system right now, never brand.
-   *
-   * --status-critical was #e5484d: 1.54:1 against --status-good and
-   * dE-deutan 8.6 (tests/web_ui/test_web_ui_state_not_colour_alone.py,
-   * DESIGN-INVARIANTS.md §10's floor is dE >= 8 AND a lightness split, not
-   * either alone -- 8.6 cleared the first and failed the second, so the
-   * two "up"/"down" dots read as one colour at the same brightness to a
-   * dichromat and the *only* other signal was hue). #d32f2f is a deeper,
-   * more saturated red at the same identity: 1.96:1, dE-deutan 13.9.
-   * Considered instead: darkening --status-good so --status-critical could
-   * stay nearer its original shade. Rejected -- --status-good is read by
-   * nearly twice as many rules (guard pill, admin pass/fail, cache badge,
-   * turn outcome, live-key status …) as --status-critical, so moving it
-   * risks a visual regression in places this task was not scoped to touch.
-   * Moving only --status-critical, and keeping it inside the same red
-   * family rather than the brick/rust the search space pushes toward when
-   * --status-good is held fixed (see the dark block below), is the
-   * narrower change. */
+  /* ── Text ───────────────────────────────────────────────────────── */
+  --ink: #15140f;
+  --ink-2: #38342c;
+  --muted: #5f5a4f;         /* 6.0:1 on --bg, 6.6:1 on --card */
+  --faint: #857e71;
+  --on-dark: #f7f4ee;
+  --on-dark-muted: #a9a294;
+
+  /* Legacy semantic aliases still referenced by older rules. */
+  --green: #0f8a5f;
+  --red: #c62828;
+  --amber: #b45309;
+
+  /* ── SQL / code surface ─────────────────────────────────────────── */
+  --sql-bg: #fbf7f1;
+  --sql-bg-2: #f4ede3;
+  --sql-text: #2a2420;
+  --sql-keyword: #b3400b;
+  --sql-number: #8a5a00;
+  --sql-function: #6d28d9;
+  --sql-string: #0f766e;
+  --sql-operator: #6b655e;
+  --sql-comment: #928a80;
+  --sql-border: #e6dccd;
+
+  /* ── Status: facts about the system, never brand ─────────────────── */
   --status-good: #10b981;
-  --status-good-bg: #e9f9f1;
+  --status-good-bg: #e9f8f1;
+  --status-good-ink: #0b6b4b;
   --status-warn: #f59e0b;
-  --status-warn-bg: #fef6e7;
+  --status-warn-bg: #fdf3e2;
+  --status-warn-ink: #92500a;
   --status-critical: #d32f2f;
   --status-critical-bg: #fdeeee;
-  --status-neutral: #64748b;
-  --status-neutral-bg: #eef1f5;
+  --status-critical-ink: #b02323;
+  --status-neutral: #6b655e;
+  --status-neutral-bg: #f1ece5;
+  --status-info: #2563eb;
+  --status-info-bg: #eef3fe;
 
-  /* Chart — a fourth, narrow colour axis: FOCUS vs CONTEXT within one
-   * chart only (web/js/render/chart.js). Declared here as its own
-   * literal pair, not aliased to --teal/--muted the way it used to be:
-   * DESIGN-INVARIANTS.md §10 measured that alias-based scheme at a
-   * focus/context contrast of 1.03 in dark mode — the same perceived
-   * brightness, so hue was the only remaining signal, which is exactly
-   * what colour-blind vision cannot use (ΔE 2.2 deutan, against a target
-   * floor of 15). Emphasis is a lightness-and-weight job, not a hue job,
-   * so --chart-focus keeps the full-brightness brand teal (identical to
-   * the pre-fix --teal, kept independent of it so the two can move for
-   * different reasons) and --chart-context is a new, deliberately paler
-   * blue-grey rather than a darkened --muted. Stroke width carries the
-   * rest of the distinction — see chart.js's "stroke-width" literals. */
-  --chart-focus: #0d9488;
-  --chart-context: #b8c4d4;
+  /* ── Charts: emphasis by lightness, identity by hue ─────────────── */
+  --chart-focus: #c2410c;
+  --chart-context: #cdc5b9;
+  --chart-grid: #eee7dd;
+  --chart-fill-top: rgba(234, 88, 12, .26);
+  --chart-fill-bottom: rgba(234, 88, 12, 0);
 
-  /* Source of assumption (third colour axis) */
-  --source-question: #0d9488;
-  --source-question-bg: #e7f6f2;
-  --source-session: #6366f1;
-  --source-session-bg: #eef0fd;
-  --source-default: #64748b;
-  --source-default-bg: #eef1f5;
-  --source-policy: #b45309;
-  --source-policy-bg: #fbf1e0;
+  /* ── Assumption provenance (third colour axis) ──────────────────── */
+  --source-question: #c2410c;
+  --source-question-bg: #fdf1e7;
+  --source-session: #6d28d9;
+  --source-session-bg: #f1ecfe;
+  --source-default: #6b655e;
+  --source-default-bg: #f1ece5;
+  --source-policy: #92500a;
+  --source-policy-bg: #fdf3e2;
   --source-memory: #be185d;
   --source-memory-bg: #fce8f1;
 
-  /* Geometry */
-  --radius: 12px;
-  --radius-sm: 8px;
-  --radius-pill: 999px;
-  --shadow: 0 1px 2px rgba(15, 23, 42, .06), 0 4px 14px rgba(15, 23, 42, .05);
-  --focus-ring: 0 0 0 3px rgba(13, 148, 136, .35);
+  /* ── Geometry: right angles, flat surfaces ────────────────────────── */
+  --radius: 3px;
+  --radius-lg: 4px;
+  --radius-sm: 2px;
+  --radius-xs: 1px;
+  --radius-pill: 2px;
+  --shadow-xs: none;
+  --shadow: 0 1px 0 rgba(21, 20, 15, .10);
+  --shadow-lg: 0 24px 60px -40px rgba(21, 20, 15, .45);
+  --focus-ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+  --focus-ring-strong: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+  --glow: none;
 
-  /* Type scale (see DESIGN.md §4.4) */
+  /* ── Type ───────────────────────────────────────────────────────── */
+  --font-sans: "Vazirmatn", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Tahoma, sans-serif;
+  --font-mono: "JetBrains Mono", "SFMono-Regular", ui-monospace, Consolas, "Liberation Mono", monospace;
   --fs-xs: 11px;
   --fs-sm: 12.5px;
   --fs-md: 14px;
   --fs-lg: 15px;
   --fs-xl: 18px;
-  --fs-2xl: 21px;
+  --fs-2xl: 22px;
+  --fs-3xl: 30px;
+  --tracking-wide: .14em;
+
+  /* ── Motion ─────────────────────────────────────────────────────── */
+  --ease: cubic-bezier(.2, .7, .25, 1);
+  --dur-fast: 120ms;
+  --dur: 200ms;
 }
 
 /* Dark mode via OS preference, unless the page has an explicit choice. */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --navy: #16324f;
-    --navy-2: #1c3f61;
-    --navy-3: #234c74;
-    /* Same hue/saturation as the original #14b8a6, darkened from
-     * lightness .40 to .28 — white-on-teal was 2.49:1 (worse than light
-     * mode's, since dark mode's brand teal was the brighter of the two
-     * to begin with) and this reaches 4.76. --teal-d steps to .22 for
-     * :hover. See the light :root's --teal comment for why --chart-focus
-     * is exempt and keeps the original #14b8a6. */
-    --teal: #0e8174;
-    --teal-d: #0b655b;
-    --teal-l: #113330;
-    --bg: #0b1220;
-    --card: #131c2e;
-    --card-2: #182238;
-    --border: #263349;
-    /* Same reasoning as the light :root's --border-interactive: a hue
-     * near --muted, one step more saturated, so an input's edge reaches
-     * 3:1 against --card (4.40) without touching decorative --border. */
-    --border-interactive: #71839b;
-    --ink: #e5e9f0;
-    --muted: #94a3b8;
+    color-scheme: dark;
+
+    --navy: #171814;
+    --navy-2: #20211c;
+    --navy-3: #2b2c26;
+    --teal: #c2410c;          /* white label still 5.2:1 */
+    --teal-d: #9a3412;
+    --teal-l: #2a1a11;
+
+    --accent: #c2410c;
+    --accent-hover: #e2520d;
+    --accent-press: #9a3412;
+    --accent-bright: #f97316;
+    --accent-soft: #241711;
+    --accent-soft-2: #332014;
+    --accent-line: #4a2c19;
+    --on-accent: #ffffff;
+
+    --bg: #0d0e0c;
+    --bg-deep: #080907;
+    --card: #141512;
+    --card-2: #1a1b17;
+    --card-3: #22231e;
+    --raised: #1c1d18;
+    --border: #2a2b25;
+    --border-strong: #3a3b33;
+    --border-interactive: #8d8d82;  /* 5.4:1 vs --card */
+    --overlay: rgba(0, 0, 0, .66);
+
+    --ink: #f4f1e8;
+    --ink-2: #d8d4c9;
+    --muted: #a9a397;         /* 7.2:1 on --card */
+    --faint: #7e7a70;
+    --on-dark: #f7f4f0;
+    --on-dark-muted: #a1a1aa;
+
     --green: #34d399;
     --red: #f87171;
     --amber: #fbbf24;
-    /* --sql-* intentionally unchanged: always-dark code surface. */
 
-    /* --status-critical was #f87171: 1.44:1 against --status-good and
-     * dE-deutan 7.1 -- BELOW DESIGN-INVARIANTS.md §10's floor of 8, not
-     * merely short of the lightness split (see the light :root's
-     * --status-critical comment for the full search and the rejected
-     * alternative of moving --status-good instead). Dark is the tighter
-     * case: holding --status-good at its light mint (#34d399) pushes the
-     * feasible --status-critical values toward brick/rust hues once ΔE and
-     * contrast both have to clear their floors, which reads oddly as a
-     * "down" colour and was rejected for that reason. #e53e3e stays inside
-     * the same red family as the original and clears both: 2.15:1, dE
-     * -deutan 16.6. */
+    --sql-bg: #0d0d0f;
+    --sql-bg-2: #141418;
+    --sql-text: #e7e3de;
+    --sql-keyword: #ff9a5a;
+    --sql-number: #f2c94c;
+    --sql-function: #c4a7f7;
+    --sql-string: #7fd1b9;
+    --sql-operator: #8c8780;
+    --sql-comment: #6e6a64;
+    --sql-border: #24242a;
+
     --status-good: #34d399;
-    --status-good-bg: #10261e;
+    --status-good-bg: #0f2a22;
+    --status-good-ink: #6ee7b7;
     --status-warn: #fbbf24;
-    --status-warn-bg: #2b230f;
+    --status-warn-bg: #2a2110;
+    --status-warn-ink: #fcd34d;
     --status-critical: #e53e3e;
     --status-critical-bg: #2b1414;
-    --status-neutral: #94a3b8;
-    --status-neutral-bg: #1c2536;
+    --status-critical-ink: #fca5a5;
+    --status-neutral: #a1a1aa;
+    --status-neutral-bg: #1c1c21;
+    --status-info: #93b4ff;
+    --status-info-bg: #141b2e;
 
-    /* See the light :root's --chart-focus/--chart-context comment.
-     * Focus keeps the original, pre-fix dark --teal (#14b8a6); context
-     * is a new dark blue-grey, not a darkened --muted, chosen so the
-     * pair clears 1.8:1 (measures 3.50) instead of the old 1.03:1. */
-    --chart-focus: #14b8a6;
-    --chart-context: #3d4c63;
+    --chart-focus: #f97316;
+    --chart-context: #4a4a40;
+    --chart-grid: #232329;
+    --chart-fill-top: rgba(249, 115, 22, .28);
+    --chart-fill-bottom: rgba(249, 115, 22, 0);
 
-    --source-question: #2dd4bf;
-    --source-question-bg: #102a27;
-    --source-session: #818cf8;
-    --source-session-bg: #1e2144;
-    --source-default: #94a3b8;
-    --source-default-bg: #1c2536;
-    --source-policy: #f0b95e;
-    --source-policy-bg: #2e2410;
+    --source-question: #fb923c;
+    --source-question-bg: #2a1a11;
+    --source-session: #a78bfa;
+    --source-session-bg: #1e1b33;
+    --source-default: #a1a1aa;
+    --source-default-bg: #1c1c21;
+    --source-policy: #fcd34d;
+    --source-policy-bg: #2a2110;
     --source-memory: #f472b6;
-    --source-memory-bg: #341126;
+    --source-memory-bg: #331026;
 
-    --shadow: 0 1px 2px rgba(0, 0, 0, .35), 0 6px 20px rgba(0, 0, 0, .3);
-    --focus-ring: 0 0 0 3px rgba(20, 184, 166, .45);
+    --shadow-xs: none;
+    --shadow: 0 1px 0 rgba(0, 0, 0, .6);
+    --shadow-lg: 0 30px 70px -40px rgba(0, 0, 0, .95);
+    --focus-ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent-bright);
+    --focus-ring-strong: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent-bright);
+    --glow: none;
   }
 }
 
 /* Explicit toggle wins over OS preference in both directions. */
 :root[data-theme="dark"] {
-  --navy: #16324f;
-  --navy-2: #1c3f61;
-  --navy-3: #234c74;
-  /* Mirrors the @media dark block above — see its comments. */
-  --teal: #0e8174;
-  --teal-d: #0b655b;
-  --teal-l: #113330;
-  --bg: #0b1220;
-  --card: #131c2e;
-  --card-2: #182238;
-  --border: #263349;
-  --border-interactive: #71839b;
-  --ink: #e5e9f0;
-  --muted: #94a3b8;
+  color-scheme: dark;
+
+  --navy: #171814;
+  --navy-2: #20211c;
+  --navy-3: #2b2c26;
+  --teal: #c2410c;
+  --teal-d: #9a3412;
+  --teal-l: #2a1a11;
+
+  --accent: #c2410c;
+  --accent-hover: #e2520d;
+  --accent-press: #9a3412;
+  --accent-bright: #f97316;
+  --accent-soft: #241711;
+  --accent-soft-2: #332014;
+  --accent-line: #4a2c19;
+  --on-accent: #ffffff;
+
+  --bg: #0d0e0c;
+  --bg-deep: #080907;
+  --card: #141512;
+  --card-2: #1a1b17;
+  --card-3: #22231e;
+  --raised: #1c1d18;
+  --border: #2a2b25;
+  --border-strong: #3a3b33;
+  --border-interactive: #8d8d82;
+  --overlay: rgba(0, 0, 0, .66);
+
+  --ink: #f4f1e8;
+  --ink-2: #d8d4c9;
+  --muted: #a9a397;
+  --faint: #7e7a70;
+  --on-dark: #f7f4f0;
+  --on-dark-muted: #a1a1aa;
+
   --green: #34d399;
   --red: #f87171;
   --amber: #fbbf24;
-  /* --sql-* intentionally unchanged: always-dark code surface. */
+
+  --sql-bg: #0d0d0f;
+  --sql-bg-2: #141418;
+  --sql-text: #e7e3de;
+  --sql-keyword: #ff9a5a;
+  --sql-number: #f2c94c;
+  --sql-function: #c4a7f7;
+  --sql-string: #7fd1b9;
+  --sql-operator: #8c8780;
+  --sql-comment: #6e6a64;
+  --sql-border: #24242a;
 
   --status-good: #34d399;
-  --status-good-bg: #10261e;
+  --status-good-bg: #0f2a22;
+  --status-good-ink: #6ee7b7;
   --status-warn: #fbbf24;
-  --status-warn-bg: #2b230f;
+  --status-warn-bg: #2a2110;
+  --status-warn-ink: #fcd34d;
   --status-critical: #e53e3e;
   --status-critical-bg: #2b1414;
-  --status-neutral: #94a3b8;
-  --status-neutral-bg: #1c2536;
+  --status-critical-ink: #fca5a5;
+  --status-neutral: #a1a1aa;
+  --status-neutral-bg: #1c1c21;
+  --status-info: #93b4ff;
+  --status-info-bg: #141b2e;
 
-  --chart-focus: #14b8a6;
-  --chart-context: #3d4c63;
+  --chart-focus: #f97316;
+  --chart-context: #4a4a40;
+  --chart-grid: #232329;
+  --chart-fill-top: rgba(249, 115, 22, .28);
+  --chart-fill-bottom: rgba(249, 115, 22, 0);
 
-  --source-question: #2dd4bf;
-  --source-question-bg: #102a27;
-  --source-session: #818cf8;
-  --source-session-bg: #1e2144;
-  --source-default: #94a3b8;
-  --source-default-bg: #1c2536;
-  --source-policy: #f0b95e;
-  --source-policy-bg: #2e2410;
+  --source-question: #fb923c;
+  --source-question-bg: #2a1a11;
+  --source-session: #a78bfa;
+  --source-session-bg: #1e1b33;
+  --source-default: #a1a1aa;
+  --source-default-bg: #1c1c21;
+  --source-policy: #fcd34d;
+  --source-policy-bg: #2a2110;
   --source-memory: #f472b6;
-  --source-memory-bg: #341126;
+  --source-memory-bg: #331026;
 
-  --shadow: 0 1px 2px rgba(0, 0, 0, .35), 0 6px 20px rgba(0, 0, 0, .3);
-  --focus-ring: 0 0 0 3px rgba(20, 184, 166, .45);
+  --shadow-xs: none;
+  --shadow: 0 1px 0 rgba(0, 0, 0, .6);
+  --shadow-lg: 0 30px 70px -40px rgba(0, 0, 0, .95);
+  --focus-ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent-bright);
+  --focus-ring-strong: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent-bright);
+  --glow: none;
 }
 
 :root[data-theme="light"] {
   color-scheme: light;
-}
-:root[data-theme="dark"] {
-  color-scheme: dark;
 }

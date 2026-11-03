@@ -124,6 +124,7 @@ state.mode = resolveBootMode(params, state.mode);
 state.lang = loadLang();
 applyTheme();
 applyLang(state.lang);
+updateThemeQuickToggle();
 
 const rawBootBaseUrl = resolveBootBaseUrl(params, state.baseUrl);
 if (rawBootBaseUrl !== state.baseUrl) {
@@ -169,6 +170,7 @@ setInterval(tickClock, 1000);
 /* ── Theme / user menu ─────────────────────────────────────────────── */
 function wireTopbar() {
   wireUserMenu();
+  wireThemeQuickToggle();
 
   $("live-key-save").addEventListener("click", () => {
     const val = $("live-key-input").value;
@@ -321,6 +323,7 @@ function wireUserMenu() {
         persistTheme(val);
         applyTheme();
         updateThemeSegment();
+        updateThemeQuickToggle();
       }
     });
   });
@@ -333,6 +336,7 @@ function wireUserMenu() {
         setLang(lang);
         updateLangSegment();
         updateKeyStatus();
+        updateThemeQuickToggle();
         setMode(state.mode); // refresh foot strings in the new language
       }
     });
@@ -343,6 +347,41 @@ function updateThemeSegment() {
   document.querySelectorAll("#theme-segment button[data-theme-val]").forEach((b) => {
     b.classList.toggle("active", b.getAttribute("data-theme-val") === state.theme);
   });
+}
+
+/** One-press light/dark switch in the topbar. The three-way choice
+ * (including "system") stays in the account menu; this button is the
+ * shortcut an analyst reaches for, and it always commits an explicit
+ * theme, so what they pick survives a reload. */
+function updateThemeQuickToggle() {
+  const btn = $("theme-quick-toggle");
+  if (!btn) return;
+  const explicit = document.documentElement.getAttribute("data-theme");
+  const effective = explicit
+    || (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  const turningToLight = effective === "dark";
+  btn.setAttribute("aria-label", t("themeQuick"));
+  btn.title = t("themeQuick");
+  const sun = btn.querySelector(".icon-sun");
+  const moon = btn.querySelector(".icon-moon");
+  // Show the destination, not the current state: a sun means "switch to light".
+  if (sun) sun.hidden = !turningToLight;
+  if (moon) moon.hidden = turningToLight;
+}
+
+function wireThemeQuickToggle() {
+  const btn = $("theme-quick-toggle");
+  if (!btn) return;
+  btn.addEventListener("click", () => {
+    const explicit = document.documentElement.getAttribute("data-theme");
+    const effective = explicit
+      || (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    persistTheme(effective === "dark" ? "light" : "dark");
+    applyTheme();
+    updateThemeSegment();
+    updateThemeQuickToggle();
+  });
+  updateThemeQuickToggle();
 }
 
 function updateLangSegment() {
@@ -666,6 +705,10 @@ function renderTranscriptEmptyState() {
   const empty = document.createElement("div");
   empty.className = "transcript-empty";
   empty.id = "transcript-empty";
+
+  const title = document.createElement("h2");
+  title.textContent = t("transcriptEmptyTitle");
+  empty.appendChild(title);
 
   const hint = document.createElement("p");
   hint.className = "transcript-empty-hint";
