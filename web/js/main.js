@@ -33,6 +33,7 @@ import { renderSessionList } from "./render/sessions.js";
 import { memoryKeyForField, renderMemoryPanel } from "./render/memory.js";
 import { ensureTsqlPrismReady } from "./sql-display.js";
 import { t, loadLang, setLang, applyLang } from "./i18n.js";
+import { initDashboard, syncDashboard } from "./dashboard.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -97,6 +98,10 @@ const diagnoser = createDiagnoser({
   getPageOrigin: () => location.origin,
 });
 let healthCheckSeq = 0;
+// Has any /health answer (success or failure) painted the lights yet?
+// The bell must not sit neutral while an unreachable dependency makes the
+// request hang, so boot watches this and raises the alarm if it stays false.
+let healthAnswered = false;
 
 /* ── Boot ──────────────────────────────────────────────────────────── */
 // T-SQL Prism patch must run before the first Prism.tokenize — Prism
@@ -124,6 +129,7 @@ state.mode = resolveBootMode(params, state.mode);
 state.lang = loadLang();
 applyTheme();
 applyLang(state.lang);
+updateThemeQuickToggle();
 
 const rawBootBaseUrl = resolveBootBaseUrl(params, state.baseUrl);
 if (rawBootBaseUrl !== state.baseUrl) {
@@ -162,13 +168,18 @@ wireComposer();
 wireTopbar();
 wireSidebar();
 wireMemoryPanel();
+initDashboard();
 setMode(state.mode);
+setTimeout(() => {
+  if (!healthAnswered) setHealth(null, null, null, t("systemStatusAlert"));
+}, 3000);
 tickClock();
 setInterval(tickClock, 1000);
 
 /* ── Theme / user menu ─────────────────────────────────────────────── */
 function wireTopbar() {
   wireUserMenu();
+  wireThemeQuickToggle();
 
   $("live-key-save").addEventListener("click", () => {
     const val = $("live-key-input").value;
@@ -321,6 +332,7 @@ function wireUserMenu() {
         persistTheme(val);
         applyTheme();
         updateThemeSegment();
+        updateThemeQuickToggle();
       }
     });
   });
@@ -333,6 +345,7 @@ function wireUserMenu() {
         setLang(lang);
         updateLangSegment();
         updateKeyStatus();
+        updateThemeQuickToggle();
         setMode(state.mode); // refresh foot strings in the new language
       }
     });
@@ -343,6 +356,41 @@ function updateThemeSegment() {
   document.querySelectorAll("#theme-segment button[data-theme-val]").forEach((b) => {
     b.classList.toggle("active", b.getAttribute("data-theme-val") === state.theme);
   });
+}
+
+/** One-press light/dark switch in the topbar. The three-way choice
+ * (including "system") stays in the account menu; this button is the
+ * shortcut an analyst reaches for, and it always commits an explicit
+ * theme, so what they pick survives a reload. */
+function updateThemeQuickToggle() {
+  const btn = $("theme-quick-toggle");
+  if (!btn) return;
+  const explicit = document.documentElement.getAttribute("data-theme");
+  const effective = explicit
+    || (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  const turningToLight = effective === "dark";
+  btn.setAttribute("aria-label", t("themeQuick"));
+  btn.title = t("themeQuick");
+  const sun = btn.querySelector(".icon-sun");
+  const moon = btn.querySelector(".icon-moon");
+  // Show the destination, not the current state: a sun means "switch to light".
+  if (sun) sun.hidden = !turningToLight;
+  if (moon) moon.hidden = turningToLight;
+}
+
+function wireThemeQuickToggle() {
+  const btn = $("theme-quick-toggle");
+  if (!btn) return;
+  btn.addEventListener("click", () => {
+    const explicit = document.documentElement.getAttribute("data-theme");
+    const effective = explicit
+      || (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    persistTheme(effective === "dark" ? "light" : "dark");
+    applyTheme();
+    updateThemeSegment();
+    updateThemeQuickToggle();
+  });
+  updateThemeQuickToggle();
 }
 
 function updateLangSegment() {
@@ -471,6 +519,21 @@ function setHealth(api_, llm, db, label) {
     }),
   );
   host.title = label;
+  healthAnswered = true;
+
+  // The topbar no longer shows three pills: the bell carries the whole
+  // state. Green when every dependency is up; a blinking red alarm when
+  // even one is down (or still unverified). The panel behind the bell
+  // still lists all three.
+  const bell = $("status-btn");
+  if (bell) {
+    const allUp = api_ === true && llm === true && db === true;
+    bell.classList.toggle("is-ok", allUp);
+    bell.classList.toggle("is-alert", !allUp);
+    const key = allUp ? "systemStatusOk" : "systemStatusAlert";
+    bell.setAttribute("aria-label", t(key));
+    bell.title = t(key);
+  }
 }
 
 async function refreshHealth() {
@@ -529,6 +592,15 @@ function renderSessionSidebar() {
     onRename: (sessionId, title) => renameSession(sessionId, title),
     onDelete: (sessionId) => deleteSessionAndFollowUp(sessionId),
   }));
+  // The dashboard reads the same resolved state the rail does; it never
+  // fetches anything of its own (see dashboard.js's docstring).
+  syncDashboard({
+    sessions: state.sessions,
+    turns: state.turns,
+    mode: state.mode,
+    baseUrl: state.baseUrl,
+    sessionId: state.sessionId,
+  });
 }
 
 /** (Re)resolves and loads the active session for the CURRENT mode.
@@ -606,8 +678,12 @@ async function switchToSession(sessionId) {
   if (state.sessionId) turnsCache.set(state.sessionId, state.turns);
   persistSessionId(sessionId);
 
+  // An empty cached transcript carries no information — restoring it only
+  // hides turns the server does have (and a double click on the same row
+  // used to cache its own empty list, then "restore" it, skipping the
+  // fetch entirely). Cache hits must have something to show.
   const cached = turnsCache.get(sessionId);
-  if (cached) {
+  if (cached && cached.length) {
     state.turns = cached;
   } else if (state.mode === "live") {
     try {
@@ -651,6 +727,13 @@ function renderTranscriptFromTurns(turns) {
   }
   if (turns.length === 0) renderTranscriptEmptyState();
   refreshSampleButtonsDisabledState();
+  syncDashboard({
+    sessions: state.sessions,
+    turns: state.turns,
+    mode: state.mode,
+    baseUrl: state.baseUrl,
+    sessionId: state.sessionId,
+  });
 }
 
 /** The empty-conversation placeholder — DESIGN.md §5.1's resolution for
@@ -666,6 +749,10 @@ function renderTranscriptEmptyState() {
   const empty = document.createElement("div");
   empty.className = "transcript-empty";
   empty.id = "transcript-empty";
+
+  const title = document.createElement("h2");
+  title.textContent = t("transcriptEmptyTitle");
+  empty.appendChild(title);
 
   const hint = document.createElement("p");
   hint.className = "transcript-empty-hint";
