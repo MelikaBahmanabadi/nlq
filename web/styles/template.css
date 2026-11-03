@@ -277,9 +277,43 @@ body {
    (hidden) because the status panel and activity list read them. */
 .health[hidden] { display: none; }
 #status-btn.is-ok {
+  position: relative;
+  overflow: hidden;
   color: var(--status-good);
-  border-color: color-mix(in srgb, var(--status-good) 42%, transparent);
-  background: color-mix(in srgb, var(--status-good) 10%, var(--card));
+  border-color: color-mix(in srgb, var(--status-good) 58%, transparent);
+  background:
+    radial-gradient(120% 120% at 28% 16%, color-mix(in srgb, var(--status-good) 26%, transparent) 0%, transparent 64%),
+    color-mix(in srgb, var(--status-good) 11%, var(--card));
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #fff 34%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--status-good) 12%, transparent),
+    0 4px 18px color-mix(in srgb, var(--status-good) 24%, transparent);
+}
+/* The healthy bell itself is solid green, shaded top-to-bottom so it reads as
+   a glossy, lit object rather than a thin outline. */
+#status-btn.is-ok svg {
+  fill: url(#bell-ok-fill);
+  stroke-width: 1.1;
+  stroke: color-mix(in srgb, var(--status-good) 74%, #032a19);
+  filter: drop-shadow(0 0 4px color-mix(in srgb, var(--status-good) 50%, transparent));
+}
+#bell-ok-fill .bell-hi { stop-color: color-mix(in srgb, #fff 66%, var(--status-good)); }
+#bell-ok-fill .bell-mid { stop-color: var(--status-good); }
+#bell-ok-fill .bell-lo { stop-color: color-mix(in srgb, var(--status-good) 76%, #032a19); }
+/* A slow specular sweep, so the bell catches the light every few seconds. */
+#status-btn.is-ok::after {
+  content: "";
+  position: absolute;
+  inset: -30% -45%;
+  background: linear-gradient(115deg, transparent 46%, color-mix(in srgb, #fff 60%, transparent) 50%, transparent 54%);
+  mix-blend-mode: screen;
+  transform: translateX(-130%);
+  animation: bell-sheen 6.5s ease-in-out infinite;
+  pointer-events: none;
+}
+@keyframes bell-sheen {
+  0%, 64% { transform: translateX(-130%); }
+  86%, 100% { transform: translateX(130%); }
 }
 #status-btn.is-alert {
   color: var(--status-critical);
@@ -300,6 +334,7 @@ body {
 }
 @media (prefers-reduced-motion: reduce) {
   #status-btn.is-alert { animation: none; }
+  #status-btn.is-ok::after { animation: none; transform: none; opacity: .28; }
 }
 
 .icon-btn {

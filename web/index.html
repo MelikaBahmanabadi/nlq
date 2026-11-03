@@ -87,7 +87,16 @@
         </div>
 
         <button class="icon-btn" id="status-btn" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="status-panel" aria-label="وضعیت سامانه" title="وضعیت سامانه">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 1 0-12 0c0 6-2 7-2 7h16s-2-1-2-7"/><path d="M10.3 20a2 2 0 0 0 3.4 0"/></svg>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <defs>
+              <linearGradient id="bell-ok-fill" x1="22%" y1="0%" x2="62%" y2="100%">
+                <stop class="bell-hi" offset="0%"/>
+                <stop class="bell-mid" offset="46%"/>
+                <stop class="bell-lo" offset="100%"/>
+              </linearGradient>
+            </defs>
+            <path d="M18 8a6 6 0 1 0-12 0c0 6-2 7-2 7h16s-2-1-2-7"/><path d="M10.3 20a2 2 0 0 0 3.4 0"/>
+          </svg>
         </button>
 
         <!-- Account menu: theme, language, API key, access requests. -->
