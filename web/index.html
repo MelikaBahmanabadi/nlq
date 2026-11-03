@@ -78,13 +78,15 @@
       <div class="topbar-right">
         <!-- Static pre-JS fallback mirroring setHealth's DOM shape: starts
              "unknown" rather than claiming every service is up. -->
-        <div class="health" id="health" role="status" aria-live="polite">
+        <!-- Health is read by the bell (#status-btn) and the status panel;
+             the three pills themselves are hidden — see setHealth(). -->
+        <div class="health" id="health" role="status" aria-live="polite" hidden>
           <span class="pill" aria-label="API: نامشخص"><span class="dot dot-unknown"></span><span class="pill-name">API</span><span class="pill-state">نامشخص</span></span>
           <span class="pill" aria-label="LLM: نامشخص"><span class="dot dot-unknown"></span><span class="pill-name">LLM</span><span class="pill-state">نامشخص</span></span>
           <span class="pill" aria-label="DB: نامشخص"><span class="dot dot-unknown"></span><span class="pill-name">DB</span><span class="pill-state">نامشخص</span></span>
         </div>
 
-        <button class="icon-btn" id="status-btn" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="status-panel" aria-label="وضعیت سامانه" title="وضعیت سامانه" data-i18n-attr="aria-label:systemStatus,title:systemStatus">
+        <button class="icon-btn" id="status-btn" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="status-panel" aria-label="وضعیت سامانه" title="وضعیت سامانه">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 1 0-12 0c0 6-2 7-2 7h16s-2-1-2-7"/><path d="M10.3 20a2 2 0 0 0 3.4 0"/></svg>
         </button>
 

@@ -272,6 +272,36 @@ body {
 .health .dot-down { background: var(--status-critical); box-shadow: 0 0 0 3px color-mix(in srgb, var(--status-critical) 18%, transparent); }
 .health .dot-unknown { background: var(--status-warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--status-warn) 18%, transparent); }
 
+/* The three pills are now the bell's state: green when every dependency is
+   up, a blinking red alarm when even one is not. The pills stay in the DOM
+   (hidden) because the status panel and activity list read them. */
+.health[hidden] { display: none; }
+#status-btn.is-ok {
+  color: var(--status-good);
+  border-color: color-mix(in srgb, var(--status-good) 42%, transparent);
+  background: color-mix(in srgb, var(--status-good) 10%, var(--card));
+}
+#status-btn.is-alert {
+  color: var(--status-critical);
+  border-color: color-mix(in srgb, var(--status-critical) 48%, transparent);
+  animation: bell-alarm 1.4s ease-in-out infinite;
+}
+@keyframes bell-alarm {
+  0%, 100% {
+    color: var(--status-critical);
+    background: color-mix(in srgb, var(--status-critical) 8%, var(--card));
+    box-shadow: none;
+  }
+  50% {
+    color: #fff;
+    background: var(--status-critical);
+    box-shadow: 0 0 0 5px color-mix(in srgb, var(--status-critical) 22%, transparent);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  #status-btn.is-alert { animation: none; }
+}
+
 .icon-btn {
   display: inline-flex;
   align-items: center;

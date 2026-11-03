@@ -98,6 +98,10 @@ const diagnoser = createDiagnoser({
   getPageOrigin: () => location.origin,
 });
 let healthCheckSeq = 0;
+// Has any /health answer (success or failure) painted the lights yet?
+// The bell must not sit neutral while an unreachable dependency makes the
+// request hang, so boot watches this and raises the alarm if it stays false.
+let healthAnswered = false;
 
 /* ── Boot ──────────────────────────────────────────────────────────── */
 // T-SQL Prism patch must run before the first Prism.tokenize — Prism
@@ -166,6 +170,9 @@ wireSidebar();
 wireMemoryPanel();
 initDashboard();
 setMode(state.mode);
+setTimeout(() => {
+  if (!healthAnswered) setHealth(null, null, null, t("systemStatusAlert"));
+}, 3000);
 tickClock();
 setInterval(tickClock, 1000);
 
@@ -512,6 +519,21 @@ function setHealth(api_, llm, db, label) {
     }),
   );
   host.title = label;
+  healthAnswered = true;
+
+  // The topbar no longer shows three pills: the bell carries the whole
+  // state. Green when every dependency is up; a blinking red alarm when
+  // even one is down (or still unverified). The panel behind the bell
+  // still lists all three.
+  const bell = $("status-btn");
+  if (bell) {
+    const allUp = api_ === true && llm === true && db === true;
+    bell.classList.toggle("is-ok", allUp);
+    bell.classList.toggle("is-alert", !allUp);
+    const key = allUp ? "systemStatusOk" : "systemStatusAlert";
+    bell.setAttribute("aria-label", t(key));
+    bell.title = t(key);
+  }
 }
 
 async function refreshHealth() {
