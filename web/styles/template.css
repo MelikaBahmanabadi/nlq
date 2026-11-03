@@ -425,11 +425,14 @@ body {
   background: color-mix(in srgb, var(--card) 92%, transparent);
   backdrop-filter: blur(26px) saturate(150%);
   box-shadow: var(--shadow-lg);
-  transform: translateX(-110%);
+  /* The drawer rests 84px in from the edge, so the closed transform must
+     clear its own width AND that inset — 110% alone left a 51px sliver
+     of the drawer visible at the viewport edge. */
+  transform: translateX(calc(-100% - 96px));
   transition: transform var(--dur) var(--ease);
   overflow-y: auto;
 }
-[dir="rtl"] .sidebar { transform: translateX(110%); }
+[dir="rtl"] .sidebar { transform: translateX(calc(100% + 96px)); }
 .app-body.sidebar-open .sidebar { transform: translateX(0); }
 
 .sidebar-head {
