@@ -1,0 +1,706 @@
+# SPDX-License-Identifier: BUSL-1.1
+# Copyright (c) 2024-2026 Ali Sadeghi Aghili
+"""ASGI middleware for the API.
+
+Middleware stack (outer → inner)
+--------------------------------
+1. RequestIDMiddleware   — stamps every request with X-Request-ID
+2. AuthMiddleware         — resolves ``request.state.principal`` from the
+                            ``Authorization`` header (``api/auth.py`` — Phase 8).
+                            Runs before RateLimitMiddleware so the limiter can
+                            bucket on principal id instead of IP.
+3. RateLimitMiddleware   — per-IP (or per-principal — see below) token-bucket
+                            rate limiter (429)
+4. ConcurrencyMiddleware — rejects requests when MAX_CONCURRENT_REQUESTS
+                            active requests are already in flight (503)
+
+See ``api/server.py``'s own middleware-registration comment for the exact
+``add_middleware()`` call order that produces this stack (Starlette
+applies it in reverse).
+
+Rate-limit tuning
+------------------
+``RATE_LIMIT_REQUESTS`` / ``RATE_LIMIT_WINDOW_SEC`` / ``RATE_LIMIT_BURST``
+are ``config.Settings`` fields (:attr:`~config.Settings.rate_limit_requests`,
+:attr:`~config.Settings.rate_limit_window_seconds`,
+:attr:`~config.Settings.rate_limit_burst`) as of the deployment-readiness
+pass — see that module for their current defaults and the reasoning behind
+them (the short version: the old ``60``/``60``/``10`` defaults meant one
+whole organisation sharing one service key got 60 requests per minute
+*total*, not per analyst). ``RateLimitMiddleware.__init__`` resolves them
+itself, read through ``cfg.settings`` **at construction time** (not at this
+module's import time, and not baked into the class's own default-parameter
+values) — see the docstring on that class for exactly why, and see
+``config.Settings.rate_limit_requests``'s own docstring for why the
+*shared* ``api.server.app`` instance still needs the test-suite override in
+place before the whole pytest session's first request, not just "before
+some test runs".
+
+TRUSTED_PROXY_IPS          — comma-separated IPs allowed to supply
+                             X-Forwarded-For / X-Real-IP for rate-limiting
+                             (env var, not a Settings field; default: empty)
+RATE_LIMIT_MAX_TRACKED_IPS — max distinct client buckets kept in memory at
+                             once, LRU-evicted beyond this (env var, not a
+                             Settings field; default: 10000)
+
+Bucket identity (Phase 8): a request with a principal resolved by
+``AuthMiddleware`` buckets on ``principal:<id>`` instead of IP, so callers
+behind a shared proxy (or NAT) each get their own allowance instead of
+exhausting one shared-IP bucket for the whole organisation. An
+unauthenticated request still buckets on IP, exactly as before this phase.
+
+Example: RATE_LIMIT_REQUESTS=600 RATE_LIMIT_WINDOW_SEC=60 RATE_LIMIT_BURST=40
+  → allows 600 req/min sustained per (principal, ip) bucket, with a burst
+  of up to 40 extra tokens — see config.Settings.rate_limit_requests for
+  the reasoning behind these numbers.
+
+TRUSTED_PROXY_IPS is empty by default, meaning X-Forwarded-For / X-Real-IP
+are never trusted and the rate limiter always keys on the raw TCP peer
+address. Set it only when this server sits behind a known reverse proxy
+(so the proxy's own address is what request.client.host reports) —
+otherwise any direct client can bypass its per-IP limit by sending a
+different made-up X-Forwarded-For value on every request.
+
+Concurrency tuning
+------------------
+MAX_CONCURRENT_REQUESTS — max parallel capped requests before 503 (default: 10).
+Applies to POST /query, POST /query/stream, POST /v2/sessions/{sid}/turns,
+and PATCH /v2/sessions/{sid}/turns/{tid}/assumptions (i.e., all routes that
+run the blocking pipeline: LLM call + database query).
+
+QUERY_THREAD_LIMIT — max concurrent worker threads for blocking operations
+(default: 16). Enforced by ONE shared module-level ``asyncio.Semaphore`` in
+``api/concurrency.py`` (see that module's docstring for why a single
+semaphore, not one per event loop). This is separate from
+ConcurrencyMiddleware's admission control: the middleware decides whether
+to accept a request at all (503 when over capacity); that semaphore
+decides how many accepted requests occupy a worker thread simultaneously.
+
+Security headers (Finding 7, 2026 audit)
+-----------------------------------------
+``SecurityHeadersMiddleware`` (registered outermost in ``api/server.py``, so
+it sees every response including ones produced by the exception handlers
+below it) adds ``X-Content-Type-Options``, ``X-Frame-Options`` and
+``Referrer-Policy`` to every response and strips the ``Server`` header.
+Deliberately does **not** add ``Strict-Transport-Security`` — this process
+never terminates TLS, so asserting HSTS from here would be a promise the
+wrong layer makes, and a broken one the moment this app runs in its normal
+mode: plain HTTP behind a reverse proxy. See
+``tests/security_audit/test_security_headers.py`` for the reasoning this
+codifies and ``docs/`` / the reverse-proxy config for where HSTS belongs
+instead.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+import uuid
+from collections import OrderedDict
+from dataclasses import dataclass
+from threading import Lock
+
+import re
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+import config as cfg
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Env-var configuration
+# ---------------------------------------------------------------------------
+
+_MAX_CONCURRENT: int = int(os.getenv("MAX_CONCURRENT_REQUESTS", "10"))
+_MAX_TRACKED_IPS: int = int(os.getenv("RATE_LIMIT_MAX_TRACKED_IPS", "10000"))
+
+# RATE_LIMIT_REQUESTS / RATE_LIMIT_WINDOW_SEC / RATE_LIMIT_BURST are
+# deliberately NOT read here as module-level constants (contrast
+# _MAX_CONCURRENT / _MAX_TRACKED_IPS just above, which are out of this
+# change's scope) -- they now live on config.Settings
+# (rate_limit_requests / rate_limit_window_seconds / rate_limit_burst) and
+# are read through cfg.settings at RateLimitMiddleware construction time
+# instead, so config.override_settings() reaches a middleware instance
+# built with no explicit constructor kwargs. See that class's __init__ and
+# config.Settings' own fields for the full reasoning.
+
+# IPs allowed to supply X-Forwarded-For / X-Real-IP for rate-limit purposes
+# — i.e. known reverse proxies sitting in front of this server. Empty by
+# default: trust nothing, since a server exposed directly to the internet
+# must never let a client set its own rate-limit identity via a header.
+_TRUSTED_PROXIES: frozenset[str] = frozenset(
+    ip.strip() for ip in os.getenv("TRUSTED_PROXY_IPS", "").split(",") if ip.strip()
+)
+
+# Paths that are exempt from rate limiting. Only read-only endpoints
+# belong here: /cache/clear and /cache/invalidate are unauthenticated,
+# state-mutating POST endpoints (see api/server.py) and must NOT be
+# exempt, or anyone can flush/evict the shared query cache as fast as
+# the network allows.
+#
+# /health itself is a known DoS surface (tracked for Phase 8, not fixed
+# here): each call performs two real ~5s network probes (the LLM endpoint +
+# database) against the shared connection pool, so even a rate-limited
+# flood of /health requests can still exhaust pool capacity for real
+# /query traffic. It stays exempt for now because liveness checks (load
+# balancers, container orchestrators) must never be rate-limited away.
+_EXEMPT_PATHS: frozenset[str] = frozenset({
+    "/health",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
+    "/cache/stats",
+})
+
+
+# ---------------------------------------------------------------------------
+# 1. Request ID
+# ---------------------------------------------------------------------------
+
+class RequestIDMiddleware(BaseHTTPMiddleware):
+    """Ensure every request and response carries an X-Request-ID header."""
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+        request.state.request_id = request_id
+
+        start = time.perf_counter()
+        response: Response = await call_next(request)
+        elapsed = time.perf_counter() - start
+
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Response-Time"] = f"{elapsed:.3f}s"
+        return response
+
+
+# ---------------------------------------------------------------------------
+# 2. Rate limiter  (token-bucket per IP)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _Bucket:
+    """Token-bucket state for a single IP.
+
+    ``last_refill`` is deliberately required rather than defaulting to
+    ``time.monotonic()``: the caller must stamp it with the very same
+    *now* it uses to compute ``elapsed``. A factory reading the clock
+    independently is called *after* the caller's reading, which makes a
+    brand-new bucket's first ``elapsed`` slightly negative and shaves an
+    epsilon off its starting tokens -- enough to spuriously reject the
+    very first request when capacity is exactly 1.
+    """
+    tokens: float
+    last_refill: float
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """Per-IP token-bucket rate limiter.
+
+    Parameters
+    ----------
+    requests_per_window:
+        Sustained request allowance (tokens refilled over *window_seconds*).
+        ``None`` (the default) reads :attr:`config.Settings.rate_limit_requests`
+        through ``cfg.settings`` **at construction time** — i.e. when this
+        middleware is actually instantiated (Starlette builds
+        ``api.server.app``'s middleware stack lazily, on its first request,
+        and caches the result for the app's lifetime — see
+        :attr:`config.Settings.rate_limit_requests`'s own docstring for why
+        that matters for the shared test-suite app). Passing an explicit
+        int (as most of this module's own tests do, and as any deployment
+        overriding the env-derived default in code rather than via
+        ``RATE_LIMIT_REQUESTS`` would) always wins over ``cfg.settings``.
+    window_seconds:
+        Length of the refill window in seconds. ``None`` reads
+        :attr:`config.Settings.rate_limit_window_seconds` the same way.
+    burst:
+        Extra tokens above the sustained rate that a client can spend
+        instantly (capacity = requests_per_window + burst). ``None`` reads
+        :attr:`config.Settings.rate_limit_burst` the same way.
+    trusted_proxies:
+        IPs whose ``X-Forwarded-For`` / ``X-Real-IP`` headers are honoured
+        for rate-limiting. Any direct client whose TCP peer address is
+        *not* in this set has its headers ignored outright — otherwise a
+        direct client could bypass its own per-IP limit forever simply by
+        sending a different made-up ``X-Forwarded-For`` value on every
+        request. Defaults to :data:`_TRUSTED_PROXIES` (empty unless
+        ``TRUSTED_PROXY_IPS`` is set), i.e. trust nothing.
+    max_tracked_ips:
+        Maximum number of distinct client buckets kept in memory at once.
+        The store is keyed by client IP, which is spoofable by anyone
+        whose header isn't trusted (see trusted_proxies above) and, at a
+        minimum, always attacker-controllable in the sense that any
+        client can make requests from many source addresses -- so left
+        unbounded it is a memory-exhaustion vector. Beyond this many
+        distinct clients, the least-recently-seen bucket is evicted to
+        make room for a new one -- the same LRU policy QueryCache already
+        uses for cached responses.
+    """
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        requests_per_window: int | None = None,
+        window_seconds: float | None = None,
+        burst: int | None = None,
+        trusted_proxies: frozenset[str] = _TRUSTED_PROXIES,
+        max_tracked_ips: int = _MAX_TRACKED_IPS,
+        auth_failure_requests_per_window: int | None = None,
+        auth_failure_window_seconds: float | None = None,
+        auth_failure_burst: int | None = None,
+    ) -> None:
+        super().__init__(app)
+        # Resolved through cfg.settings HERE, at construction time, rather
+        # than via Python default-parameter values (which would be baked
+        # in once, at this module's own import time -- exactly the
+        # import-time-capture problem this whole change moves away from).
+        # A caller passing an explicit value always wins; None means "ask
+        # cfg.settings right now".
+        if requests_per_window is None or window_seconds is None or burst is None:
+            if requests_per_window is None:
+                requests_per_window = cfg.settings.rate_limit_requests
+            if window_seconds is None:
+                window_seconds = cfg.settings.rate_limit_window_seconds
+            if burst is None:
+                burst = cfg.settings.rate_limit_burst
+        self._requests_per_window: int = requests_per_window
+        self._capacity: float = requests_per_window + burst
+        self._refill_rate: float = requests_per_window / window_seconds  # tokens / second
+        self._window: float = window_seconds
+        self._trusted_proxies: frozenset[str] = trusted_proxies
+        self._max_tracked_ips: int = max_tracked_ips
+        self._buckets: OrderedDict[str, _Bucket] = OrderedDict()
+        self._lock = Lock()
+
+        # A small, SEPARATE bucket namespace for requests whose
+        # Authorization header failed to resolve to a principal (admin
+        # panel phase 6 -- see this class's own docstring section below
+        # and docs/admin-panel-architecture.md §9). Resolved the same
+        # "None means ask cfg.settings now" way as the block above.
+        if (
+            auth_failure_requests_per_window is None
+            or auth_failure_window_seconds is None
+            or auth_failure_burst is None
+        ):
+            if auth_failure_requests_per_window is None:
+                auth_failure_requests_per_window = cfg.settings.auth_failure_rate_limit_requests
+            if auth_failure_window_seconds is None:
+                auth_failure_window_seconds = cfg.settings.auth_failure_rate_limit_window_seconds
+            if auth_failure_burst is None:
+                auth_failure_burst = cfg.settings.auth_failure_rate_limit_burst
+        self._auth_failure_requests_per_window: int = auth_failure_requests_per_window
+        self._auth_failure_capacity: float = auth_failure_requests_per_window + auth_failure_burst
+        self._auth_failure_refill_rate: float = (
+            auth_failure_requests_per_window / auth_failure_window_seconds
+        )
+        self._auth_failure_window: float = auth_failure_window_seconds
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+
+    def _client_ip(self, request: Request) -> str:
+        """Best-effort client IP extraction.
+
+        ``X-Forwarded-For`` / ``X-Real-IP`` are only honoured when the
+        request's actual TCP peer is a configured trusted proxy — anyone
+        else's copy of these headers is attacker-controlled and ignored,
+        falling back straight to the real socket address.
+        """
+        direct_ip = request.client.host if request.client else "unknown"
+        if direct_ip not in self._trusted_proxies:
+            return direct_ip
+
+        forwarded_for = request.headers.get("x-forwarded-for")
+        if forwarded_for:
+            return forwarded_for.split(",")[0].strip()
+        real_ip = request.headers.get("x-real-ip")
+        if real_ip:
+            return real_ip.strip()
+        return direct_ip
+
+    def _bucket_key(self, request: Request) -> str:
+        """The rate-limit bucket identity for *request* (Phase 8).
+
+        Keyed on the **pair** (principal, ip) when the caller is
+        authenticated, because either half alone collapses in a real
+        deployment:
+
+        * **IP alone.** Behind a shared proxy every caller's
+          ``request.client.host`` is the same proxy address, so the whole
+          organisation shares one bucket.
+        * **Principal alone.** An organisation that fronts this API with
+          one web UI issues that UI a single service key — so every user
+          of it shares one bucket. This was the shape shipped in Phase 8,
+          and it traded the first collapse for the second rather than
+          fixing it. The test suite made it visible: 1800+ requests under
+          a single test principal exhausted one bucket and produced
+          intermittent 429s that looked like unrelated test flakiness.
+
+        The pair separates per-user keys behind one proxy *and* distinct
+        clients sharing one service key. One shared key behind one proxy
+        still collapses, but that traffic is genuinely indistinguishable.
+
+        ``api.auth.AuthMiddleware`` must run before this middleware — see
+        ``api/server.py``'s middleware ordering. An unauthenticated
+        request (missing/invalid key, or ``AUTH_REQUIRED=false`` with no
+        key presented) falls back to the IP-only key.
+
+        A request whose ``Authorization`` header was presented but did
+        NOT resolve to a principal (``request.state.auth_failed`` set by
+        ``AuthMiddleware`` — admin panel phase 6) gets a key in its OWN
+        namespace (``"authfail|ip:<ip>"``), never ``"ip:<ip>"`` — see this
+        class's own docstring's "Bucket identity" section for why that
+        separation exists. Checked with ``is True`` rather than a plain
+        truthy test so a caller that never sets the attribute at all
+        (``getattr`` returning its ``False`` default, or — in a unit test
+        driving this method with a bare ``unittest.mock.MagicMock``
+        request — an auto-created mock attribute that is not itself the
+        object ``True``) is never mistaken for a real auth failure.
+        """
+        ip = self._client_ip(request)
+        principal = getattr(request.state, "principal", None)
+        if principal is not None:
+            return f"principal:{principal.id}|ip:{ip}"
+        if getattr(request.state, "auth_failed", False) is True:
+            return f"authfail|ip:{ip}"
+        return f"ip:{ip}"
+
+    def _consume(
+        self, bucket_key: str, *, capacity: float | None = None, refill_rate: float | None = None,
+    ) -> tuple[bool, float]:
+        """Try to consume one token for *bucket_key* (an IP- or principal-keyed identity).
+
+        *capacity*/*refill_rate* default to this instance's shared,
+        default-bucket values (``None`` means "use those") — pass the
+        auth-failure-bucket values explicitly (see ``dispatch``) for a key
+        produced by :meth:`_bucket_key`'s auth-failure branch, so that
+        namespace is governed by its own, much smaller allowance instead of
+        silently reusing the shared bucket's numbers.
+
+        Returns
+        -------
+        (allowed, retry_after)
+            *allowed* — True if the request is permitted.
+            *retry_after* — seconds until next token is available (0 if allowed).
+        """
+        if capacity is None:
+            capacity = self._capacity
+        if refill_rate is None:
+            refill_rate = self._refill_rate
+
+        now = time.monotonic()
+        with self._lock:
+            bucket = self._buckets.get(bucket_key)
+            if bucket is None:
+                if len(self._buckets) >= self._max_tracked_ips:
+                    self._buckets.popitem(last=False)  # evict least-recently-seen
+                # Stamp last_refill with *this* call's `now` so a fresh
+                # bucket's first `elapsed` is exactly 0.0, never negative.
+                bucket = _Bucket(tokens=capacity, last_refill=now)
+                self._buckets[bucket_key] = bucket
+            else:
+                self._buckets.move_to_end(bucket_key)
+
+            # Refill tokens proportional to elapsed time
+            elapsed = now - bucket.last_refill
+            bucket.tokens = min(
+                capacity,
+                bucket.tokens + elapsed * refill_rate,
+            )
+            bucket.last_refill = now
+
+            if bucket.tokens >= 1.0:
+                bucket.tokens -= 1.0
+                return True, 0.0
+            else:
+                retry_after = (1.0 - bucket.tokens) / refill_rate
+                return False, retry_after
+
+    # ------------------------------------------------------------------
+    # dispatch
+    # ------------------------------------------------------------------
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        if request.url.path in _EXEMPT_PATHS:
+            return await call_next(request)
+
+        is_auth_failure = getattr(request.state, "auth_failed", False) is True
+        key = self._bucket_key(request)
+        if is_auth_failure:
+            capacity = self._auth_failure_capacity
+            refill_rate = self._auth_failure_refill_rate
+            requests_per_window = self._auth_failure_requests_per_window
+            window = self._auth_failure_window
+        else:
+            capacity = self._capacity
+            refill_rate = self._refill_rate
+            requests_per_window = self._requests_per_window
+            window = self._window
+
+        allowed, retry_after = self._consume(key, capacity=capacity, refill_rate=refill_rate)
+
+        if not allowed:
+            request_id = getattr(request.state, "request_id", "")
+            logger.warning(
+                "[%s] Rate limit exceeded for %s — retry in %.1fs",
+                request_id,
+                key,
+                retry_after,
+            )
+            principal = getattr(request.state, "principal", None)
+            if principal is not None:
+                # Admin panel phase 6 §4: the per-analyst usage report
+                # needs to know how many times a principal hit the limit,
+                # and the ONLY existing record of "what happened" is the
+                # analyst audit log analyze_audit_log.py already reads —
+                # a 429 never reaches api/runner.py (it is rejected right
+                # here, before the route even runs), so without this call
+                # that log would have no idea a rate-limit rejection ever
+                # happened. See scripts.analyze_audit_log.per_principal_usage
+                # and its own module docstring for how this is read back.
+                # Deliberately NOT observability.audit.save_audit_record:
+                # that log's own contract is "one record per API query"
+                # (see its module docstring) and a throttled request never
+                # became one.
+                from scripts.analyze_audit_log import record_rate_limit_hit
+
+                record_rate_limit_hit(principal.id, request.url.path)
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "error": {
+                        "code": "RATE_LIMIT_EXCEEDED",
+                        "message": (
+                            f"Rate limit exceeded (this is a client throttling "
+                            f"response, not a query or model failure). "
+                            f"Allowed {requests_per_window} requests per "
+                            f"{int(window)}s window for this caller. "
+                            f"Retry after {retry_after:.1f}s."
+                        ),
+                        "request_id": request_id,
+                        "path": str(request.url.path),
+                        "retry_after_seconds": round(retry_after, 2),
+                    }
+                },
+                headers={"Retry-After": str(int(retry_after) + 1)},
+            )
+
+        response = await call_next(request)
+        # Informational headers so clients can self-throttle
+        response.headers["X-RateLimit-Limit"] = str(requests_per_window)
+        response.headers["X-RateLimit-Window"] = str(int(window))
+        return response
+
+
+# ---------------------------------------------------------------------------
+# 3. Concurrency limiter
+# ---------------------------------------------------------------------------
+
+def _is_capped_request(path: str, method: str) -> bool:
+    """Check if a request path and method should be subject to concurrency capping.
+
+    A request is capped (must acquire a slot before proceeding) if it runs
+    a blocking pipeline operation:
+
+    - ``POST /query``: translate question to SQL and/or execute
+    - ``POST /query/stream``: same, streamed as Server-Sent Events
+    - ``POST /v2/sessions/{session_id}/turns``: conversational mode
+    - ``PATCH /v2/sessions/{session_id}/turns/{turn_id}/assumptions``:
+      override assumptions and re-run the turn
+
+    Everything else (health, docs, GET/DELETE sessions, feedback, memory,
+    admin operations) proceeds without acquiring a slot, because they do
+    not run the core blocking pipeline (LLM call + database query).
+    """
+    if method == "POST" and (path == "/query" or path == "/query/stream"):
+        return True
+    if method == "POST" and re.match(r"^/v2/sessions/[^/]+/turns$", path):
+        return True
+    if method == "PATCH" and re.match(r"^/v2/sessions/[^/]+/turns/[^/]+/assumptions$", path):
+        return True
+    return False
+
+
+class ConcurrencyMiddleware:
+    """ASGI middleware that caps concurrent pipeline requests and holds slots until response complete.
+
+    Applies to POST /query, POST /query/stream, POST /v2/sessions/{session_id}/turns
+    (with or without ?stream), and PATCH .../turns/{turn_id}/assumptions (see
+    ``_is_capped_request``). Other routes pass through uncapped.
+
+    Implementation (pure ASGI)
+    -------------------------
+    Unlike the previous BaseHTTPMiddleware version, this is a pure ASGI middleware:
+    __init__ and __call__ (the ASGI entry point). For capped requests, a slot is acquired
+    before awaiting self.app(scope, receive, send), and released in a finally block
+    after the full response (including any streaming body) has been sent. This ensures:
+
+    1. Streaming responses hold the slot until the body is completely sent or the
+       client disconnects (BaseHTTPMiddleware's call_next returns as soon as response
+       headers are ready, before the body streams, so the old version released slots
+       too early).
+    2. A client disconnect or exception always releases the slot, never leaking counts.
+    3. The slot is held for the actual work duration, not just the HTTP handshake.
+
+    In-flight requests are tracked with a plain counter guarded by a threading.Lock
+    (the same primitive RateLimitMiddleware uses). The accept-or-reject decision and
+    the matching increment happen inside the lock with no await in between, so the
+    decision is atomic against both asyncio tasks on the same event loop and OS-thread
+    concurrency from multiple TestClient instances hitting the same app.
+
+    The wrapped app is stored as ``self.app`` (not a name-mangled ``self._app``) to
+    match the attribute name every other ASGI middleware in this stack uses
+    (``BaseHTTPMiddleware.__init__`` does the same) -- among other things, that
+    uniform name is what lets a test walk a live, already-built middleware stack
+    (``app.middleware_stack``, then repeatedly follow ``.app``) to find whichever
+    instance is actually wired into a running app, regardless of which middleware
+    classes sit around it.
+
+    Reading the request id on rejection
+    ------------------------------------
+    ``RequestIDMiddleware`` stamps the id via ``request.state.request_id = ...``,
+    which (per Starlette's ``Request.state`` implementation) writes into
+    ``scope["state"]["request_id"]`` -- ``scope`` is an ordinary ``dict``, not an
+    object with a ``.state`` attribute, so it must be read back with
+    ``scope.get("state", {}).get("request_id", "")``, never ``hasattr(scope,
+    "state")`` (which is always False for a dict and silently produced an empty
+    id in every 503 this middleware ever sent).
+
+    The 503 response itself is built with ``starlette.responses.JSONResponse``
+    and sent by calling it as an ASGI app (``await response(scope, receive,
+    send)``) rather than hand-assembling ``http.response.start`` /
+    ``http.response.body`` messages, so it gets a correct ``Content-Length``
+    (and the same ``content-type: application/json`` framing) the same way
+    every other JSON error response in this codebase does -- a hand-rolled send
+    left ``Content-Length`` out entirely.
+    """
+
+    def __init__(self, app: ASGIApp, max_concurrent: int = _MAX_CONCURRENT) -> None:
+        self.app = app
+        self._max = max_concurrent
+        self._active = 0
+        self._lock = Lock()
+
+    def _try_acquire(self) -> bool:
+        """Atomically accept-and-count, or refuse. Never blocks."""
+        with self._lock:
+            if self._active >= self._max:
+                return False
+            self._active += 1
+            return True
+
+    def _release(self) -> None:
+        with self._lock:
+            self._active -= 1
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        method = scope.get("method", "")
+
+        if not _is_capped_request(path, method):
+            await self.app(scope, receive, send)
+            return
+
+        if not self._try_acquire():
+            # scope is a plain dict, not an object -- RequestIDMiddleware's
+            # request.state.request_id = ... writes into
+            # scope["state"]["request_id"] (see this class's docstring).
+            request_id = scope.get("state", {}).get("request_id", "")
+
+            logger.warning(
+                "[%s] Server overload — %d/%d slots used",
+                request_id,
+                self._active,
+                self._max,
+            )
+
+            error_body = {
+                "error": {
+                    "code": "SERVER_OVERLOAD",
+                    "message": (
+                        f"Server is at capacity ({self._max} concurrent requests). "
+                        "Please retry in a few seconds."
+                    ),
+                    "request_id": request_id,
+                    "path": path,
+                }
+            }
+
+            response = JSONResponse(
+                error_body, status_code=503, headers={"Retry-After": "5"},
+            )
+            await response(scope, receive, send)
+            return
+
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            self._release()
+
+
+# ---------------------------------------------------------------------------
+# 5. Security headers
+# ---------------------------------------------------------------------------
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Attach a minimal, defensible set of security headers to every response.
+
+    Finding 7 of the 2026 audit: a live authenticated ``200`` from this
+    service carried exactly ``server: uvicorn`` and ``x-request-id`` —
+    none of ``X-Content-Type-Options``, ``X-Frame-Options`` or
+    ``Referrer-Policy``, and a repo-wide grep for those names returned
+    zero hits. This is a JSON API, so the payoff is modest next to the
+    HTML this project also ships (covered separately by a ``<meta>`` CSP
+    under ``web/`` — see that directory and
+    ``tests/security_audit/test_admin_panel_xss.py``), but a response
+    body from this process **is** sometimes rendered — an error page, the
+    hand-registered ``/docs`` — and the headers cost nothing to send
+    unconditionally rather than trying to guess which route needs them.
+
+    Registered as the outermost layer in ``api/server.py`` (the last
+    ``add_middleware()`` call), specifically so it also wraps the
+    exception-handling middleware FastAPI installs beneath every
+    user-added layer: a 401 or 500 body is exactly as renderable as a 200
+    one, and the whole point of a blanket middleware is that nobody has
+    to remember to apply it per status code.
+
+    What is deliberately absent
+    ----------------------------
+    * ``Strict-Transport-Security`` — a claim about the TLS terminator.
+      This process does not terminate TLS; it is meant to run behind a
+      reverse proxy (or with no TLS at all, in local/dev use). Emitting
+      HSTS from here would assert something the app cannot back, and
+      would be actively wrong — browsers *remember* HSTS — the moment
+      someone runs this in the plain-HTTP mode it is normally deployed
+      in. Configure HSTS at the TLS terminator instead.
+    * ``Content-Security-Policy`` — a policy against inline scripts,
+      remote frames, etc. only means something for HTML responses, and
+      this middleware runs in front of a JSON API. The HTML this project
+      ships is covered by its own ``<meta>`` CSP instead, because a
+      header this process sets cannot reach a page a different origin
+      serves.
+    """
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        response: Response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        # Remove rather than rewrite: a "Server" header naming this
+        # process's stack (and, on some builds, its version) is a free
+        # fingerprint for an attacker and serves no client. If a
+        # front-facing proxy wants to advertise its own value it is free
+        # to set one; this process should not volunteer anything.
+        if "server" in response.headers:
+            del response.headers["server"]
+        return response

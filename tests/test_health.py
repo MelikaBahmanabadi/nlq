@@ -1,0 +1,227 @@
+# SPDX-License-Identifier: BUSL-1.1
+# Copyright (c) 2024-2026 Ali Sadeghi Aghili
+"""Unit tests for api/health.py — the OpenAI-compatible /models probe + DB ping.
+
+api/test_api_endpoints.py::TestHealth exercises the endpoint with
+check_health() mocked wholesale; this file exercises check_health's own
+two probes directly, with requests/the DB engine mocked instead.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+import config as cfg
+from api.health import _ping_datasource, _ping_db, _ping_openai, check_health
+
+
+def _response(status: int) -> MagicMock:
+    resp = MagicMock()
+    resp.status_code = status
+    return resp
+
+
+class TestPingOpenAI:
+    """The probe must agree with the engine, or its light lies.
+
+    Both assertions below encode a real incident: the CLI answered
+    questions perfectly through the configured endpoint while this UI
+    showed the LLM light red, because the probe and
+    ``llm.providers.OpenAIBackend`` disagreed about two things.
+    """
+
+    def test_true_on_200(self):
+        with cfg.override_settings(openai_base_url="http://localhost:8000/v1", openai_api_key="k"):
+            with patch("requests.get", return_value=_response(200)) as get:
+                ok, detail = _ping_openai()
+                assert ok is True
+        assert get.call_args.kwargs["headers"]["Authorization"] == "Bearer k"
+        assert get.call_args[0][0] == "http://localhost:8000/v1/models"
+        assert "200" in detail
+
+    def test_no_authorization_header_at_all_when_the_key_is_empty(self):
+        """An empty key means NO header, never ``Bearer `` with nothing after it.
+
+        Many self-hosted OpenAI-compatible servers check no credentials,
+        so an empty key is legitimate -- and a malformed header is not the
+        same as an absent one: plenty of servers answer the first with 401
+        and the second with 200. ``OpenAIBackend._headers`` omits it, so
+        the engine worked where this probe did not.
+        """
+        with cfg.override_settings(openai_api_key=""):
+            with patch("requests.get", return_value=_response(200)) as get:
+                ok, _ = _ping_openai()
+                assert ok is True
+        assert "Authorization" not in get.call_args.kwargs["headers"], (
+            "sending 'Bearer ' with an empty token is what made a working "
+            "endpoint report as unreachable"
+        )
+
+    def test_missing_models_endpoint_is_not_a_fault(self):
+        """404 on /models means only that a server lacks an endpoint we never call.
+
+        Generation goes to /chat/completions. Reporting this as down is a
+        false negative, and a health light that cries wolf gets ignored
+        exactly when it matters.
+        """
+        for status in (404, 405):
+            with patch("requests.get", return_value=_response(status)):
+                ok, detail = _ping_openai()
+            assert ok is True, f"HTTP {status} on /models must not be reported as down"
+            assert "chat/completions" in detail
+
+    def test_rejected_credentials_are_a_fault_and_say_so(self):
+        for status in (401, 403):
+            with patch("requests.get", return_value=_response(status)):
+                ok, detail = _ping_openai()
+            assert ok is False
+            assert "OPENAI_API_KEY" in detail, (
+                "a reachable endpoint that refuses our key is a different "
+                "problem from an unreachable one, and needs a different fix"
+            )
+
+    def test_false_on_other_non_200(self):
+        with patch("requests.get", return_value=_response(500)):
+            ok, detail = _ping_openai()
+        assert ok is False
+        assert "500" in detail
+
+    def test_false_on_exception_names_the_failure(self):
+        with patch("requests.get", side_effect=OSError("no network")):
+            ok, detail = _ping_openai()
+        assert ok is False
+        assert "unreachable" in detail and "OSError" in detail
+
+
+class TestPingDb:
+    """Idle-aware-ping follow-up to Finding 1, 2026 warehouse-load audit:
+    checkout alone no longer proves liveness (a connection reused within
+    ``DB_POOL_PING_IDLE_SECONDS`` is handed back unprobed -- see
+    ``database.pool_ping``), so ``_ping_db`` always runs its own explicit
+    ``SELECT 1`` regardless of ``cfg.settings.db_pool_pre_ping``. See
+    ``_ping_db``'s own docstring for the one-round-trip-usually,
+    two-in-a-rare-case accounting.
+    """
+
+    def test_pre_ping_on_still_runs_an_explicit_select_1(self):
+        """Checkout no longer guarantees a probe by itself once idle-aware
+        ping is in play, so this function must not skip its own check just
+        because ``db_pool_pre_ping`` is on."""
+        fake_conn = MagicMock()
+        fake_engine = MagicMock()
+        fake_engine.connect.return_value.__enter__.return_value = fake_conn
+        with cfg.override_settings(db_pool_pre_ping=True), \
+             patch("database.connection.get_engine", return_value=fake_engine):
+            ok, detail = _ping_db()
+        assert ok is True
+        assert "SELECT 1" in detail
+        fake_conn.execute.assert_called_once()
+
+    def test_pre_ping_off_runs_exactly_one_explicit_select_1(self):
+        """With ``pool_pre_ping`` off, checkout performs no liveness check
+        of its own, so this is the ONLY round trip that can prove the
+        database actually answers a query."""
+        fake_conn = MagicMock()
+        fake_engine = MagicMock()
+        fake_engine.connect.return_value.__enter__.return_value = fake_conn
+        with cfg.override_settings(db_pool_pre_ping=False), \
+             patch("database.connection.get_engine", return_value=fake_engine):
+            ok, detail = _ping_db()
+        assert ok is True
+        assert "SELECT 1" in detail
+        fake_conn.execute.assert_called_once()
+
+    def test_false_on_exception_names_the_exception(self):
+        with patch("database.connection.get_engine", side_effect=RuntimeError("down")):
+            ok, detail = _ping_db()
+        assert ok is False
+        assert "RuntimeError" in detail
+
+
+class TestPingDbMultipleSources:
+    """Multiple warehouse data sources (``database.datasources``): every
+    configured source is pinged, and the single-source detail shape stays
+    exactly as before -- see ``_ping_db``'s own docstring."""
+
+    def test_single_source_detail_is_unchanged(self):
+        """No ``datasources.yaml`` (the default): ``_ping_db``'s detail
+        must be exactly ``_ping_datasource``'s own detail, not wrapped in
+        a ``"default: ..."`` prefix -- byte-for-byte the pre-existing
+        shape."""
+        with patch("api.health._ping_datasource", return_value=(True, "SELECT 1 succeeded")):
+            ok, detail = _ping_db()
+        assert ok is True
+        assert detail == "SELECT 1 succeeded"
+
+    def test_several_sources_are_all_pinged_and_named_in_the_detail(self):
+        with patch(
+            "database.datasources.datasource_names", return_value=("main", "archive"),
+        ), patch(
+            "api.health._ping_datasource",
+            side_effect=[(True, "SELECT 1 succeeded"), (False, "OperationalError: down")],
+        ) as mock_ping:
+            ok, detail = _ping_db()
+        assert ok is False  # not every source is up
+        assert mock_ping.call_args_list == [(("main",),), (("archive",),)]
+        assert detail == "main: SELECT 1 succeeded; archive: OperationalError: down"
+
+    def test_ok_only_when_every_source_answers(self):
+        with patch(
+            "database.datasources.datasource_names", return_value=("main", "archive"),
+        ), patch(
+            "api.health._ping_datasource",
+            side_effect=[(True, "up"), (True, "up")],
+        ):
+            ok, _ = _ping_db()
+        assert ok is True
+
+    def test_an_invalid_datasources_yaml_is_a_health_failure_not_a_crash(self):
+        with patch(
+            "database.datasources.datasource_names",
+            side_effect=ValueError("[datasources.yaml] bad"),
+        ):
+            ok, detail = _ping_db()
+        assert ok is False
+        assert "bad" in detail
+
+    def test_ping_datasource_uses_the_named_engine(self):
+        fake_conn = MagicMock()
+        fake_engine = MagicMock()
+        fake_engine.connect.return_value.__enter__.return_value = fake_conn
+        with patch("database.connection.get_engine", return_value=fake_engine) as mock_get_engine:
+            ok, detail = _ping_datasource("archive")
+        assert ok is True
+        assert "SELECT 1" in detail
+        mock_get_engine.assert_called_once_with("archive")
+
+
+class TestCheckHealth:
+    def test_ok_when_both_reachable(self):
+        with patch("api.health._ping_openai", return_value=(True, "up")),              patch("api.health._ping_db", return_value=(True, "up")):
+            resp = check_health()
+        assert resp.status == "ok"
+        assert resp.openai is True
+        assert resp.database is True
+
+    def test_degraded_when_only_one_reachable(self):
+        with patch("api.health._ping_openai", return_value=(True, "up")),              patch("api.health._ping_db", return_value=(False, "nope")):
+            resp = check_health()
+        assert resp.status == "degraded"
+
+    def test_down_when_neither_reachable(self):
+        with patch("api.health._ping_openai", return_value=(False, "nope")),              patch("api.health._ping_db", return_value=(False, "nope")):
+            resp = check_health()
+        assert resp.status == "down"
+
+    def test_model_reflects_current_settings(self):
+        with cfg.override_settings(openai_model="gpt-oss-20b"):
+            with patch("api.health._ping_openai", return_value=(True, "up")),                  patch("api.health._ping_db", return_value=(True, "up")):
+                resp = check_health()
+        assert resp.model == "gpt-oss-20b"
+
+    def test_the_reason_reaches_the_response(self):
+        """A red light with no reason is what made this undiagnosable."""
+        with patch("api.health._ping_openai", return_value=(False, "endpoint refused our key")),              patch("api.health._ping_db", return_value=(True, "SELECT 1 succeeded")):
+            resp = check_health()
+        assert resp.openai_detail == "endpoint refused our key"
+        assert resp.database_detail == "SELECT 1 succeeded"

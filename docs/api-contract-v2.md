@@ -1,0 +1,892 @@
+# API contract v2 — conversational sessions
+
+Status: **design, frozen for implementation**. Authored as the shared interface
+so the web UI and the backend can be built independently and wired later.
+
+This supersedes the single-shot `POST /query` shape for interactive use.
+`POST /query` stays as-is for scripted/one-off callers and stays backward
+compatible — v2 is additive.
+
+---
+
+## 1. Why sessions
+
+The single-shot API forces every question to be self-contained. Real analytical
+use is iterative:
+
+```
+Q1  معاملات مشتری‌های تالار سیمان را نشان بده
+    → 342 rows
+Q2  از بین آن‌ها ۱۰ مشتری برتر به لحاظ حجم معامله
+    → refines Q1
+Q3  همین را برای سال قبل
+    → refines Q2
+```
+
+Q2 and Q3 are meaningless without Q1. A session carries that state explicitly
+rather than hoping a stateless prompt can reconstruct it.
+
+---
+
+## 2. The two semantics of "among those"
+
+**This is the load-bearing design decision of v2. Read it before implementing.**
+
+When the user says «از بین آن‌ها» / "among those", there are two possible
+referents and they return *different answers*:
+
+| Reading | Means | Correct? |
+|---|---|---|
+| **A — among the rows displayed** | Wrap Q1's SQL, `TOP` included, as a CTE and rank within it | Almost always **wrong**. Q1 was truncated for display at `TOP 100`; the true top-10 by volume may not be in those 100 rows at all. |
+| **B — among all rows matching the previous filter** | Reuse Q1's *predicate*, drop Q1's display `TOP`, then rank and take 10 | Almost always what the user means. |
+
+v2 implements **B**, and must state that it did so as an explicit assumption
+(see §5). Silently choosing either reading is unacceptable — the two give
+different numbers and the user cannot tell which they got.
+
+Composition when `basis.kind == "refines"`:
+
+```sql
+WITH _prev AS (
+    -- previous turn's SQL, with its outermost display TOP removed
+    -- and an inner safety cap of settings.refinement_scan_cap applied
+)
+SELECT TOP 10 CustomerName, SUM(Volume) AS TotalVolume
+FROM _prev
+GROUP BY CustomerName
+ORDER BY TotalVolume DESC
+```
+
+Two hard requirements:
+
+1. The **composed** statement is what the guard validates and what executes.
+   Never validate the fragment and then splice it — that is how injection gets
+   in through the back door.
+2. Removing the previous `TOP` uncaps the inner scan, so a separate
+   `refinement_scan_cap` (default: `max_rows_returned * 100`, configurable)
+   bounds it. If the inner scan hits that cap, the turn's `warnings` must say
+   the refinement was computed over a truncated base — a wrong number the user
+   knows about beats a wrong number they don't.
+
+**An `assumption_overrides` PATCH that changes an inherited filter (2026
+overridden refinement filters) forces composition `"none"`, not `"cte"`.** `_prev`
+above is `previous turn's SQL`, verbatim — the previous turn's inherited
+filter (e.g. `ring=تالار سیمان`) is already baked into that SQL text, so
+composing over it unchanged while the chip shows a *different*, overridden
+value would make the chip and the executed SQL disagree, silently. When an
+override changes a filter this turn would otherwise inherit unchanged, the
+server routes the turn through fresh generation instead (the overridden
+value folded into the filters that generation sees), and `basis.composition`
+reports `"none"` honestly — a client must not assume a `"cte"`-triggering
+question phrase (§2's cue list) always yields `composition: "cte"` in the
+response; an override on the same turn can change that. `basis.kind` stays
+`"refines"` either way (this is still conceptually a refinement — a fresh
+generation with inherited filters, the same shape a carry-forward turn like
+"همین را برای سال قبل" already uses).
+
+---
+
+## 3. Endpoints
+
+```
+POST   /v2/sessions                     → create
+GET    /v2/sessions                     → the caller's conversation index
+PATCH  /v2/sessions/{sid}               → rename (title only)
+GET    /v2/sessions/{sid}               → transcript
+DELETE /v2/sessions/{sid}               → drop (and free cached state)
+POST   /v2/sessions/{sid}/turns         → ask; returns a Turn
+POST   /v2/sessions/{sid}/turns?stream=1 → same, as SSE
+PATCH  /v2/sessions/{sid}/turns/{tid}/assumptions → re-run with edited assumptions
+POST   /v2/sessions/{sid}/turns/{tid}/access-request → request access to this turn's denied column
+POST   /v2/sessions/{sid}/turns/{tid}/confirmation → "this answer is correct" (پاسخ درست است)
+DELETE /v2/sessions/{sid}/turns/{tid}/confirmation → withdraw the caller's own confirmation
+GET    /v2/sessions/{sid}/confirmations → the turns of this session the caller confirmed
+GET    /v2/access-requests              → the caller's own access requests + status
+GET    /v2/examples?limit=6             → examples.yaml questions the caller can start with (text only)
+GET    /v2/memory                       → the caller's entries + which keys are rememberable
+PUT    /v2/memory/{key}                 → set one entry
+DELETE /v2/memory/{key}                 → forget one
+DELETE /v2/memory                       → forget all
+GET    /health                          → unchanged
+```
+
+Sessions are server-side, TTL-bounded in memory, and capped in count — same
+discipline as the existing query cache. A session holds at most
+`session_max_turns` turns; older turns fall out of the prompt window but stay
+in the transcript. Optionally (on by default — see §9, §10) a session is
+*also* backed by SQLite: TTL expiry then only demotes the record out of the
+in-memory hot set, and `session_retention_days` (independent of the TTL)
+governs how long it stays listable/reopenable at all.
+
+`PATCH .../assumptions` is what makes the assumption chips in the UI
+interactive: the client sends back a modified assumption set and gets a fresh
+turn. It does not mutate the original turn.
+
+`POST .../access-request` is "Request access" (ADR-004 part 1;
+`docs/design/DESIGN-INVARIANTS.md` §8's failure-anatomy table names it beside
+"Ask without that column" for a denied-column guard rejection). No request
+body: the caller is stamped server-side from the authenticated principal, and
+the column is re-derived server-side by joining `session_id`/`turn_id` back to
+the audit record and reading `guard.subject` — it must be a turn whose
+`guard.reason` is `"denied_column"` or `"join_only_column"` (for the latter the
+subject is the whole `denied_columns` entry, and approval removes exactly that
+entry), and nothing here ever accepts a column name
+from the client. Session/turn ownership is enforced the same way as every
+other route in this module (404, never 403, for a turn on someone else's
+session). While an open request already exists for the same principal and
+column, a second call returns that existing request (`already_pending: true`,
+HTTP 200) instead of creating another (HTTP 201 for a new one). Approving or
+denying the request is a `security`-only admin action
+(`POST /admin/access-requests/{id}/approve` / `.../deny`, out of scope for
+this document — see the admin panel's own routes) that widens `denied_columns`
+on every live key the requester holds, through the existing ACL path.
+
+`POST .../confirmation` is "this answer is correct" (پاسخ درست است): the
+analyst-facing positive twin of the wrong-answer flag
+(`POST .../feedback`). Each confirmation is evidence — a reviewed golden-set
+candidate (`scripts/harvest_golden.py`) and a figure in the admin panel's
+real-use quality card (`GET /admin/quality`) — so it is one request with no
+body. Like the flag it stores **identifiers only** (`session_id`, `turn_id`,
+`principal_id`, `request_id`, `created_at`; never the question, the SQL or any
+result data): the principal is stamped server-side from the authenticated key
+and `request_id` is resolved server-side from the turn's audit record, so
+there is nothing for a client to forge.
+
+* **Authorisation** is the flag's: the turn's owner only. A turn on someone
+  else's session is `404`, never `403` (§11.5).
+* **Only a successful answer.** The turn's audit record must show SQL that ran
+  and returned a result (no `error_code`, a non-blank `generated_sql`, the
+  guard did not refuse it, a result came back; an empty result still counts).
+  A guard-rejected, out-of-scope or failed turn, or one the audit log no
+  longer holds, is refused with `409` and a message saying why.
+* **At most one confirmation per (turn, principal), and re-confirming is
+  idempotent.** The first call is `201`; a repeat is `200` with
+  `already_confirmed: true` and changes nothing.
+* **Flag and confirmation exclude each other, per principal: the later action
+  wins and the earlier one is removed.** Confirming a turn the caller had
+  flagged deletes that flag if it is still `open` (`removed_flags` in the
+  response); a flag an admin has already resolved is kept, because triage
+  recorded a decision on it. Flagging a turn the caller had confirmed deletes
+  the confirmation (`withdrew_confirmation: true` in the feedback response).
+  Another principal's flags and confirmations are never touched.
+
+```jsonc
+// 201 (200 on a repeat)
+{"confirmed": true, "already_confirmed": false, "removed_flags": 0,
+ "confirmation_id": 12, "session_id": "s_0a1b2c3d4e", "turn_id": "t_3",
+ "principal_id": "analyst-1", "request_id": "r_9f8e7d",
+ "created_at": "2026-10-13T09:30:00+00:00"}
+```
+
+`DELETE .../confirmation` withdraws the caller's own confirmation (another
+principal's confirmation of the same turn is never affected). It is safe to
+repeat: `200` with `{"confirmed": false, "withdrawn": true}`, or
+`"withdrawn": false` when there was nothing to withdraw.
+
+`GET /v2/sessions/{sid}/confirmations` lists the turns of one session the
+caller has confirmed, so the UI can show each turn's state when a transcript
+is opened with one request: `{"confirmations": [...], "turn_ids": ["t_3"]}`.
+Owner-scoped like the rest.
+
+`GET /v2/access-requests` is the caller's own minimal status read — every
+access request they raised, across every session, with its current status and,
+once denied, the reason. Scoped by the caller's principal id alone; a security
+admin's denial reason is visible here precisely because this read is already
+confined to the requester's own rows.
+
+`GET /v2/examples` is what the analyst page offers in an empty conversation:
+`{"examples": [{"question": "..."}]}`, the deployment's `examples.yaml`
+questions in file order, at most `limit` (default 6, clamped to 1..12),
+duplicates and blank questions dropped. Only question text is returned, never
+the SQL or the tags. A question is offered to a caller only when its SQL passes
+the guard (`validate_sql`) with that caller's `denied_columns`, so an example
+over a column the caller may not read is not suggested to them, and one the
+guard refuses for any other reason is suggested to nobody
+(`core/start_examples.py`). No readable `examples.yaml` is `{"examples": []}`,
+not an error.
+
+`GET /v2/sessions` — the conversation index, owner-scoped (a caller only ever
+sees sessions it created):
+
+```jsonc
+{"sessions": [
+  {"session_id": "s_0a1b2c3d4e",
+   "title": "معاملات مشتری‌های تالار سیمان را نشان بده",
+   "created_at": "2026-09-04T12:00:00Z",
+   "last_active_at": "2026-09-04T12:31:00Z",
+   "turn_count": 4,
+   "expires_at": "2026-10-04T12:31:00Z"}],
+ "total": 1}
+```
+
+`title` is derived from the first turn's question, truncated at a word
+boundary to `session_title_max_length` (80), and renameable via
+`PATCH /v2/sessions/{sid}` (`{"title": "..."}`). A title is user text under
+the same length/control-character rules as a memory value (§5), and it
+**never enters a prompt** — presentation only.
+
+`GET`/`DELETE /v2/sessions/{sid}` and `POST .../turns` keep the existing
+404-not-403 rule for a non-owner (§11.5) — a session created with no
+principal at all (`AUTH_REQUIRED=false`) stays reachable by anyone, exactly
+as before this phase.
+
+---
+
+## 4. `Turn`
+
+```jsonc
+{
+  "turn_id": "t_04",
+  "session_id": "s_a91f",
+  "index": 3,
+
+  "question": "از بین آن‌ها ۱۰ مشتری برتر به لحاظ حجم معامله",
+  "resolved_question": "برای معاملات تالار سیمان در سال ۱۴۰۳، ۱۰ مشتری با بیشترین حجم معامله",
+
+  "basis": {
+    "kind": "refines",              // "fresh" | "refines"
+    "refines_turn_id": "t_03",
+    "composition": "cte",           // "cte" | "none"
+    "inherited": ["ring=تالار سیمان", "year=1403"]
+  },
+
+  "sql": "WITH _prev AS (...) SELECT TOP 10 ...",
+  "sql_display": "SELECT TOP 10 ...",   // optional: `sql` laid out for reading
+                                         // (display and copy only; `sql` is what ran)
+
+  "ambiguity": {
+    "is_ambiguous": true,
+    "assumptions": [
+      { "field": "measure",  "value": "حجم معامله (HallMatchingWeight)",
+        "source": "question", "editable": true },
+      { "field": "scope",    "value": "همهٔ سطرهای منطبق با فیلتر قبلی، نه فقط ۱۰۰ سطر نمایش‌داده‌شده",
+        "source": "policy",   "editable": false },
+      { "field": "ring",     "value": "تالار سیمان",
+        "source": "session",  "editable": true },
+      { "field": "period",   "value": "۱۴۰۳",
+        "source": "session",  "editable": true }
+    ],
+    "clarifications": [
+      { "field": "measure",
+        "prompt": "«برتر» بر اساس کدام معیار؟",
+        "options": ["حجم معامله", "ارزش ریالی", "تعداد قرارداد"] }
+    ]
+  },
+
+  "guard": {
+    "verdict": "allowed",           // "allowed" | "rejected"
+    "rule": null,                   // free-text, populated on rejection --
+                                     // exact wording kept stable: the audit
+                                     // trail and security/sql_guard.py's own
+                                     // tests key off it verbatim
+    "reason": null,                 // populated on rejection: "denied_column"
+                                     // | "join_only_column"
+                                     // | "forbidden_statement" | "unknown_table"
+                                     // | "system_catalogue" | "no_table_reference"
+                                     // | "cross_datasource" | "ambiguous_table"
+                                     // | "other" -- lets
+                                     // the client pick a targeted next action
+                                     // (DESIGN-INVARIANTS.md §8) without
+                                     // parsing `rule`'s free text
+    "subject": null,                // the one column/table/keyword `reason`
+                                     // is about, when there is exactly one
+                                     // (e.g. "NationalID" for a denied column,
+                                     // or the whole denied_columns entry such as
+                                     // "sales.Order.ID" for "join_only_column";
+                                     // null when the rejection is about the
+                                     // query's shape rather than one identifier)
+    "rejected_sql": null,           // the exact statement that was refused and
+                                     // DID NOT RUN -- populated on a rejected
+                                     // verdict when the guard got far enough to
+                                     // see a candidate statement (null for a
+                                     // composition-level failure, or a rejection
+                                     // this contract predates); null on an
+                                     // allowed verdict
+    "rejected_sql_display": null,   // `rejected_sql` laid out for reading, the
+                                     // way `sql_display` is for `sql`: display
+                                     // only, null exactly when `rejected_sql`
+                                     // is, equal to it when it could not be
+                                     // laid out. Clients show it when present
+                                     // and `rejected_sql` otherwise
+    "injected_top": 10,
+    "tables_touched": ["Contract", "Customer", "Ring"]
+  },
+
+  "result": {
+    "columns": [ { "name": "CustomerName", "type": "string" },
+                 { "name": "TotalVolume",  "type": "number" } ],
+    "rows": [ ... ],
+    "row_count": 10,
+    "truncated": false,
+    "rows_omitted": false            // true only for a turn rehydrated from
+                                      // disk (§9, §10) -- row VALUES are
+                                      // never persisted, so an older turn in
+                                      // a reopened conversation carries its
+                                      // shape (columns, row_count, truncated)
+                                      // but an empty `rows`. Additive,
+                                      // defaults false: an existing response
+                                      // is unchanged. A client must read
+                                      // this rather than inferring "0 rows"
+                                      // from an empty `rows` array.
+  },
+
+  "interpretation": "…",             // null unless the request asked for it
+                                     // (`interpret: true` — see §7's note)
+  "tier": "T2",                     // T0 cache | T1 template | T2 single-shot | T3 agent
+  "warnings": [],
+
+  "llm": { /* §6 */ },
+  "timings": {
+    "total_ms": 2840, "plan_ms": 4, "prompt_ms": 11, "llm_ms": 2310,
+    "guard_ms": 6, "execute_ms": 480, "interpret_ms": 0
+  },
+
+  "error": null                     // { "code": ..., "message": ..., "request_id": ... }
+                                     // on failure -- `request_id` is the SAME
+                                     // id the server logs this turn's audit
+                                     // record against (session.engine.
+                                     // TurnEngine._write_audit), so a user can
+                                     // quote it back to an operator; null on
+                                     // an older, rehydrated turn predating
+                                     // this field
+}
+```
+
+`resolved_question` is not cosmetic: it is the system showing its work. If the
+user sees «برای معاملات تالار سیمان در سال ۱۴۰۳…» when they meant something
+else, they catch the misunderstanding before trusting the number.
+
+---
+
+## 5. Ambiguity policy — answer, then declare
+
+**Never block on a vague question.** Produce the best answer under explicit
+assumptions and surface them. Blocking makes the tool feel obstructive, and the
+user can correct an assumption far faster than they can phrase a
+fully-specified question.
+
+- `is_ambiguous: true` changes *presentation*, not whether a result is returned.
+- Every assumption carries a `source`, and the source is shown in the UI:
+  - `question` — extracted from what the user actually typed
+  - `session`  — inherited from an earlier turn (builds trust in follow-ups)
+  - `memory`   — a standing preference the analyst explicitly pinned (§5.1),
+                 carried across sessions
+  - `default`  — a configured fallback
+  - `policy`   — a system rule the user cannot override (e.g. the §2 scope rule)
+- `clarifications` are *offers*, not gates. The UI renders them as one-click
+  refinements that issue a `PATCH`.
+
+The only case that legitimately returns no result: the question cannot be
+mapped to the schema under any reasonable assumption. That is
+`error.code = "OUT_OF_SCOPE"`, which already exists.
+
+### 5.1 Memory — a standing preference across sessions
+
+An entry exists only because the analyst pinned it via `PUT /v2/memory/{key}`
+— nothing is inferred from repetition. The set of keys an analyst may pin is
+closed and declared in `project_config/memory_policy.yaml` (mirroring how
+`session_policy.yaml` externalises the default-scope rule); free-form memory
+(an arbitrary remembered sentence) is out of scope — it would be a
+prompt-injection channel with no schema to validate it against.
+
+Precedence, exactly:
+
+```
+question  >  session  >  memory  >  default
+policy: not overridable by any of them
+```
+
+A stored entry only ever replaces an already-`"default"`-sourced assumption
+for the same field, and is re-sourced `"memory"` — the existing assumption
+chip / `PATCH .../assumptions` machinery is how an analyst overrides it for
+one turn, without touching the stored preference. A memory entry naming a
+column is re-validated against the requesting principal's `denied_columns`
+on **every** turn that would apply it (the ACL can change after the entry was
+stored) — a now-denied entry is dropped for that turn and reported in
+`Turn.warnings`, never applied and never silently ignored.
+
+`GET /v2/memory`:
+
+```jsonc
+{"entries": [
+  {"key": "scope", "field": "ring", "value": "تالار سیمان",
+   "updated_at": "2026-09-04T12:00:00Z", "applicable": true}],
+ "rememberable": [
+  {"key": "scope", "field": "ring", "options": ["...", "..."],
+   "max_length": 120}]}
+```
+
+`applicable` is the read-time ACL re-check result: `false` means the entry is
+stored but the caller may no longer see the column it constrains. A value is
+capped at `memory_value_max_length` (default 120, or a narrower per-key
+`max_length`), rejects a newline/control character outright (`422`), and —
+where the key declares a closed option set — must be one of them (`422`).
+`memory_max_entries_per_principal` (default 20) exceeded by a *new* key is an
+explicit `422`, never a silent eviction of an older entry.
+
+---
+
+## 6. `llm` — the LLM status block
+
+The OpenAI-compatible `/chat/completions` response returns most of this in
+its `usage` object; surfacing it costs nothing and is what makes the
+Phase 2 latency work measurable.
+
+```jsonc
+"llm": {
+  "backend": "openai",
+  "model": "gpt-oss-20b",
+  "endpoint": "http://localhost:8000/v1", // which endpoint answered
+  "trusted": true,                  // was that endpoint permitted to see this data
+  "endpoint_status": 200,           // HTTP status of the final attempt
+  "attempts": 1,                    // >1 means transport retries happened
+  "finish_reason": "stop",          // stop | length | content_filter | tool_calls
+                                     //   | schema_violation | error | "other:<raw>"
+  "structured_output": true,        // was constrained decoding used
+
+  "prompt_tokens": 4612,            // usage.prompt_tokens
+  "completion_tokens": 148,         // usage.completion_tokens
+  "prefill_ms": null,               // not distinguished from decode by this protocol
+  "decode_ms": null,                // not distinguished from prefill by this protocol
+  "total_ms": 2310,                 // measured wall-clock time of the call
+  "tokens_per_second": null,        // needs decode_ms, which this protocol has no separate figure for
+
+  "prefix_cache_hit": true,         // the server's word when it gives one, else an estimate; see below
+  "prefix_cache_hit_source": "server", // "server" | "estimate"
+  "cached_tokens": 4592,            // usage.prompt_tokens_details.cached_tokens; null = the server did not say
+  "temperature": 0.0,
+  "seed": 7,
+  "seed_honored": true,             // endpoint reported system_fingerprint AND a seed was requested; null otherwise
+  "corrections": 0,                 // self-correction rounds spent
+
+  "provider": "openai:gpt-oss-20b", // which backend in the router's fallback chain answered
+  "fallback_used": false,           // true if the first-choice backend
+                                     // failed and a later one answered
+  "reasoning_detected": false,      // true if the response appears to carry
+                                     // reasoning/chain-of-thought text rather
+                                     // than, or alongside, a final answer
+
+  "ttft_ms": null,                  // ms to the first generated token (queue + prefill);
+                                     // null unless LLM_STREAM_TIMINGS=true
+  "generation_ms": null,            // ms from the first token to the end; ttft_ms + generation_ms == total_ms
+  "reasoning_tokens": null,         // how many completion_tokens were reasoning; null = no reasoning seen
+  "reasoning_tokens_estimated": false // true = estimated from the reasoning text's length,
+                                     // false = the server's own count (or no count)
+}
+```
+
+`finish_reason` is read off the response itself
+(`choices[0].finish_reason`), never a caller-supplied literal — a response
+cut short by `llm_num_predict` reads `"length"`, not `"stop"`, which is the
+one distinction that separates "the model is bad at SQL" from "raise the
+token budget" when reading a week of production logs. `"length"` together
+with an empty `sql` is the extreme of that: the model was cut off before
+it emitted anything, which a reasoning model does routinely when the token
+budget is smaller than the reasoning it does. That pair surfaces as
+`error.code = "LLM_OUTPUT_TRUNCATED"` rather than `"EMPTY_SQL_RESPONSE"`,
+and is never retried — nothing about it depends on the question. The set grew from
+the original four values (`stop | length | schema_violation | error`) to
+add `content_filter` (a moderation block) and `tool_calls` (the model tried
+to call a function instead of answering) — both real values an
+OpenAI-compatible endpoint can return that the original contract didn't
+anticipate. Anything else — a value this project has never seen — is
+preserved verbatim as `"other:<raw>"` rather than being discarded or
+coerced into `"error"`; a total transport failure (no response ever
+arrived) is the one case that still reports `"error"` unconditionally,
+since there is no real response to read a reason from.
+
+`prefix_cache_hit` is the single most useful number in this block, and
+`prefix_cache_hit_source` says where it came from.
+
+- `"server"`: the model server reported how many prompt tokens it served from
+  its prefix cache (`usage.prompt_tokens_details.cached_tokens`; vLLM with
+  `--enable-prompt-tokens-details`), kept as `cached_tokens`. The flag is true
+  when that covers at least half of the static prefix (of the whole prompt
+  when it is shorter, or when no prefix is known). This is the real hit.
+- `"estimate"`: the server did not report it (`cached_tokens` is `null`), so
+  the flag is the older rule `prefix_cache_hit = prompt_tokens <
+  (static_prefix_tokens * 0.5)`. It dates from a backend whose prompt count
+  held only the tokens it computed, where a hit made `prompt_tokens` collapse
+  to the variable suffix. An OpenAI-compatible server counts the whole prompt
+  either way, so the estimate now means "the prompt was short", not "the cache
+  was hit". A record written before these two fields existed has neither and
+  counts as an estimate.
+
+Record `static_prefix_tokens` per skill version so the ratio stays meaningful.
+With several data sources the static prefix is per source, so the estimate used
+is the prefix of the source whose tables the model was shown (the audit record's
+`datasource_selection.chosen`), not the whole schema's.
+
+`seed_honored` is deliberately not a plain assertion of determinism:
+`seed`/`temperature`/`top_p` are sent on every request, honoured by
+vLLM/llama.cpp, and accepted-without-guarantee by OpenAI's own hosted API.
+`seed_honored` reports whether the endpoint's response carried a
+`system_fingerprint` — the signal OpenAI's own docs describe for detecting
+when a backend change might affect reproducibility — as `true`, or `null`
+when the response carries no such signal at all (never `false`: absence
+means "unknown", not "confirmed not honoured"). It can only be `true` when
+a `seed` was actually requested in the first place — a `system_fingerprint`
+on a call that never set one does not mean a (nonexistent) seed was
+honoured.
+
+`reasoning_detected` exists because the deployment target (gpt-oss) emits a
+reasoning/chain-of-thought channel this project previously never read at
+all: when the model's answer looks like it landed there instead of (or
+alongside) the final-answer field, this flag says so, so a resulting parse
+failure reads as a diagnosable protocol mismatch rather than a mysterious
+accuracy problem. Deliberately a boolean, not a text excerpt of the
+reasoning itself — that text can quote prompt content (including real row
+data, at the interpretation task), and this block is embedded in the audit
+trail, which must never carry row values.
+
+`ttft_ms`, `generation_ms`, `reasoning_tokens` and
+`reasoning_tokens_estimated` split the otherwise opaque model call. A
+non-streaming request can only report `total_ms`; with
+`LLM_STREAM_TIMINGS=true` the request is streamed and reassembled into the
+same response, and the first token's arrival separates *waiting* (`ttft_ms`:
+the server's queue plus prefill — what a cold prefix cache and a busy server
+inflate) from *generating* (`generation_ms`: decoding, reasoning included).
+`prefill_ms` and `decode_ms` stay `null`: a first token is not a clean
+prefill boundary on a server that queues. `reasoning_tokens` is the server's
+`usage.completion_tokens_details.reasoning_tokens` when it reports one
+(`reasoning_tokens_estimated: false`); otherwise an estimate that splits
+`completion_tokens` by the share of characters that are reasoning
+(`reasoning_tokens_estimated: true`); `null` when the response shows no
+reasoning, which is not the same as `0`. It is a count only: the reasoning
+text itself never enters this block, for the reason `reasoning_detected` is a
+boolean. A record written before these fields existed simply lacks them.
+
+On error, `llm` is still populated as far as it got — a 503 with
+`attempts: 3` and `endpoint_status: 0` tells a very different story from a 200
+with `finish_reason: "schema_violation"`, and the UI must be able to show that
+difference.
+
+---
+
+## 7. SSE event stream
+
+`POST /v2/sessions/{sid}/turns?stream=1` emits, in order:
+
+| Event | Payload | UI effect |
+|---|---|---|
+| `stage` | `{stage, state}` | drives the pipeline step list |
+| `resolved` | `{resolved_question, basis}` | shows what it understood, early |
+| `assumptions` | `ambiguity` object | assumption chips appear before the result |
+| `sql_delta` | `{text}` | SQL types out live |
+| `sql` | `{sql, sql_display, guard}` | final SQL + guard verdict; `sql_display` is the layout `done`'s turn carries, so the first paint is the final one (additive: a client that ignores it keeps working) |
+| `rows` | `{columns, rows, row_count}` | table fills |
+| `interpretation_delta` | `{text}` | summary types out — only when the request set `interpret: true` |
+| `llm` | `llm` object | status strip populates |
+| `done` | `{turn}` | full Turn for the transcript |
+| `error` | `{code, message, request_id}` | error banner |
+
+`POST .../turns` takes an optional `interpret` (default `false`). It is
+opt-in because producing a summary sends up to twenty rows of real result
+data to the interpretation backend — the same reason `/query`'s own
+`interpret` has defaulted to `false` since phase 2. The bundled web UI
+exposes it as a per-analyst toggle rather than a deployment setting: the
+person who asked the question is the one who knows whether these
+particular rows should go to a model. `llm.interpret.interpret_rows`'s
+governance gate still refuses to send them to a *remote* backend unless
+`LLM_ALLOW_REMOTE` is explicitly true.
+
+When `interpret` is true the engine also times an `interpret` stage, so
+the `stage` events cover all five steps a client may be drawing.
+
+Streaming matters more than raw latency here: `resolved` and `assumptions`
+arrive in the first few hundred milliseconds, so the user can tell the system
+misunderstood them *before* waiting out the full generation.
+
+---
+
+## 8. Prompt assembly for a follow-up turn
+
+Ordering is deliberate and must not be changed casually — it is what preserves
+KV-cache reuse (see architecture Decision 1).
+
+```
+[ STATIC PREFIX — byte-identical across every request for a skill version ]
+  system prompt
+  full schema (types, PKs, FKs)
+  relationships
+  business rules
+  metrics
+  few-shot examples
+[ /STATIC PREFIX ]
+
+[ VARIABLE SUFFIX — only this changes ]
+  session context:
+    turn t_03: question, SQL, result columns, row_count
+    turn t_02: question, SQL, result columns, row_count
+    (last session_prompt_turns turns; SQL + column names only — never row data)
+  resolved filters for this turn (memory-derived filters included here, §5.1)
+  the new question
+[ /VARIABLE SUFFIX ]
+```
+
+With several data sources the prefix is built per data source (one source is
+chosen for the question before the prompt exists, and the prefix describes only
+that source), so "byte-identical" holds across the requests of one source:
+`docs/design/DATASOURCES.md`, "Choosing a source per question".
+
+Three rules:
+
+1. **Result columns go in the prompt, result rows do not.** Column names are
+   what let the model resolve «از بین آن‌ها»; row data would leak business data
+   into the prompt (and into any remote model) for no accuracy gain.
+2. The session block sits in the suffix, after the static prefix. Putting
+   per-turn content anywhere in the prefix destroys cache reuse and silently
+   undoes the entire Phase 2 latency win.
+3. **Memory-derived filters (§5.1) go in the suffix, with the other resolved
+   filters — never in the static prefix.** The static prefix is asserted
+   byte-identical whether or not the calling principal has any memory pinned
+   at all: breaking that is silent (the suite stays green, and every request
+   pays full prefill — roughly halving throughput with no failing test), so
+   this is exactly the kind of change rule 2 above already warns about,
+   applied to the newest source of per-turn content.
+
+---
+
+## 9. New settings
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `session_ttl_seconds` | 1800 | idle-expiry window for the in-memory hot set |
+| `session_max_count` | 500 | cap concurrent sessions (memory bound) |
+| `session_max_turns` | 50 | transcript cap per session |
+| `session_prompt_turns` | 3 | how many prior turns enter the prompt |
+| `refinement_scan_cap` | `max_rows_returned * 100` | §2 inner-scan bound |
+| `default_top_n` | `max_rows_returned` | display cap |
+| `session_store_path` | `logs/sessions.db` | SQLite file for session + memory persistence; empty string disables it |
+| `session_retention_days` | 30 | how long a conversation stays listable/reopenable |
+| `session_title_max_length` | 80 | cap on a session title's length |
+| `memory_enabled` | `true` | master switch for §5.1 memory |
+| `memory_max_entries_per_principal` | 20 | cap on pinned keys per principal |
+| `memory_value_max_length` | 120 | default per-key cap on a memory value's length |
+
+All read through `cfg.settings` at call time, per the project's existing
+configuration contract.
+
+Three lifetimes, not two: `session_prompt_turns` (the prompt window — how many
+turns the model sees), `session_ttl_seconds` (the live context — how long the
+in-memory record stays hot), and `session_retention_days` (retention — how
+long a conversation stays listable/reopenable at all). Before persistence,
+the second and third were the same number, which is exactly why there was
+nothing to list: TTL expiry deleted the record outright. With a backend
+attached, TTL expiry instead *demotes* a session out of the hot set —
+rehydrated transparently, with `TurnResult.rows_omitted=true` on every
+rehydrated turn (§4) — and retention is the separate, much longer question of
+permanent deletion, enforced by a purge that runs once at start-up.
+
+Persistence defaults **on**. The file holds questions, generated SQL, and
+result column names/`row_count`/`truncated` — the same class of data the
+audit log has always written, in the same directory — never result rows
+(§4's `rows_omitted`, and see `session.persistence`'s module docstring for
+why: a persisted row cannot be re-checked against a principal's `denied_columns`
+if it changes after the row was written). `scripts/verify_deployment.py`
+checks the target directory is writable, beside its existing
+audit-log-writable check.
+
+---
+
+## 10. Out of scope for v2
+
+Two of the original three deferrals are now delivered — authentication (Phase
+8) landed, which was the stated precondition for cross-session memory, and a
+SQLite-backed store now survives a restart. What stays deliberately out of
+scope, and why:
+
+- **Inference from repetition.** A memory entry (§5.1) exists only because the
+  analyst explicitly pinned it via `PUT /v2/memory/{key}`. Silently promoting
+  a repeated pattern to a standing preference the analyst never declared is
+  the exact failure this project treats as worse than an error — and it is
+  undebuggable, since they cannot inspect a rule they never stated.
+- **Free-form remembered text.** An arbitrary remembered sentence injected
+  into the prompt suffix is a prompt-injection channel with no schema to
+  validate it against. Memory is a closed, config-declared set of keys
+  (`project_config/memory_policy.yaml`) for exactly this reason.
+- **Agentic multi-step planning inside a turn.** That is Phase 6, tier T3.
+  A session is turn-level state, not an agent loop — do not conflate them.
+
+---
+
+## 11. Authentication (Phase 8)
+
+`POST /query` runs model-generated T-SQL against the production warehouse.
+Before this phase, none of the ten HTTP routes had any caller identity
+whatsoever — this section closes that gap.
+
+### 11.1 Scheme
+
+Named API keys, not JWT/OIDC. This is an on-prem tool with no IdP
+dependency available today, and what auth actually needs to provide is **a
+principal identity** — something to key the cache on, own a session, and
+name in the audit trail. API keys deliver that with no new infrastructure,
+and leave a clean seam for OIDC later: only the resolver in `security/auth.py`
+would need to change; `Principal` and every downstream consumer (the SQL
+guard's `denied_columns`, the cache scope key, session ownership, the audit
+trail) stay exactly as they are.
+
+```python
+@dataclass(frozen=True)
+class Principal:
+    id: str                                # stable, short, in every audit record
+    name: str                              # human label for logs
+    denied_columns: tuple[str, ...] = ()   # feeds security.sql_guard's existing ACL seam
+```
+
+Transport is `Authorization: Bearer <key>` only — `X-API-Key` and every
+other transport are deliberately unsupported, so there is exactly one way
+in to reason about.
+
+Configuration is `API_KEYS_JSON`, a JSON array of
+`{"id", "name", "key_sha256", "denied_columns"?}` objects — or, for the same
+array in a file with no `.env` quoting rules, `API_KEYS_FILE` (a path;
+relative paths resolve against the repository root; read once at start-up;
+set one of the two, not both). Both go through the same parser, which also
+refuses a field repeated inside one object. `denied_columns`
+is optional, and **omitting it is not the same as denying everything**: an
+entry with no `denied_columns` field gets no column restriction at all,
+the opposite of a key issued through the admin panel, which defaults to
+deny-all (`appdb.key_store._maximally_restrictive_denied_columns()`). That
+asymmetry is deliberate — flipping the env-key default to deny-all would
+silently revoke access from every existing deployment mid-upgrade — but it
+is a decision every `API_KEYS_JSON` entry has to make explicitly.
+`security/auth.py::_parse_api_keys` logs a `WARNING` for any entry that
+omits the field entirely; write `"denied_columns": []` once unrestricted
+access is actually intended, and the warning stops (see Finding 6, 2026
+audit).
+
+An entry may also be **scoped**: `schema.Table.Col` makes that column
+*join-only* on that table, `Source:schema.Table.Col` only when the query runs
+on data source `Source`, and `Source:Col` on every table of `Source` that has
+the column. A join-only column may appear only as one side of `a.col = b.col`
+inside a `JOIN ... ON`; any other use is rejected with
+`guard.reason == "join_only_column"` (correctable: the model is re-prompted).
+Scoped entries are checked against `schema.yaml` and `datasources.yaml` when
+the keys are loaded, so a typo stops start-up instead of restricting nothing
+(see `docs/deployment-runbook.md`).
+
+Every entry, plain or scoped, is **normalised** before it is read, whichever
+source it came from (the key file or `API_KEYS_JSON`, a key of the admin panel,
+`PATCH /admin/keys/{key}/acl`): whitespace and Unicode format characters
+(category `Cf`: the zero-width non-joiner and joiner, the left-to-right and
+right-to-left marks, the bidi embeddings and isolates, the byte-order mark, the
+soft hyphen) are removed from the **start and the end** of the entry, repeatedly,
+and nothing else changes — characters inside an entry, format characters
+included, case and inner spaces are kept (a Persian column name may contain a
+zero-width non-joiner). `Principal.denied_columns` and the cache scope key hold
+the entries so cleaned, so `"NationalID"` and `"NationalID<RLM>"` are one
+restriction and one cache partition. For a plain entry with a format character
+inside, the guard's policy denies the entry as written and also the name without
+that character; the second name is never stored or returned. An entry with nothing left is kept as
+written and reported. A key whose entries changed gets one `WARNING` naming its
+`id` (the entries in `ascii()` form, never the key's hash). A plain entry that
+matches no column of `schema.yaml` denies nothing; it is logged as a `WARNING`
+once per key and listed by the preflight check `Column restrictions name real
+columns`, and the key still loads. `PATCH /admin/keys/{key}/acl` stores, and
+returns in `denied_columns`, the cleaned entries. Only the
+SHA-256 hex digest of a key is ever stored — never the raw key. Comparison
+is `hmac.compare_digest`, walking every configured key with no early exit
+on a prefix match. Plain SHA-256, not bcrypt/argon2, is correct here: those
+exist to slow brute-force guessing of a *low-entropy human password*, and a
+key minted by `scripts/issue_api_key.py` (`secrets.token_urlsafe(32)`, 256
+bits of entropy) is not that. Issue a key with:
+
+```
+python -m scripts.issue_api_key --id analyst-1 --name "Jane Analyst"
+```
+
+It prints the raw key **once**, to stdout only — never to a file or log —
+plus the entry to add to the `API_KEYS_FILE` array (or `API_KEYS_JSON`).
+
+### 11.2 Fail closed
+
+`AUTH_REQUIRED` defaults to `true`. If it is `true` and `API_KEYS_FILE` /
+`API_KEYS_JSON` resolve to zero configured keys, `api/server.py`'s `lifespan` raises
+`RuntimeError` — the server refuses to start with a front door nobody could
+ever open, the same fail-closed precedent already applied to a placeholder
+`DB_CONNECTION_URL`.
+
+`AUTH_REQUIRED=false` is a deliberate escape hatch (local development, or a
+deployment that already sits behind its own perimeter auth). It logs a
+`WARNING` on **every** startup, not just the first — a silently disabled
+front door is the bug this phase exists to fix, so it must never be quiet
+in the logs.
+
+### 11.3 Route matrix
+
+| Route | Auth |
+|---|---|
+| `GET /health` | Open — liveness probes. `model` is omitted from the response when unauthenticated; a probe does not need the model name. |
+| `POST /query`, `POST /query/stream` | Required |
+| `GET /cache/stats`, `POST /cache/clear`, `POST /cache/invalidate` | Required |
+| all four `/v2/sessions*` routes | Required |
+| `/docs`, `/openapi.json`, `/redoc` | Required by default (`APP_DOCS_PUBLIC=false`) |
+
+A missing or invalid key on a protected route returns `401` with the
+existing error envelope (§ above tables), `error.code = "UNAUTHENTICATED"`,
+and a `WWW-Authenticate: Bearer` header.
+
+### 11.4 Cache isolation
+
+Naively appending the principal id to the cache key
+(`(prefix_version, question, mode, principal_id)`) would be correct but
+throws away all cross-user cache sharing — a real latency regression on a
+shared org tool where most questions repeat. Instead the cache keys on a
+**scope key**:
+
+```
+scope_key = sha256(json.dumps(sorted(principal.denied_columns), separators=(",", ":")) or "all").hexdigest()[:16]
+```
+
+Two principals with identical data visibility share cache entries safely;
+two with different visibility can never collide. Every all-access principal
+(the common case) shares one scope key, so today's hit rates are preserved.
+Implemented in `security.auth.scope_key`, threaded through
+`api.query_cache.QueryCache`'s question- and SQL-keyed stores alike.
+
+`scope_key` also takes an optional `memory_used` mapping (§5.1): the
+memory entries that actually influenced a query's resolved filters —
+never a principal's whole stored memory set, which would partition the
+cache per principal for anyone who ever pinned anything, even on queries
+their memory never touched. Two principals whose memory *did* influence a
+query never share an entry; two whose memory did *not* influence it still
+do. `POST /query` (v1) has no memory concept and calls `scope_key` with
+`memory_used` omitted, unchanged from Phase 8; the seam exists so a future
+cache tier over `/v2/sessions/*/turns` (currently uncached — see
+`session.engine.TurnEngine.ask`'s own note) can reuse it.
+
+### 11.5 Session ownership
+
+A `/v2/sessions` session records the `owner_id` of the principal that
+created it (`session.store.SessionRecord.owner_id`). `GET`/`DELETE
+/v2/sessions/{sid}` and `POST .../turns` return `404`, never `403`, for a
+non-owner — a `403` would itself confirm the session exists to a caller
+who has no business knowing that. A session created with no principal at
+all (`AUTH_REQUIRED=false`) has `owner_id=None` and stays reachable by
+anyone, matching pre-Phase-8 behaviour.
+
+### 11.6 Rate limiting
+
+`RateLimitMiddleware` buckets per IP by default, which is one shared bucket
+for an entire organisation behind a proxy. `AuthMiddleware` resolves the
+caller's `Principal` and stashes it on `request.state.principal` earlier in
+the middleware stack (before `RateLimitMiddleware` runs); the rate limiter
+then keys its bucket on `principal:<id>` for an authenticated request,
+falling back to the pre-Phase-8 IP-based key otherwise.
+
+### 11.7 Audit
+
+`observability.audit.AuditRecord` carries `principal_id` on every query —
+the field that makes the audit trail an actual "who ran this" record. It is
+written on both paths: `/query` and `/query/stream` through `api/runner.py`, and
+every turn of `/v2/sessions` (a first turn, a follow-up, a streamed turn and the
+re-run of `PATCH .../assumptions`) through `session/engine.py`. Records written
+before 6.15.1 for the session path hold `null`; so does the note the model
+router writes when a task goes to a remote provider (`request_id` starting
+`remote-llm-`), which belongs to no one caller. The existing hard rule is unchanged and unweakened: no result row values are
+ever written to the audit log, only column names. A record also carries
+`datasource` (where the generated SQL runs) and, with more than one data
+source, `datasource_selection` (which source the model was shown, and why);
+both are additive and described in `docs/design/DATASOURCES.md`.

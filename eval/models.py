@@ -1,0 +1,813 @@
+# SPDX-License-Identifier: BUSL-1.1
+# Copyright (c) 2024-2026 Ali Sadeghi Aghili
+"""Typed records shared across the evaluation harness.
+
+Three record types flow through the pipeline in order:
+
+1. :class:`GoldenCase`  — one hand-authored question + reference answer,
+   loaded from a ``golden.jsonl`` file.
+2. :class:`CaseResult`  — the outcome of running one :class:`GoldenCase`
+   through :func:`eval.runner.run_case`.
+3. :class:`EvalReport`  — the aggregate of every :class:`CaseResult` in a
+   run, produced by :func:`eval.report.build_report`.
+
+All three are plain, immutable-by-convention dataclasses so they serialise
+to/from JSON trivially (see :mod:`eval.report` and :mod:`eval.baseline`).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Literal, get_args
+
+#: What a case is expected to do when run through the pipeline.
+#:
+#: ``"success"``
+#:     The generator produces SQL, the guard accepts it, execution succeeds,
+#:     and the result fingerprint matches ``expected_fingerprint``.
+#: ``"empty"``
+#:     Same as ``"success"`` but the reference answer is a zero-row result
+#:     set (still requires a fingerprint match — an empty frame has a
+#:     well-defined fingerprint, see :mod:`eval.fingerprint`).
+#: ``"out_of_scope"``
+#:     The generator is expected to raise ``ValueError("OUT_OF_SCOPE")``.
+#: ``"error"``
+#:     The case is expected to fail (e.g. a deliberately malformed golden
+#:     case used to test the harness itself). Rare in practice.
+CaseExpectation = Literal["success", "empty", "out_of_scope", "error"]
+
+#: Whether a case currently participates in the regression gate.
+#:
+#: ``"active"``
+#:     The default -- runs and counts toward ``EvalReport.total``/
+#:     ``passed`` exactly as every case always has.
+#: ``"pending_expected"``
+#:     Admin panel phase 4 (``docs/admin-panel-architecture.md`` §3, the
+#:     phase 4 spec §4): a triaged feedback flag promoted to a golden case
+#:     before anyone has supplied its correct SQL/expected result. A golden
+#:     case with a *wrong* expectation would be worse than no case at all
+#:     -- it would make the regression gate enforce the bug the flag was
+#:     raised about -- so :func:`eval.runner.run_golden_set` skips a
+#:     ``"pending_expected"`` case entirely rather than running it against
+#:     whatever placeholder expectation it might carry. It still appears
+#:     in :func:`eval.runner.load_golden_cases`'s return value (so the
+#:     golden set's *size*, including its still-pending cases, remains
+#:     visible to anyone reading the file directly), and moves to
+#:     ``"active"`` the moment someone edits its ``expected_sql``.
+#: ``"pending_review"``
+#:     An unreviewed candidate harvested from real usage
+#:     (``scripts/harvest_golden.py``). Its ``expected_sql``, when present,
+#:     is only the model's own *proposal*: nobody has said it is right.
+#:     Skipped by the runner exactly like ``"pending_expected"``, and
+#:     forbidden from carrying recorded rows or a fingerprint (there is
+#:     nothing verified to record).
+#: ``"reviewed"``
+#:     A person has confirmed (or supplied) the ``expected_sql``
+#:     (``scripts/golden_sheet.py import``) but ``python -m eval.cli verify``
+#:     has not yet run it against the database. Skipped by the runner;
+#:     ``verify --accept`` moves it to ``"active"``.
+#: ``"excluded"``
+#:     A case a tool built but has put out of scoring on purpose, with a
+#:     recorded reason (:attr:`GoldenCase.exclusion_reason`): the public
+#:     benchmark importer excludes a question whose reference fails, returns
+#:     nothing, or differs after the data was loaded into SQL Server. Skipped
+#:     by the runner exactly like the pending statuses, but kept in the file
+#:     so the exclusion is listed and countable, never a silent drop. Nothing
+#:     moves it back automatically.
+GoldenCaseStatus = Literal[
+    "active", "pending_expected", "pending_review", "reviewed", "excluded"
+]
+
+#: Tag of a benchmark case whose transpiled reference returned another result on
+#: the SQL Server copy although every table it reads is identical (a dialect
+#: semantics difference). The case is scored; reports give the accuracy with and
+#: without these cases.
+SEMANTIC_DIFFERENCE_TAG = "fidelity:semantic_difference"
+
+#: Tag of a benchmark case whose reference could not be checked on the copy (it
+#: could not be transpiled, or failed there). Information only.
+UNVERIFIED_TAG = "fidelity:unverified"
+
+#: How a *stored* reference is compared with the executed result.
+#:
+#: ``"fingerprint"``
+#:     The long-standing rule: equal :func:`eval.fingerprint.fingerprint_dataframe`
+#:     hashes, which include the column names.
+#: ``"execution"``
+#:     Execution accuracy as BIRD and Spider define it
+#:     (:func:`eval.compare.compare_frames`): the case's ``expected_rows`` are
+#:     compared with the result as a multiset of rows, column names ignored,
+#:     with the numeric tolerance. Needed when the reference result comes from
+#:     another engine than the one under test, where column names and float
+#:     noise differ although the answer is the same.
+StoredMatch = Literal["fingerprint", "execution"]
+
+#: The statuses whose cases never reach the generator or the executor.
+#: Everything except ``"active"``.
+NON_RUNNABLE_STATUSES: tuple[str, ...] = tuple(
+    s for s in get_args(GoldenCaseStatus) if s != "active"
+)
+
+#: Coarse bucket a finished case falls into — used for the error taxonomy
+#: in :class:`EvalReport` and to decide pass/fail.
+CaseStatus = Literal[
+    "pass",                 # matched expectation, fingerprint matched (or N/A)
+    "fingerprint_mismatch", # SQL executed but result != expected (stored fingerprint or live reference)
+    "guard_rejected",       # security.sql_guard.validate_sql raised
+    "generation_error",     # LLM/generator raised something unexpected
+    "execution_error",      # execute_fn raised RuntimeError
+    "reference_error",      # --reference live: the case's own expected_sql failed to run
+    "unexpected_out_of_scope",  # generator said OUT_OF_SCOPE but case expected data
+    "missed_out_of_scope",  # case expected OUT_OF_SCOPE but generator returned SQL
+]
+
+
+@dataclass(frozen=True, slots=True)
+class GoldenCase:
+    """One hand-authored (question -> reference answer) evaluation case.
+
+    Parameters
+    ----------
+    id:
+        Stable, unique identifier (e.g. ``"customer_count_basic"``). Used in
+        reports and as the join key against a baseline.
+    question:
+        The natural-language question, verbatim as a user would type it.
+        May be Persian, English, or mixed.
+    tags:
+        Free-form keywords used for the per-tag accuracy breakdown (e.g.
+        ``["customer", "count"]``, ``["persian_digits", "date_filter"]``).
+    expected_sql:
+        The reference T-SQL query a domain expert verified produces the
+        correct answer. ``None`` for cases whose ``expect`` is
+        ``"out_of_scope"`` (there is no correct SQL for those).
+    expect:
+        What the pipeline should do with this question. See
+        :data:`CaseExpectation`. Defaults to ``"success"``.
+    expected_fingerprint:
+        Precomputed :func:`eval.fingerprint.fingerprint_dataframe` hash of
+        the reference result set. Required for offline/CI mode (there is no
+        live database to compute it against). Optional in live mode, where
+        it can instead be *recorded* from the first run to seed a baseline.
+    expected_rows:
+        Optional recorded reference rows (list of ``{column: value}``
+        dicts), used only by the offline replay executor
+        (:func:`eval.runner.make_offline_executor`) to serve as the
+        "database" response for this case without a real connection. Not
+        required when only ``expected_fingerprint`` is used for comparison
+        in live mode.
+    notes:
+        Free-text explanation of *why* this case exists / what it guards
+        against (e.g. "Persian digit normalisation must map ۱۴۰۲ -> 1402").
+    status:
+        See :data:`GoldenCaseStatus`. Defaults to ``"active"`` -- every
+        case ever loaded before this field existed has no ``status`` key
+        in its JSON line at all, and :meth:`from_dict` treats an absent
+        key exactly like this default, so no existing golden set changes
+        behaviour.
+    datasource:
+        Optional name of the data source (``datasources.yaml``) the
+        reference answer lives in, e.g. ``"sales"``. A live run compares
+        it with the source the pipeline selected, which is how
+        source-selection accuracy is measured. ``None`` (the default, and
+        what every case written before this field existed has) means "not
+        stated": the case still counts toward overall accuracy but not
+        toward the per-source figures.
+    exclusion_reason:
+        Why an ``"excluded"`` case is out of scoring (a short code such as
+        ``"load_fidelity"``); required for that status and forbidden for any
+        other. ``None`` for every case written before this field existed.
+    match:
+        See :data:`StoredMatch`. ``"fingerprint"`` (the default, and what every
+        case written before this field existed means) or ``"execution"``,
+        which needs recorded ``expected_rows``.
+
+    Examples
+    --------
+    >>> case = GoldenCase(
+    ...     id="customer_count_basic",
+    ...     question="How many customers exist?",
+    ...     tags=["customer", "count"],
+    ...     expected_sql="SELECT COUNT(*) AS CustomerCount FROM [sales].[Customer]",
+    ...     expected_fingerprint="deadbeef",
+    ... )
+    >>> case.expect
+    'success'
+    >>> case.is_out_of_scope
+    False
+
+    A ``"pending_expected"`` case may omit ``expected_sql`` entirely --
+    admin panel phase 4's promoted-but-not-yet-answered golden case (spec
+    §4):
+
+    >>> pending = GoldenCase(
+    ...     id="promoted_from_feedback_7",
+    ...     question="How many orders shipped late last quarter?",
+    ...     status="pending_expected",
+    ... )
+    >>> pending.expected_sql is None
+    True
+
+    A ``"pending_review"`` candidate keeps the model's proposed SQL but is
+    never run, and may not carry recorded rows:
+
+    >>> candidate = GoldenCase(
+    ...     id="cand_1", question="How many customers?",
+    ...     expected_sql="SELECT COUNT(*) FROM [sales].[Customer]",
+    ...     status="pending_review", datasource="sales",
+    ... )
+    >>> candidate.is_runnable
+    False
+    >>> GoldenCase(id="cand_2", question="q", status="pending_review",
+    ...            expected_rows=[{"n": 1}])
+    Traceback (most recent call last):
+        ...
+    ValueError: GoldenCase 'cand_2': a 'pending_review' case cannot carry expected_rows or expected_fingerprint (nothing has been verified yet)
+
+    An ``"excluded"`` case says why, and is never run:
+
+    >>> excluded = GoldenCase(id="ex_1", question="q", expected_sql="SELECT 1",
+    ...                       status="excluded", exclusion_reason="load_fidelity")
+    >>> excluded.is_runnable
+    False
+    """
+
+    id: str
+    question: str
+    tags: list[str] = field(default_factory=list)
+    expected_sql: str | None = None
+    expect: CaseExpectation = "success"
+    expected_fingerprint: str | None = None
+    expected_rows: list[dict[str, Any]] | None = None
+    notes: str = ""
+    status: GoldenCaseStatus = "active"
+    datasource: str | None = None
+    exclusion_reason: str | None = None
+    match: StoredMatch = "fingerprint"
+
+    def __post_init__(self) -> None:
+        if not self.id or not self.id.strip():
+            raise ValueError("GoldenCase.id must be a non-empty string")
+        if not self.question or not self.question.strip():
+            raise ValueError(f"GoldenCase {self.id!r}: question must be non-empty")
+        if self.status not in get_args(GoldenCaseStatus):
+            raise ValueError(
+                f"GoldenCase {self.id!r}: unknown status {self.status!r} "
+                f"(expected one of {list(get_args(GoldenCaseStatus))})"
+            )
+        if self.datasource is not None and (
+            not isinstance(self.datasource, str) or not self.datasource.strip()
+        ):
+            raise ValueError(
+                f"GoldenCase {self.id!r}: datasource must be a non-empty string or None"
+            )
+        if self.match not in get_args(StoredMatch):
+            raise ValueError(
+                f"GoldenCase {self.id!r}: unknown match {self.match!r} "
+                f"(expected one of {list(get_args(StoredMatch))})"
+            )
+        if self.status == "excluded":
+            if not self.exclusion_reason or not self.exclusion_reason.strip():
+                raise ValueError(
+                    f"GoldenCase {self.id!r}: an 'excluded' case needs an exclusion_reason"
+                )
+            return  # nothing of it is run, so no expectation is required
+        if self.exclusion_reason is not None:
+            raise ValueError(
+                f"GoldenCase {self.id!r}: exclusion_reason only applies to an 'excluded' case"
+            )
+        if self.status == "pending_review":
+            if self.expected_rows is not None or self.expected_fingerprint is not None:
+                raise ValueError(
+                    f"GoldenCase {self.id!r}: a 'pending_review' case cannot carry "
+                    "expected_rows or expected_fingerprint (nothing has been verified yet)"
+                )
+            # The model's proposal may be present or absent (an
+            # out-of-scope or failed record has none); either is fine
+            # until a person has looked at it.
+            return
+        if self.status == "pending_expected":
+            # No expectation exists yet, by definition (spec §4) -- neither
+            # branch below applies until someone supplies one and moves
+            # this case back to "active".
+            return
+        if self.expect != "out_of_scope" and not self.expected_sql:
+            raise ValueError(
+                f"GoldenCase {self.id!r}: expected_sql is required unless "
+                f"expect='out_of_scope' (got expect={self.expect!r})"
+            )
+        if self.expect == "out_of_scope" and self.expected_sql:
+            raise ValueError(
+                f"GoldenCase {self.id!r}: expected_sql must be None when "
+                f"expect='out_of_scope'"
+            )
+        if self.match == "execution" and not self.expected_rows:
+            raise ValueError(
+                f"GoldenCase {self.id!r}: match='execution' compares with the recorded "
+                "expected_rows, which must be a non-empty list"
+            )
+
+    @property
+    def is_out_of_scope(self) -> bool:
+        """True when this case documents an out-of-scope question."""
+        return self.expect == "out_of_scope"
+
+    @property
+    def is_runnable(self) -> bool:
+        """True when the regression gate runs this case (``status == "active"``).
+
+        Examples
+        --------
+        >>> GoldenCase(id="a", question="q", expected_sql="SELECT 1").is_runnable
+        True
+        >>> GoldenCase(id="b", question="q", status="pending_expected").is_runnable
+        False
+        """
+        return self.status == "active"
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "GoldenCase":
+        """Build a :class:`GoldenCase` from one decoded JSON line.
+
+        Unknown keys are ignored so ``golden.jsonl`` can carry extra
+        documentation fields (e.g. a human-only ``source`` column) without
+        breaking the loader.
+
+        Parameters
+        ----------
+        data:
+            A dict decoded from one line of a ``golden.jsonl`` file.
+
+        Returns
+        -------
+        GoldenCase
+
+        Examples
+        --------
+        >>> GoldenCase.from_dict({
+        ...     "id": "x", "question": "how many?", "expected_sql": "SELECT 1",
+        ... }).id
+        'x'
+        """
+        known = {f: data[f] for f in cls.__dataclass_fields__ if f in data}
+        return cls(**known)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise back to a plain dict (inverse of :meth:`from_dict`)."""
+        return {
+            "id": self.id,
+            "question": self.question,
+            "tags": list(self.tags),
+            "expected_sql": self.expected_sql,
+            "expect": self.expect,
+            "expected_fingerprint": self.expected_fingerprint,
+            "expected_rows": self.expected_rows,
+            "notes": self.notes,
+            "status": self.status,
+            "datasource": self.datasource,
+            "exclusion_reason": self.exclusion_reason,
+            "match": self.match,
+        }
+
+
+#: How a result differs from the reference, from :mod:`eval.diagnosis`.
+#:
+#: ``match``
+#:     The same answer (the verdict of :mod:`eval.compare`).
+#: ``match_capped``
+#:     Passed: the result has exactly as many rows as the row cap (the
+#:     ``TOP n`` the server injected, or ``MAX_ROWS_RETURNED`` if lower),
+#:     fewer than the reference, every row is one the reference has, **and**
+#:     a count of the model's SQL without the cap equals the reference's row
+#:     count (:mod:`eval.capcheck`), so it is not an over-filtered query that
+#:     merely returns a cap's worth of valid rows. The analyst saw the right
+#:     rows, cut short by policy. Only the production pipeline has a cap, so
+#:     ``--single-shot`` never produces it. When the count disagrees, or
+#:     cannot be asked, the class is ``actual_is_subset`` and the case fails.
+#: ``not_executed``
+#:     The generated SQL, or the reference, never produced a result.
+#: ``column_count_differs``, ``actual_empty``, ``expected_empty``
+#:     The shapes differ: a different number of columns; no rows where the
+#:     reference has some; rows where the reference has none.
+#: ``actual_is_subset`` / ``actual_is_superset``
+#:     Fewer (more) rows than the reference, and every row of the smaller
+#:     result is in the larger one: a filter too tight (too loose).
+#: ``row_count_differs``
+#:     A different number of rows and neither contains the other.
+#: ``same_rows_different_order``
+#:     The same rows, but the reference's ``ORDER BY`` with ``TOP`` /
+#:     ``OFFSET`` makes the order part of the answer.
+#: ``column_names_differ``
+#:     The same data, but the columns are not lined up as the reference
+#:     selects them (another order, or other names): the two agree once the
+#:     columns are matched by name, or by content.
+#: ``values_differ_same_shape``
+#:     The same number of rows and columns, different values.
+MismatchClass = Literal[
+    "match",
+    "match_capped",
+    "row_count_differs",
+    "column_count_differs",
+    "column_names_differ",
+    "same_rows_different_order",
+    "values_differ_same_shape",
+    "actual_is_subset",
+    "actual_is_superset",
+    "actual_empty",
+    "expected_empty",
+    "not_executed",
+]
+
+#: Every :data:`MismatchClass`, in the order declared on the type.
+MISMATCH_CLASSES: tuple[str, ...] = get_args(MismatchClass)
+
+#: The buckets of :attr:`MismatchDiagnosis.relative_error_bucket`.
+RELATIVE_ERROR_BUCKETS: tuple[str, ...] = ("<1%", "<10%", ">=10%")
+
+
+@dataclass(frozen=True, slots=True)
+class MismatchDiagnosis:
+    """How the generated SQL's result differs from the reference's, without any value.
+
+    Computed on the machine that ran both queries (see
+    :func:`eval.diagnosis.diagnose_results`) from the two result frames and
+    holding only their *shape*: counts and column names. Column names are
+    schema, not data; no cell value is ever kept here, which is what makes a
+    diagnosis safe to put in a file that leaves the server.
+
+    Parameters
+    ----------
+    mismatch_class:
+        See :data:`MismatchClass`.
+    expected_rows, actual_rows:
+        Row counts of the reference and of the generated SQL's result;
+        ``None`` for a query that did not run.
+    expected_columns, actual_columns:
+        Column names, in selected order; ``None`` for a query that did not
+        run.
+    relative_error_bucket:
+        Only for two single-cell numeric results that differ:
+        ``"<1%"``, ``"<10%"`` or ``">=10%"`` (relative to the reference).
+        Never the numbers. ``None`` otherwise.
+    capped, row_cap:
+        ``capped`` is true for ``match_capped``; ``row_cap`` is the cap the
+        server applied to that result (a count, never a value), and is also
+        recorded for a capped-looking result that did not qualify.
+    uncapped_rows:
+        For a result that qualified for ``match_capped``: the number of rows
+        the model's SQL returns without the cap, from one extra count query.
+        A count, never a value; ``None`` otherwise.
+    reference_uncapped_rows:
+        When the reference result itself reached ``MAX_ROWS_RETURNED`` (its
+        length is not its size), the reference's own counted row count, which
+        ``uncapped_rows`` must equal; ``None`` otherwise.
+    capped_unverified:
+        True when a count query could not be run or built (the model's, or
+        the reference's when it was cut): the case then fails as
+        ``actual_is_subset`` rather than passing unverified.
+
+    Examples
+    --------
+    >>> d = MismatchDiagnosis("match", 3, 3, ["n"], ["total"])
+    >>> d.to_dict()["mismatch_class"]
+    'match'
+    >>> MismatchDiagnosis.from_dict(d.to_dict()) == d
+    True
+    """
+
+    mismatch_class: MismatchClass
+    expected_rows: int | None = None
+    actual_rows: int | None = None
+    expected_columns: list[str] | None = None
+    actual_columns: list[str] | None = None
+    relative_error_bucket: str | None = None
+    capped: bool = False
+    row_cap: int | None = None
+    uncapped_rows: int | None = None
+    reference_uncapped_rows: int | None = None
+    capped_unverified: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise to a JSON-friendly dict."""
+        return {
+            "mismatch_class": self.mismatch_class,
+            "expected_rows": self.expected_rows,
+            "actual_rows": self.actual_rows,
+            "expected_columns": (
+                None if self.expected_columns is None else list(self.expected_columns)
+            ),
+            "actual_columns": (
+                None if self.actual_columns is None else list(self.actual_columns)
+            ),
+            "relative_error_bucket": self.relative_error_bucket,
+            "capped": self.capped,
+            "row_cap": self.row_cap,
+            "uncapped_rows": self.uncapped_rows,
+            "reference_uncapped_rows": self.reference_uncapped_rows,
+            "capped_unverified": self.capped_unverified,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MismatchDiagnosis":
+        """Inverse of :meth:`to_dict`; absent keys read as ``None``."""
+        name = data["mismatch_class"]
+        if name not in MISMATCH_CLASSES:
+            raise ValueError(f"unknown mismatch_class {name!r}")
+        expected_columns = data.get("expected_columns")
+        actual_columns = data.get("actual_columns")
+        return cls(
+            mismatch_class=name,
+            expected_rows=data.get("expected_rows"),
+            actual_rows=data.get("actual_rows"),
+            expected_columns=None if expected_columns is None else list(expected_columns),
+            actual_columns=None if actual_columns is None else list(actual_columns),
+            relative_error_bucket=data.get("relative_error_bucket"),
+            capped=bool(data.get("capped", False)),
+            row_cap=data.get("row_cap"),
+            uncapped_rows=data.get("uncapped_rows"),
+            reference_uncapped_rows=data.get("reference_uncapped_rows"),
+            capped_unverified=bool(data.get("capped_unverified", False)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CaseResult:
+    """Outcome of running one :class:`GoldenCase` through the pipeline.
+
+    Parameters
+    ----------
+    case_id:
+        Matches :attr:`GoldenCase.id`.
+    question:
+        Copied from the case, for standalone readability of a report.
+    tags:
+        Copied from the case, used for the per-tag breakdown.
+    status:
+        Coarse outcome bucket, see :data:`CaseStatus`.
+    passed:
+        ``True`` iff the run matched the case's expectation. Convenience
+        boolean derived from ``status`` at construction time (``status ==
+        "pass"``).
+    generated_sql:
+        The cleaned SQL string the generator produced, or ``None`` if
+        generation failed before producing SQL (e.g. ``OUT_OF_SCOPE``).
+    actual_fingerprint:
+        Fingerprint of the executed result set, or ``None`` if execution
+        never happened.
+    error:
+        Human-readable error message when ``status != "pass"``, else
+        ``None``.
+    latency_seconds:
+        Wall-clock time for the full case (generation + guard + execution,
+        plus the reference query in ``--reference live`` mode).
+    expected_datasource:
+        Copied from :attr:`GoldenCase.datasource` (``None`` when the case
+        does not state one). Additive: a report written before this field
+        existed loads with ``None``.
+    selected_datasource:
+        The data source the pipeline picked for this question in a live
+        run: the source routing's ``chosen`` source when several sources
+        are configured, otherwise the source the generated SQL routes to
+        (:func:`database.routing.target_datasource_or_none`). ``None`` when
+        nothing was generated, in offline mode, or in a report written
+        before this field existed.
+    reference_fingerprint:
+        Fingerprint of the reference query's result when the run used
+        ``--reference live`` (``None`` otherwise). Compared with
+        :attr:`actual_fingerprint` only for diagnosis -- the verdict comes
+        from :func:`eval.compare.compare_frames`, which ignores column
+        names that the fingerprint includes.
+    diagnosis:
+        How the result differs from the reference (counts and column names,
+        never a value), set by a ``--reference live`` run that got as far as
+        executing the generated SQL. ``None`` otherwise and in a report
+        written before this field existed.
+    corrections:
+        Self-correction rounds spent on this question: the number of
+        generations after the first. The default ``--live`` pipeline runs
+        the server's own correction loop (:mod:`eval.pipeline`), so this is
+        real; ``--single-shot`` generates once and it is ``0``.
+    guard_rejections:
+        The SQL guard's rejections of this question's SQL, one per round
+        that was rejected, as ``{"round": <1 = first try>, "class":
+        <exception class>, "message": <text>}``. Raw text: it is redacted
+        when it goes into a share bundle (:mod:`eval.share`), not here.
+    execution_errors:
+        The same for rounds whose SQL passed the guard and then failed to
+        run (the server corrects those too).
+    """
+
+    case_id: str
+    question: str
+    tags: list[str]
+    status: CaseStatus
+    generated_sql: str | None
+    actual_fingerprint: str | None
+    error: str | None
+    latency_seconds: float
+    expected_datasource: str | None = None
+    selected_datasource: str | None = None
+    reference_fingerprint: str | None = None
+    diagnosis: MismatchDiagnosis | None = None
+    corrections: int = 0
+    guard_rejections: list[dict[str, Any]] = field(default_factory=list)
+    execution_errors: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def passed(self) -> bool:
+        """True iff this case matched its expectation."""
+        return self.status == "pass"
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise to a JSON-friendly dict."""
+        return {
+            "case_id": self.case_id,
+            "question": self.question,
+            "tags": list(self.tags),
+            "status": self.status,
+            "passed": self.passed,
+            "generated_sql": self.generated_sql,
+            "actual_fingerprint": self.actual_fingerprint,
+            "error": self.error,
+            "latency_seconds": self.latency_seconds,
+            "expected_datasource": self.expected_datasource,
+            "selected_datasource": self.selected_datasource,
+            "reference_fingerprint": self.reference_fingerprint,
+            "diagnosis": None if self.diagnosis is None else self.diagnosis.to_dict(),
+            "corrections": self.corrections,
+            "guard_rejections": [dict(r) for r in self.guard_rejections],
+            "execution_errors": [dict(r) for r in self.execution_errors],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class EvalReport:
+    """Aggregate result of running a full golden set once.
+
+    Parameters
+    ----------
+    mode:
+        ``"offline"`` or ``"live"`` — which executor/generator wiring
+        produced this report.
+    total:
+        Number of cases run.
+    passed:
+        Number of cases with ``status == "pass"``.
+    accuracy_pct:
+        ``100 * passed / total`` (0.0 when ``total == 0``).
+    tag_accuracy:
+        Per-tag accuracy, ``{tag: (passed, total)}``.
+    status_counts:
+        Count of results per :data:`CaseStatus` value — this is the error
+        taxonomy.
+    guard_rejections:
+        Number of cases whose generated SQL was rejected by
+        :func:`security.sql_guard.validate_sql` (subset of
+        ``status_counts["guard_rejected"]``, surfaced separately since it
+        is the single most safety-relevant metric).
+    latency_p50, latency_p95, latency_p99:
+        Latency percentiles across all cases, in seconds.
+    results:
+        The full list of per-case results, for drill-down.
+    generated_at:
+        ISO-8601 UTC timestamp of when the report was built.
+    reference:
+        How a live run decided a result was right: ``"stored"`` (compare
+        with each case's recorded ``expected_fingerprint``, the only
+        option offline and the long-standing live behaviour) or ``"live"``
+        (run each case's ``expected_sql`` in the same run and compare the
+        two results, see :mod:`eval.compare`). A report written before
+        this field existed loads as ``"stored"``. A baseline can only be
+        compared with a run that used the same reference.
+    source_accuracy:
+        Per-data-source execution accuracy, ``{source: (passed, total)}``,
+        over the cases that name a ``datasource``. Empty when no case does.
+    source_selection:
+        ``(correct, total)`` source-selection accuracy of a *live* run over
+        the cases that name a ``datasource`` and expect SQL; ``None`` for
+        an offline run (where the "selection" replays the reference and is
+        right by construction) and when no case names a source.
+    pipeline:
+        What generated the SQL in a live run: ``"production"`` (the server's
+        own ``SQLAgent`` loop: guard, correction rounds, row cap; the
+        default) or ``"single_shot"`` (one model call, no correction: the
+        model-only number). ``None`` for an offline run, and for a report
+        written before this field existed, which was always single-shot.
+    benchmark:
+        Set when the cases are a public benchmark loaded into the operator's
+        own database (every case carries the same ``bench:<name>`` tag; see
+        :func:`eval.report.benchmark_from_results`): ``{"name": ...}`` plus,
+        in a merged benchmark report, the run mode and the exclusions. Its
+        presence puts a "not this deployment's accuracy" header on the text
+        report. ``None`` for a golden set of the deployment's own questions
+        and in a report written before this field existed.
+    """
+
+    mode: Literal["offline", "live"]
+    total: int
+    passed: int
+    accuracy_pct: float
+    tag_accuracy: dict[str, tuple[int, int]]
+    status_counts: dict[str, int]
+    guard_rejections: int
+    latency_p50: float
+    latency_p95: float
+    latency_p99: float
+    results: list[CaseResult]
+    generated_at: str
+    reference: Literal["stored", "live"] = "stored"
+    source_accuracy: dict[str, tuple[int, int]] = field(default_factory=dict)
+    source_selection: tuple[int, int] | None = None
+    pipeline: Literal["production", "single_shot"] | None = None
+    benchmark: dict[str, Any] | None = None
+
+    def intervals(self) -> dict[str, Any]:
+        """Wilson 95% intervals of the overall accuracy and of every stratum.
+
+        A stratum is a tag (language, category, ``db:*``, ``difficulty:*``, ...)
+        or a data source. Each carries its ``n``, and ``interpretable`` is false
+        below :data:`eval.stats.MIN_STRATUM_N` cases. Derived from the counts,
+        so it is not read back when a report is loaded.
+
+        Examples
+        --------
+        >>> r = EvalReport("live", 4, 3, 75.0, {"t": (3, 4)}, {}, 0, 0.0, 0.0, 0.0, [], "x")
+        >>> r.intervals()["overall"]["n"], r.intervals()["per_tag"]["t"]["interpretable"]
+        (4, False)
+        """
+        from eval.stats import stratum_summary
+
+        return {
+            "overall": stratum_summary(self.passed, self.total),
+            "per_tag": {
+                tag: stratum_summary(p, t) for tag, (p, t) in self.tag_accuracy.items()
+            },
+            "per_source": {
+                source: stratum_summary(p, t) for source, (p, t) in self.source_accuracy.items()
+            },
+        }
+
+    def fidelity_split(self) -> dict[str, Any]:
+        """The accuracy on all scored cases and without the semantic-difference cases.
+
+        A benchmark case flagged :data:`SEMANTIC_DIFFERENCE_TAG` is scored, but a
+        correct T-SQL answer may be unable to match its SQLite reference (integer
+        division, string comparison, a column SQLite stores as mixed types), so
+        both figures are given.
+
+        Examples
+        --------
+        >>> from eval.models import CaseResult
+        >>> rs = [CaseResult("a", "q", [], "pass", None, None, None, 0.0),
+        ...       CaseResult("b", "q", [SEMANTIC_DIFFERENCE_TAG], "fingerprint_mismatch", None, None, None, 0.0)]
+        >>> split = EvalReport("live", 2, 1, 50.0, {}, {}, 0, 0.0, 0.0, 0.0, rs, "x").fidelity_split()
+        >>> split["semantic_difference_cases"], split["all"]["pct"], split["without_semantic_difference"]["pct"]
+        (1, 50.0, 100.0)
+        """
+        from eval.stats import stratum_summary
+
+        kept = [r for r in self.results if SEMANTIC_DIFFERENCE_TAG not in r.tags]
+        return {
+            "semantic_difference_cases": len(self.results) - len(kept),
+            "unverified_cases": sum(1 for r in self.results if UNVERIFIED_TAG in r.tags),
+            "all": stratum_summary(self.passed, self.total),
+            "without_semantic_difference": stratum_summary(sum(1 for r in kept if r.passed), len(kept)),
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise to a JSON-friendly dict (used by :mod:`eval.baseline`)."""
+        return {
+            "mode": self.mode,
+            "pipeline": self.pipeline,
+            "total": self.total,
+            "passed": self.passed,
+            "accuracy_pct": self.accuracy_pct,
+            "tag_accuracy": {
+                tag: {"passed": p, "total": t}
+                for tag, (p, t) in self.tag_accuracy.items()
+            },
+            "status_counts": dict(self.status_counts),
+            "guard_rejections": self.guard_rejections,
+            "latency_p50": self.latency_p50,
+            "latency_p95": self.latency_p95,
+            "latency_p99": self.latency_p99,
+            "generated_at": self.generated_at,
+            "reference": self.reference,
+            "source_accuracy": {
+                source: {"passed": p, "total": t}
+                for source, (p, t) in self.source_accuracy.items()
+            },
+            "source_selection": (
+                None
+                if self.source_selection is None
+                else {"correct": self.source_selection[0], "total": self.source_selection[1]}
+            ),
+            "benchmark": self.benchmark,
+            "fidelity": (
+                self.fidelity_split()
+                if self.benchmark or any(SEMANTIC_DIFFERENCE_TAG in r.tags for r in self.results)
+                else None
+            ),
+            "intervals": self.intervals(),
+            "results": [r.to_dict() for r in self.results],
+        }

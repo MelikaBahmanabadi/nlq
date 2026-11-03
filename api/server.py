@@ -1,0 +1,803 @@
+# SPDX-License-Identifier: BUSL-1.1
+# Copyright (c) 2024-2026 Ali Sadeghi Aghili
+"""FastAPI server for the Auction NLQ Engine.
+
+Endpoints
+---------
+POST /query
+    Accept a natural-language question and return SQL, result, or both
+    — plus an optional plain-language interpretation.
+
+GET  /health
+    Liveness check: confirms the LLM endpoint is reachable and DB can be pinged.
+
+GET  /cache/stats
+    Return current cache metrics (hits, misses, size, evictions, enabled).
+
+POST /cache/clear
+    Flush the entire query-result cache and return a stats snapshot.
+
+POST /cache/invalidate
+    Evict a single (question, mode) entry from the cache.
+
+GET  /admin/summary, /admin/health/checks, /admin/cache, /admin/config
+    Read-only operator observability, admin-capability-gated — see
+    ``api/admin_routes.py`` and ``docs/admin-panel-architecture.md``.
+"""
+
+from __future__ import annotations
+
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
+from fastapi.responses import JSONResponse, StreamingResponse
+
+import config as cfg
+# Must stay ahead of every import below that reads project_config/ at import
+# time (security.sql_guard binds the schema allowlist): a broken file then
+# ends the process with three readable lines instead of a traceback.
+import api.startup_preflight  # noqa: F401
+import api.admin_access_requests_routes as admin_access_requests_routes
+import api.admin_config_routes as admin_config_routes
+import api.admin_feedback_routes as admin_feedback_routes
+import api.admin_ops_routes as admin_ops_routes
+import api.admin_routes as admin_routes
+import api.admin_write_routes as admin_write_routes
+import api.concurrency as concurrency
+import api.maintenance as maintenance
+import api.runner as runner  # import the MODULE so patch.object(runner, 'run_query') works
+import api.v2_routes as v2_routes
+# Only register_handlers is needed here: the typed exceptions are raised in
+# api/runner.py and translated to responses by the handlers that
+# register_handlers() attaches, so this module never names them.
+from api.auth import AuthMiddleware, get_principal_if_any, require_principal
+from api.cors_diagnostics import RejectedOriginLogMiddleware
+from api.errors import register_handlers
+from api.maintenance import require_not_in_maintenance
+from core.logging_setup import configure_stdlib_logging
+from core.provenance import log_startup_notice
+from core.version import __version__
+from api.middleware import (
+    ConcurrencyMiddleware,
+    RateLimitMiddleware,
+    RequestIDMiddleware,
+    SecurityHeadersMiddleware,
+)
+from api.models import (
+    QueryRequest,
+    QueryResponse,
+    HealthResponse,
+    CacheStatsResponse,
+    CacheInvalidateRequest,
+)
+from api.query_cache import query_cache
+from knowledge.config_loader import resolve_system_prompt_path
+from security.auth import ApiKeyConfigError, Principal, load_api_keys
+
+logger = logging.getLogger(__name__)
+
+# Resolved under PROJECT_CONFIG_DIR (see knowledge/config_loader.py), NOT
+# the process's current working directory — running uvicorn from anywhere
+# other than the repo root used to silently fail to find the prompt.
+_PROMPT_PATH = resolve_system_prompt_path()
+_system_prompt: str = ""
+
+# ---------------------------------------------------------------------------
+# Bounded threadpool for blocking pipeline work
+# ---------------------------------------------------------------------------
+# All blocking pipeline operations (runner.run_query, TurnEngine.ask,
+# etc.) run off the event loop through asyncio.to_thread under the shared
+# semaphore in api/concurrency.py. This semaphore bounds how many such
+# threads may run at once.
+#
+# The ConcurrencyMiddleware (api/middleware.py) controls admission: it
+# decides whether to accept a request at all (503 when over capacity).
+# The concurrency semaphore then decides how many accepted requests may
+# occupy a worker thread simultaneously.
+#
+# They are separate to allow:
+# - Admission control to be tight (reject excess requests fast)
+# - Worker pool to be generous (accommodate accepted requests that might
+#   queue briefly on the semaphore)
+#
+# _query_semaphore / _QUERY_THREAD_LIMIT below are aliases of the SAME
+# objects api/concurrency.py owns (module-level names, not copies), kept
+# for backward compatibility with tests written against this module
+# directly. Every actual acquire goes through api.concurrency.run_bounded
+# (via _run_query_bounded just below), which looks the semaphore up fresh
+# on each call (api.concurrency._get_semaphore()) rather than capturing
+# either of these aliases -- so a test that swaps out
+# api.concurrency._semaphore for a new object (to exercise a tight bound)
+# is honoured by every caller, while these two names keep pointing at
+# whatever object existed at this module's own import time.
+_query_semaphore = concurrency._semaphore
+_QUERY_THREAD_LIMIT = concurrency._QUERY_THREAD_LIMIT
+
+
+async def _run_query_bounded(**kwargs) -> QueryResponse:
+    """Run ``runner.run_query`` off the event loop, under a concurrency bound.
+
+    Parameters
+    ----------
+    **kwargs:
+        Forwarded verbatim to :func:`api.runner.run_query`.
+
+    Returns
+    -------
+    api.models.QueryResponse
+
+    Raises
+    ------
+    api.errors.NLQError
+        Whatever ``runner.run_query`` itself raises, propagated unchanged
+        — ``asyncio.to_thread`` re-raises the worker thread's exception in
+        the calling coroutine, so the existing exception-handler
+        registration (``register_handlers``) still works unmodified.
+    """
+    return await concurrency.run_bounded(runner.run_query, **kwargs)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _system_prompt
+
+    # Neither documented way of starting this API (a plain `uvicorn
+    # api.server:app ...`, or `python -m api`) otherwise makes a single
+    # INFO line -- this function's own provenance banner and CORS line
+    # among them -- reach anywhere: uvicorn's default logging config never
+    # touches the ROOT logger, which Python itself starts at WARNING with
+    # no handler. A no-op once an operator (or this same call, on a
+    # second lifespan start in one process, e.g. under a test) has
+    # already configured logging -- see core.logging_setup's module
+    # docstring for the full mechanism. Must run before the first log
+    # call below, or that call is the one that gets silently dropped.
+    configure_stdlib_logging(cfg.settings.log_level)
+
+    # Stated before anything else can fail: an operator who never reaches
+    # a working config should still have seen whose work this is and on
+    # what terms. See core/provenance.py for why this is a log line and
+    # not a licence check that could refuse to start.
+    log_startup_notice(logger)
+
+    try:
+        cfg.settings.validate()
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid configuration: {exc}") from exc
+
+    # Logged once, every startup, unconditionally (not just when the list
+    # is non-default): a real deployment split across two ports/hosts
+    # diagnosed a "backend down" symptom that was actually an empty CORS
+    # allowlist purely by trial and error, because nothing in the startup
+    # log named which origins were actually allowed. See
+    # ``docs/deployment-runbook.md`` and ``docs/fa/getting-started.md``
+    # §2.3.1 for the full symptom (every health light red, cross-origin
+    # only) this line exists to short-circuit.
+    logger.info(
+        "CORS allowed origins: %s",
+        ", ".join(cfg.settings.cors_allowed_origins) or "(none — same-origin callers only)",
+    )
+
+    # ── Phase 8: fail closed on authentication config ──────────────────────
+    # Mirrors the db_connection_url precedent immediately above: a broken
+    # or absent auth configuration must stop the server from starting at
+    # all, not be discovered later as every caller gets a 401 nobody can
+    # fix without a redeploy. This first pass only parses API_KEYS_JSON /
+    # API_KEYS_FILE (fail fast on malformed JSON before touching the application
+    # database at all); the "are there ANY usable keys" check below runs
+    # after the application-database keys are known too (admin panel
+    # phase 2), since an all-database-issued key set with no environment
+    # keys is a legitimate deployment shape, not a misconfiguration.
+    try:
+        load_api_keys()
+    except ApiKeyConfigError as exc:
+        raise RuntimeError(f"Invalid API key configuration: {exc}") from exc
+
+    if not cfg.settings.auth_required:
+        # Logged on EVERY startup (not deduplicated) -- a deliberately
+        # disabled front door must never be quiet in the logs. See
+        # config.py's Settings.auth_required docstring.
+        logger.warning(
+            "AUTH_REQUIRED=false -- this server is accepting unauthenticated "
+            "requests on every route except the ones that were already open. "
+            "This is a deliberate escape hatch and must not be used in a "
+            "production deployment."
+        )
+
+    # ── Admin panel, phase 2: the application database ─────────────────────
+    # Fail closed, mirroring the auth/db_connection_url checks above: the
+    # server now depends on the application database (key store, role
+    # grants), and an operator must be told clearly which database is
+    # missing/misconfigured rather than discovering it as every request
+    # fails once traffic arrives. See docs/admin-panel-architecture.md §5.7
+    # and the phase 2 spec §1.4 ("this resolves the first open question in
+    # the architecture's §9").
+    #
+    # Checked BEFORE anything touches either engine: raise_if_same_database
+    # must run first so a misconfiguration that would point the writable
+    # application database at the read-only warehouse connection is caught
+    # before a single query runs against either.
+    from appdb.engine import get_app_engine, raise_if_same_database, resolve_app_db_url
+    from appdb.key_store import (
+        AmbiguousKeyIdentityError,
+        bootstrap_from_env,
+        get_active_principals,
+    )
+
+    from database.datasources import check_table_datasources, get_datasources
+
+    app_db_url = resolve_app_db_url()
+    for source in get_datasources():
+        raise_if_same_database(app_db_url, source.url)
+
+    # Every schema.yaml table must name a configured data source; an
+    # unknown one would only surface as a failed query later.
+    try:
+        check_table_datasources()
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid configuration: {exc}") from exc
+
+    try:
+        get_app_engine()  # builds the engine and creates its tables (checkfirst)
+    except Exception as exc:  # noqa: BLE001 - re-raised as a clear, fail-closed RuntimeError
+        raise RuntimeError(
+            f"Application database unreachable or unusable at startup "
+            f"(APP_DB_URL resolved to {app_db_url!r}): {exc}"
+        ) from exc
+
+    try:
+        bootstrap_from_env()
+    except ApiKeyConfigError as exc:
+        raise RuntimeError(f"Invalid API key configuration: {exc}") from exc
+    except AmbiguousKeyIdentityError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+    # Now that both sources have been reconciled, "are there any keys at
+    # all" is asked against the merged set -- an all-database-issued
+    # deployment with no environment keys must not be refused startup
+    # just because the environment alone has nothing configured.
+    if cfg.settings.auth_required and not get_active_principals():
+        raise RuntimeError(
+            "AUTH_REQUIRED is true but no usable key is configured in "
+            "API_KEYS_FILE, API_KEYS_JSON or the application database -- "
+            "refusing to start a server that requires authentication nobody "
+            "could ever satisfy. Set API_KEYS_FILE (a JSON array in a file, "
+            "e.g. project_config/api_keys.json) or API_KEYS_JSON (see "
+            "scripts/issue_api_key.py), or explicitly set AUTH_REQUIRED=false."
+        )
+
+    if not _PROMPT_PATH.exists():
+        raise RuntimeError(f"System prompt not found: {_PROMPT_PATH}")
+    _system_prompt = _PROMPT_PATH.read_text(encoding="utf-8")
+    # v2_routes.py/admin_ops_routes.py cannot import this module at load
+    # time (this module imports both to mount their routers -- a cycle),
+    # so the loaded prompt is handed across explicitly here instead.
+    v2_routes._system_prompt = _system_prompt
+    admin_ops_routes._system_prompt = _system_prompt
+    logger.info("System prompt loaded (%d chars)", len(_system_prompt))
+
+    # With several data sources the token budget is applied per source:
+    # say, once, what each source's prompt estimate is and which path it
+    # takes. Silent (and a no-op) with one source.
+    from prompt_engine.static_prefix import log_prompt_paths
+
+    log_prompt_paths(_system_prompt)
+
+    # ── §9/§10: retention purge, once at start-up (no second daemon thread) ─
+    # Permanently deletes any persisted session past session_retention_days
+    # since its last activity. A no-op when session persistence is disabled
+    # (session_store_path=""). Best-effort: a failure here (e.g. a
+    # transiently locked SQLite file) must not stop the server from
+    # starting -- the next restart tries again, and TTL expiry alone still
+    # bounds the in-memory hot set in the meantime.
+    try:
+        removed = v2_routes.get_session_store().purge_expired()
+        if removed:
+            logger.info("session retention purge: removed %d expired session(s)", removed)
+    except Exception as exc:  # noqa: BLE001 - startup must not fail on this
+        logger.warning("session retention purge failed at startup: %s", exc)
+
+    # ── Admin panel, phase 6: admin-action log retention purge ─────────────
+    # Mirrors the session-retention purge immediately above (once at
+    # start-up, best-effort) -- see appdb.admin_audit's module docstring
+    # for why this log is retained by time rather than by size.
+    try:
+        from appdb.admin_audit import purge_expired_admin_actions
+
+        removed = purge_expired_admin_actions()
+        if removed:
+            logger.info("admin-action log retention purge: removed %d expired record(s)", removed)
+    except Exception as exc:  # noqa: BLE001 - startup must not fail on this
+        logger.warning("admin-action log retention purge failed at startup: %s", exc)
+
+    # ── Latency: prime the model server's prefix cache ─────────────────────
+    # Same shape as the vocabulary warm-up below -- a settings flag, a
+    # failure that is a warning and never fatal -- with one difference that
+    # matters: this one does NOT run before `yield`. The vocabulary warm-up
+    # is a handful of cheap database reads; this is a prefill that takes
+    # about a minute on a large local model, and a server that held back
+    # every request for that long would have moved the slow first question
+    # from the analyst to the load balancer's health check. It runs on a
+    # daemon thread (llm/warmup.py), so the server accepts requests at once
+    # and a question that arrives mid-warm-up simply runs as it would have
+    # without it. Started before the vocabulary warm-up so the two overlap.
+    # See Settings.llm_prefix_warmup_on_startup.
+    if cfg.settings.llm_prefix_warmup_on_startup:
+        try:
+            from llm.warmup import start_background_warmup
+
+            start_background_warmup(_system_prompt, runner.get_llm_router)
+        except Exception as exc:  # noqa: BLE001 - an optimisation, startup must not fail on it
+            logger.warning("LLM prefix warm-up could not be started: %s", type(exc).__name__)
+
+    # ── Phase 5b: prefetch the small-dimension value vocabulary ────────────
+    # On by default (see
+    # Settings.dimension_vocabulary_warm_on_startup's own docstring for
+    # why); still an opt-out, not a hardcoded call, for a deployment whose
+    # startup path must not touch the database at all. This call happens
+    # BEFORE `yield` -- under the ASGI lifespan protocol no request is
+    # served until this coroutine yields, so "the first request must not
+    # block on a database round trip" holds by construction: the round
+    # trips happen here, on zero in-flight requests, not during a request.
+    # A failure is a warning, not fatal -- an empty vocabulary cache
+    # degrades every dimension it covers to "no match" (this phase's
+    # universal safe-miss behaviour), which is not a reason to refuse to
+    # start the server at all. `warm_all` already catches and logs a
+    # failure per (table, column) internally rather than propagating it
+    # (one bad dimension must not cold-start every other one too), but the
+    # call is still wrapped here: `warm_all` itself failing outright (a
+    # bug in it, or a test/deployment that replaces it entirely) must
+    # degrade exactly the same way a per-column failure does -- a cold
+    # cache, not a server that refuses to start -- see
+    # tests/test_startup_vocabulary_warmup.py. This codebase's DB-less
+    # test suite is unaffected either way: the root conftest.py's autouse
+    # `_no_real_database` fixture makes `database.connection.create_engine`
+    # raise for the duration of every test, so an unmocked startup attempt
+    # against that refused connection degrades to the same "no match"
+    # cache state a disabled flag would leave it in.
+    if cfg.settings.dimension_vocabulary_warm_on_startup:
+        from retrieval.dimension_vocabulary import warm_all
+
+        try:
+            counts = warm_all()
+            logger.info("dimension_vocabulary: startup warm-up complete: %s", counts)
+        except Exception as exc:  # noqa: BLE001 - a cold cache degrades gracefully, startup must not fail
+            logger.warning("dimension_vocabulary: startup warm-up failed: %s", exc)
+
+    # ── Latency: keep the prefix cache warm while the server runs ──────────
+    # Off unless LLM_PREFIX_KEEPWARM_SECONDS is above zero. It is the same
+    # pass as the start-up warm-up above, repeated, minus any source a real
+    # request used within the interval, so it costs nothing under traffic
+    # (llm/warmup.py's KeepWarm). Paused while maintenance mode is on, and
+    # stopped below at shutdown. A failure to start is a warning.
+    try:
+        from llm.warmup import start_keepwarm
+
+        start_keepwarm(
+            _system_prompt, runner.get_llm_router,
+            paused=lambda: bool(maintenance.get_state()["active"]),
+        )
+    except Exception as exc:  # noqa: BLE001 - an optimisation, startup must not fail on it
+        logger.warning("LLM prefix keep-warm could not be started: %s", type(exc).__name__)
+
+    try:
+        yield
+    finally:
+        try:
+            from llm.warmup import stop_keepwarm
+
+            stop_keepwarm()
+        except Exception as exc:  # noqa: BLE001 - shutdown must not fail on it
+            logger.warning("LLM prefix keep-warm could not be stopped: %s", type(exc).__name__)
+
+
+# docs_url/redoc_url/openapi_url are disabled here and re-registered by hand
+# below (Phase 8) so they can sit behind the same Depends(require_principal)
+# as every other non-/health route -- FastAPI's auto-registered docs routes
+# have no dependency-injection seam of their own.
+app = FastAPI(
+    title="Auction NLQ Engine",
+    description="Natural-language \u2192 SQL \u2192 Results API for Auction_DM.",
+    version=__version__,
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
+
+# --- Middleware (order matters: outer → inner) ---
+# 1. ConcurrencyMiddleware   — innermost: applied after rate-limit passes
+# 2. RateLimitMiddleware     — per-IP (or per-principal) token-bucket (429 on excess)
+# 3. AuthMiddleware          — resolves request.state.principal (Phase 8) --
+#                              must run before RateLimitMiddleware so it can
+#                              bucket on principal id, and after RequestID so
+#                              its own logging can carry the request id
+# 4. RequestIDMiddleware     — stamps X-Request-ID first so all downstream
+#                              middleware can log it
+# 5. CORSMiddleware          — a preflight OPTIONS request must get CORS
+#                              headers even when every other layer would
+#                              otherwise reject it
+# 6. RejectedOriginLogMiddleware — logs (once per origin) the Origin that
+#                              CORSMiddleware is about to refuse; it must sit
+#                              OUTSIDE CORSMiddleware because that layer
+#                              answers a refused preflight itself and never
+#                              passes it on. It changes no request or response.
+# 7. SecurityHeadersMiddleware — outermost of all: must wrap even the
+#                              exception-handling middleware FastAPI installs
+#                              beneath every add_middleware() layer, so an
+#                              error response carries the same headers as a
+#                              200 (Finding 7, 2026 audit)
+#
+# FastAPI/Starlette applies add_middleware() in REVERSE order, so the last
+# add_middleware() call becomes the outermost layer.
+app.add_middleware(ConcurrencyMiddleware)
+app.add_middleware(RateLimitMiddleware)
+app.add_middleware(AuthMiddleware)
+app.add_middleware(RequestIDMiddleware)
+
+# CORS: default-restrictive (docs/api-contract-v2.md §9 / web/README.md).
+# Empty cfg.settings.cors_allowed_origins (the default) means allow_origins=[],
+# which blocks every cross-origin request -- same-origin callers are
+# unaffected either way. Set CORS_ALLOWED_ORIGINS (comma-separated) to
+# unblock the bundled web/ UI when it is served from a different
+# origin/port than this API, e.g. CORS_ALLOWED_ORIGINS=http://localhost:8080.
+_cors_allowed_origins = list(cfg.settings.cors_allowed_origins)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_allowed_origins,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# Registered right after CORSMiddleware, so it wraps it (the last
+# add_middleware() call is the outermost). Given the very list CORSMiddleware
+# enforces, so what it reports is what is refused.
+app.add_middleware(RejectedOriginLogMiddleware, allowed_origins=_cors_allowed_origins)
+
+# Outermost of all: see the middleware-ordering comment above for why
+# SecurityHeadersMiddleware has to be the very last add_middleware() call.
+app.add_middleware(SecurityHeadersMiddleware)
+
+# --- v2 conversational session routes (docs/api-contract-v2.md §3) ---
+app.include_router(v2_routes.router)
+
+# --- Admin panel, phase 1: read-only observability (docs/admin-panel-architecture.md) ---
+app.include_router(admin_routes.router)
+
+# --- Admin panel, phase 2: the write foundation -- key lifecycle, roles ---
+app.include_router(admin_write_routes.router)
+
+# --- Admin panel, phase 3: versioned project_config/ editing ---
+app.include_router(admin_config_routes.router)
+
+# --- Admin panel, phase 4: wrong-answer feedback and its triage ---
+app.include_router(admin_feedback_routes.router)
+
+# --- ADR-004 part 1: "Request access" from a denied-column guard
+#     rejection -- security-only triage queue ---
+app.include_router(admin_access_requests_routes.router)
+
+# --- Admin panel, phase 6: the operational tier (maintenance mode,
+#     schema drift, vocabulary freshness, per-analyst usage, cache
+#     controls, failed-auth visibility) ---
+app.include_router(admin_ops_routes.router)
+
+# --- Exception handlers ---
+register_handlers(app)
+
+
+# ---------------------------------------------------------------------------
+# API documentation — gated the same as every other route (Phase 8)
+# ---------------------------------------------------------------------------
+# /docs, /redoc, and /openapi.json describe exactly what an authenticated
+# caller can do to production data; publishing that to an unauthenticated
+# network is itself a disclosure. Registered by hand (docs_url=None etc.
+# above) because FastAPI's auto-registered docs routes have no
+# dependency-injection seam to attach Depends(require_principal) to.
+# APP_DOCS_PUBLIC=true is the explicit opt-out for a deployment that
+# already sits behind its own perimeter auth.
+
+def _require_docs_access(request: Request) -> None:
+    if cfg.settings.app_docs_public:
+        return
+    require_principal(request)
+
+
+@app.get("/openapi.json", include_in_schema=False)
+def openapi_json(_: None = Depends(_require_docs_access)) -> JSONResponse:
+    return JSONResponse(app.openapi())
+
+
+@app.get("/docs", include_in_schema=False)
+def swagger_docs(_: None = Depends(_require_docs_access)):
+    return get_swagger_ui_html(openapi_url="/openapi.json", title=f"{app.title} - Docs")
+
+
+@app.get("/redoc", include_in_schema=False)
+def redoc_docs(_: None = Depends(_require_docs_access)):
+    return get_redoc_html(openapi_url="/openapi.json", title=f"{app.title} - ReDoc")
+
+
+# ---------------------------------------------------------------------------
+# POST /query
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/query",
+    response_model=QueryResponse,
+    summary="Translate a question to SQL and/or execute it",
+    responses={
+        400: {"description": "Bad request (forbidden SQL, injection attempt, invalid input)"},
+        422: {"description": "Out-of-scope question or Pydantic validation error"},
+        429: {"description": "Rate limit exceeded"},
+        500: {"description": "Unexpected server error"},
+        502: {"description": "LLM or database returned an unusable response"},
+        503: {"description": "LLM or database is unavailable, or server is overloaded"},
+        504: {"description": "LLM inference or query execution timed out"},
+    },
+)
+async def query(
+    req: QueryRequest,
+    request: Request,
+    principal: Principal = Depends(require_principal),
+    _maintenance: None = Depends(require_not_in_maintenance),
+) -> QueryResponse:
+    import time
+    start = time.perf_counter()
+
+    if not _system_prompt:
+        # lifespan() is what loads _system_prompt; reaching this point
+        # with it still empty means startup ran without the ASGI
+        # lifespan protocol (or some other bug bypassed it). Silently
+        # continuing would prompt the model with NO system instructions
+        # at all for every request — fail loudly instead of guessing.
+        raise RuntimeError(
+            "System prompt not loaded — lifespan startup did not run "
+            "(is this app being served without the ASGI lifespan protocol?)"
+        )
+
+    # request.state.request_id is stamped by RequestIDMiddleware before
+    # this handler runs (see api/middleware.py). Passing it through to
+    # run_query() means the audit record it writes, this response's
+    # X-Request-ID header, and any server log line for this request all
+    # agree on the same id.
+    request_id = getattr(request.state, "request_id", None)
+
+    # Call via module reference so that patch.object(api.runner, 'run_query')
+    # in tests intercepts this call correctly. _run_query_bounded() runs it
+    # in a worker thread (asyncio.to_thread) under a bounded semaphore, so
+    # this fully-synchronous pipeline never blocks the event loop -- see
+    # that function's docstring.
+    response = await _run_query_bounded(
+        question=req.question,
+        system_prompt=_system_prompt,
+        mode=req.mode,
+        interpret=req.interpret,
+        request_id=request_id,
+        principal=principal,
+    )
+
+    response.elapsed_seconds = round(time.perf_counter() - start, 3)
+    return response
+
+
+# ---------------------------------------------------------------------------
+# POST /query/stream — SSE, docs/api-contract-v2.md §7 event shape
+# ---------------------------------------------------------------------------
+
+async def _query_event_stream(
+    req: QueryRequest, request_id: str | None, principal: Principal,
+):
+    """Yield SSE events for one query, per contract §7's event names.
+
+    Perceived latency matters as much as measured latency for a streaming
+    endpoint: the client sees a ``stage`` event the instant the request is
+    accepted, then ``sql``, ``rows``, ``llm``, and ``done`` as the
+    (still-synchronous, still-corrected-if-needed) pipeline produces them.
+
+    Known limitation
+    ----------------
+    This is **not** per-token streaming. ``runner.run_query`` still runs
+    end-to-end (including SQLAgent's self-correction loop) as one blocking
+    call in a worker thread before the ``sql``/``rows`` events are emitted
+    — true incremental "SQL forming before rows arrive" typing would
+    require SQLAgent itself to stream partial tokens from the endpoint's
+    own streaming response, which is a larger change than Task 4
+    covers this phase (see the Phase 2 report). What this endpoint DOES
+    provide today: an immediate ``stage`` event so the client can render a
+    progress indicator instead of a blank wait, and events broken out by
+    pipeline phase rather than one opaque JSON blob at the end.
+    """
+    import json
+
+    def _event(name: str, data: dict) -> str:
+        return f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    yield _event("stage", {"stage": "plan", "state": "start"})
+
+    try:
+        response = await _run_query_bounded(
+            question=req.question,
+            system_prompt=_system_prompt,
+            mode=req.mode,
+            interpret=req.interpret,
+            request_id=request_id,
+            principal=principal,
+        )
+    except Exception as exc:  # noqa: BLE001 - surfaced to the client as an SSE error event
+        code = getattr(exc, "error_code", "INTERNAL_ERROR")
+        message = getattr(exc, "message", str(exc))
+        yield _event("error", {"code": code, "message": message})
+        return
+
+    yield _event("sql", {"sql": response.sql, "guard": {}})
+    if response.result is not None:
+        columns = list(response.result[0].keys()) if response.result else []
+        yield _event(
+            "rows",
+            {"columns": columns, "rows": response.result, "row_count": response.row_count or 0},
+        )
+    if response.interpretation:
+        yield _event("interpretation_delta", {"text": response.interpretation})
+    if response.llm is not None:
+        yield _event("llm", response.llm)
+    yield _event("done", {"turn": response.model_dump()})
+
+
+@app.post(
+    "/query/stream",
+    summary="Same as POST /query, streamed as Server-Sent Events (contract §7)",
+    tags=["query"],
+)
+async def query_stream(
+    req: QueryRequest,
+    request: Request,
+    principal: Principal = Depends(require_principal),
+    _maintenance: None = Depends(require_not_in_maintenance),
+) -> StreamingResponse:
+    request_id = getattr(request.state, "request_id", None)
+    return StreamingResponse(
+        _query_event_stream(req, request_id, principal),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /
+# ---------------------------------------------------------------------------
+
+@app.get("/", summary="Service index")
+def index() -> dict[str, object]:
+    """What this server is, and where the things a caller wants actually are.
+
+    There was no route here, so the first thing anyone does after
+    starting the server -- open ``http://localhost:8000`` in a browser --
+    returned ``{"detail":"Not Found"}``. With ``APP_DOCS_PUBLIC=false``
+    (the default) ``/docs`` is behind auth too, so a correctly running,
+    correctly configured server looked completely dead to the one check a
+    person actually performs. That cost a real deployment an
+    investigation into a server that was working perfectly.
+
+    The most important line here is ``ui``. This is an API server; the
+    browser interface is a *separate* static server on a *different*
+    port, and the common wrong turn on a first run is expecting it here.
+
+    Deliberately open, and deliberately boring
+    -----------------------------------------
+    No credentials, for the same reason ``/health`` needs none: someone
+    checking whether the process is up should not have to authenticate to
+    find out. So it carries nothing an anonymous caller should not have --
+    no model name (the disclosure ``/health`` already withholds
+    deliberately), no connection string, no configuration, no counts.
+    Only the service's identity and a directory of paths that are already
+    public in ``docs/api-contract-v2.md``.
+    """
+    return {
+        "service": app.title,
+        "version": app.version,
+        "status": "ok",
+        "ui": (
+            "This is the API, not the web interface. The browser UI is a "
+            "separate static server: serve web/ (for example "
+            "`python -m http.server 8080`, run from inside web/) and open "
+            "that port instead. See docs/fa/getting-started.md."
+        ),
+        "endpoints": {
+            "health": "GET /health",
+            "docs": "GET /docs",
+            "query": "POST /query",
+            "sessions": "POST /v2/sessions",
+        },
+        "auth": (
+            "Every route except GET /health and this one requires "
+            "'Authorization: Bearer <key>'."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /health
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/health",
+    response_model=HealthResponse,
+    response_model_exclude_none=True,
+    summary="Liveness check",
+)
+def health(request: Request) -> HealthResponse:
+    """Always open (no credentials required) -- liveness probes need it.
+
+    Phase 8: a probe hitting this endpoint with no credentials at all
+    does not need the model name, and publishing it to an unauthenticated
+    caller is a small but real disclosure -- so ``model`` is only included
+    when the caller presented a valid API key (``request.state.principal``
+    is set by ``AuthMiddleware``, which runs regardless of whether this
+    route itself requires auth). ``response_model_exclude_none=True``
+    means an unauthenticated caller's response omits the ``model`` key
+    entirely rather than sending it as ``null``.
+    """
+    from api.health import check_health
+    response = check_health()
+    if get_principal_if_any(request) is None:
+        response.model = None
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Cache admin endpoints
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/cache/stats",
+    response_model=CacheStatsResponse,
+    summary="Return current cache metrics",
+    tags=["cache"],
+)
+def cache_stats(principal: Principal = Depends(require_principal)) -> CacheStatsResponse:
+    """Return hits, misses, size, evictions, and enabled flag."""
+    s = query_cache.stats()
+    return CacheStatsResponse(**s)
+
+
+@app.post(
+    "/cache/clear",
+    response_model=CacheStatsResponse,
+    summary="Flush the entire query-result cache",
+    tags=["cache"],
+)
+def cache_clear(principal: Principal = Depends(require_principal)) -> CacheStatsResponse:
+    """Evict all cached responses.  Returns a snapshot of stats *before* clearing."""
+    snapshot = query_cache.stats()
+    query_cache.clear()
+    return CacheStatsResponse(**snapshot)
+
+
+@app.post(
+    "/cache/invalidate",
+    response_model=CacheStatsResponse,
+    summary="Evict a single cache entry",
+    tags=["cache"],
+    responses={404: {"description": "Entry not found in cache"}},
+)
+def cache_invalidate(
+    req: CacheInvalidateRequest, principal: Principal = Depends(require_principal),
+) -> CacheStatsResponse:
+    """Remove the cached response for a specific (question, mode) pair.
+
+    Returns 404 if the entry does not exist.
+    """
+    from prompt_engine.static_prefix import prefix_version
+
+    removed = query_cache.invalidate(
+        req.question, req.mode, prefix_version=prefix_version(_system_prompt)
+    )
+    if not removed:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No cache entry for question={req.question!r} mode={req.mode!r}",
+        )
+    return CacheStatsResponse(**query_cache.stats())

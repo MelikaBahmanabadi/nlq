@@ -1,0 +1,368 @@
+# SPDX-License-Identifier: BUSL-1.1
+# Copyright (c) 2024-2026 Ali Sadeghi Aghili
+"""Tests for the v2 conversational endpoints — docs/api-contract-v2.md §3, §7.
+
+Mirrors ``tests/test_api_endpoints.py``'s fixture style: lifespan is
+skipped (the system prompt is pre-set directly), and the LLM/DB layer is
+replaced by an injected ``TurnEngine`` built with a ``MockBackend`` +
+in-memory execute stub — no Ollama or SQL Server required.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pandas as pd
+import pytest
+from fastapi.testclient import TestClient
+
+import api.server as server_module
+import api.v2_routes as v2_routes
+from llm.providers import MockBackend
+from llm.router import LLMRouter
+from security.sql_guard import pretty_sql
+from session.engine import TurnEngine
+
+SIMPLE_SQL = "SELECT TOP 10 c.Name AS CustomerName FROM Customer c"
+SIMPLE_DF = pd.DataFrame({"CustomerName": ["A", "B"]})
+
+
+@pytest.fixture()
+def client_and_engine(auth_settings):
+    server_module._system_prompt = "stub system prompt"
+    v2_routes._system_prompt = "stub system prompt"
+    v2_routes._reset_for_testing()
+
+    engine = TurnEngine(
+        router=LLMRouter(default_chain=[MockBackend(response=SIMPLE_SQL)]),
+        execute_fn=lambda sql: SIMPLE_DF.copy(),
+    )
+    v2_routes._turn_engine = engine  # bypass the lazy singleton for this test
+
+    client = TestClient(
+        server_module.app, raise_server_exceptions=False, headers=auth_settings,
+    )
+    yield client, engine
+    v2_routes._reset_for_testing()
+
+
+class TestCreateSession:
+    def test_create_session_returns_id(self, client_and_engine):
+        client, _ = client_and_engine
+        resp = client.post("/v2/sessions")
+        assert resp.status_code == 201
+        body = resp.json()
+        assert body["session_id"].startswith("s_")
+        assert body["created_at"]
+
+
+class TestGetSession:
+    def test_unknown_session_is_404(self, client_and_engine):
+        client, _ = client_and_engine
+        resp = client.get("/v2/sessions/s_nope")
+        assert resp.status_code == 404
+
+    def test_known_session_lists_turns(self, client_and_engine):
+        client, _ = client_and_engine
+        sid = client.post("/v2/sessions").json()["session_id"]
+        client.post(f"/v2/sessions/{sid}/turns", json={"question": "لیست مشتریان"})
+        resp = client.get(f"/v2/sessions/{sid}")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["session_id"] == sid
+        assert len(body["turns"]) == 1
+
+
+class TestDeleteSession:
+    def test_delete_then_get_is_404(self, client_and_engine):
+        client, _ = client_and_engine
+        sid = client.post("/v2/sessions").json()["session_id"]
+        resp = client.delete(f"/v2/sessions/{sid}")
+        assert resp.status_code == 204
+        assert client.get(f"/v2/sessions/{sid}").status_code == 404
+
+    def test_delete_unknown_session_is_idempotent(self, client_and_engine):
+        client, _ = client_and_engine
+        assert client.delete("/v2/sessions/s_nope").status_code == 204
+
+
+class TestAskTurn:
+    def test_unknown_session_is_404(self, client_and_engine):
+        client, _ = client_and_engine
+        resp = client.post("/v2/sessions/s_nope/turns", json={"question": "q"})
+        assert resp.status_code == 404
+
+    def test_blank_question_is_422(self, client_and_engine):
+        client, _ = client_and_engine
+        sid = client.post("/v2/sessions").json()["session_id"]
+        resp = client.post(f"/v2/sessions/{sid}/turns", json={"question": "   "})
+        assert resp.status_code == 422
+
+    def test_happy_path_returns_full_turn_shape(self, client_and_engine):
+        client, _ = client_and_engine
+        sid = client.post("/v2/sessions").json()["session_id"]
+        resp = client.post(f"/v2/sessions/{sid}/turns", json={"question": "لیست مشتریان"})
+        assert resp.status_code == 200
+        turn = resp.json()
+        assert turn["session_id"] == sid
+        assert turn["index"] == 1
+        assert turn["question"] == "لیست مشتریان"
+        assert turn["basis"]["kind"] == "fresh"
+        assert turn["sql"].startswith("SELECT")
+        assert turn["result"]["row_count"] == 2
+        assert turn["error"] is None
+        assert turn["llm"] is not None
+        assert set(turn["timings"].keys()) == {
+            "total_ms", "plan_ms", "prompt_ms", "llm_ms", "guard_ms", "execute_ms", "interpret_ms",
+        }
+
+    def test_truncated_response_reports_length_not_stop(self, client_and_engine):
+        """The session path's own copy of the "every call site hardcoded
+        finish_reason='stop'" gap: a response the backend flagged as cut
+        off by the token limit must read "length" in the turn's llm block,
+        not "stop" -- exactly what a truncated response silently reading
+        as a clean success would hide from a week of production logs."""
+        client, _ = client_and_engine
+
+        class _TruncatedBackend:
+            name = "truncated"
+
+            def generate_with_meta_segments(self, segments):
+                return SIMPLE_SQL, {
+                    "finish_reason": "length", "endpoint_status": 200, "attempts": 1,
+                }
+
+        v2_routes._turn_engine = TurnEngine(
+            router=LLMRouter(default_chain=[_TruncatedBackend()]),
+            execute_fn=lambda sql: SIMPLE_DF.copy(),
+        )
+        sid = client.post("/v2/sessions").json()["session_id"]
+        resp = client.post(f"/v2/sessions/{sid}/turns", json={"question": "لیست مشتریان"})
+        assert resp.status_code == 200
+        turn = resp.json()
+        assert turn["llm"]["finish_reason"] == "length"
+
+    def test_a_turn_never_surfaces_as_an_http_error_status(self, client_and_engine):
+        """§5: a turn-level failure is data in the response body (200 + Turn.error),
+        never an HTTP error status -- that would defeat "answer, then declare"."""
+        client, engine = client_and_engine
+
+        class _BrokenBackend:
+            name = "broken"
+
+            def generate_with_meta_segments(self, segments):
+                raise RuntimeError("connection refused")
+
+        v2_routes._turn_engine = TurnEngine(
+            router=LLMRouter(default_chain=[_BrokenBackend()]),
+            execute_fn=lambda sql: SIMPLE_DF.copy(),
+        )
+        sid = client.post("/v2/sessions").json()["session_id"]
+        resp = client.post(f"/v2/sessions/{sid}/turns", json={"question": "چیزی"})
+        assert resp.status_code == 200
+        assert resp.json()["error"]["code"] == "MODEL_UNAVAILABLE"
+
+
+class TestAskTurnStreaming:
+    """Contract §7's event stream.
+
+    This class used to assert the full sequence as
+    ``["stage", "resolved", ...]`` — exactly one ``stage`` frame, because
+    exactly one was ever sent: a single ``{"stage": "plan"}`` emitted
+    before the engine was even called. The web UI draws five pipeline
+    steps keyed ``understand``/``generate``/``validate``/``execute``/
+    ``interpret``, so that frame matched no step, was silently dropped by
+    ``renderPipeline``'s ``setStage``, and all five sat at "waiting" for
+    the whole turn while the answer appeared beside them.
+
+    Stage frames are now live and there are many, so the assertions split
+    in two: the content events keep their exact contract order, and the
+    stage events are checked for the properties that actually matter —
+    they name steps the UI has, they arrive before the content, and a
+    stage never reports "done" without having reported "running" first.
+    """
+
+    @staticmethod
+    def _events(body: str) -> list[tuple[str, dict]]:
+        out: list[tuple[str, dict]] = []
+        name = None
+        for line in body.splitlines():
+            if line.startswith("event: "):
+                name = line[len("event: "):]
+            elif line.startswith("data: ") and name is not None:
+                out.append((name, json.loads(line[len("data: "):])))
+                name = None
+        return out
+
+    def test_content_events_keep_their_contract_order(self, client_and_engine):
+        client, _ = client_and_engine
+        sid = client.post("/v2/sessions").json()["session_id"]
+        with client.stream(
+            "POST", f"/v2/sessions/{sid}/turns?stream=1", json={"question": "لیست مشتریان"},
+        ) as resp:
+            assert resp.status_code == 200
+            assert resp.headers["content-type"].startswith("text/event-stream")
+            body = "".join(resp.iter_text())
+
+        names = [n for n, _ in self._events(body) if n != "stage"]
+        assert names == ["resolved", "assumptions", "sql", "rows", "llm", "done"]
+        assert '"turn"' in body
+
+    def test_sql_event_carries_the_display_form_the_done_turn_has(self, client_and_engine):
+        """First paint and final paint must be the same text. `sql` stays
+        what ran; `sql_display` is additive, and identical to `done`'s."""
+        client, _ = client_and_engine
+        sid = client.post("/v2/sessions").json()["session_id"]
+        with client.stream(
+            "POST", f"/v2/sessions/{sid}/turns?stream=1", json={"question": "لیست مشتریان"},
+        ) as resp:
+            body = "".join(resp.iter_text())
+
+        events = self._events(body)
+        sql_event = next(d for n, d in events if n == "sql")
+        done_turn = next(d for n, d in events if n == "done")["turn"]
+
+        assert set(sql_event) >= {"sql", "guard"}  # nothing the old payload had is gone
+        assert sql_event["sql"] == done_turn["sql"]
+        assert sql_event["sql_display"] == done_turn["sql_display"]
+        assert sql_event["sql_display"] == pretty_sql(done_turn["sql"], "tsql")
+        assert sql_event["sql_display"].startswith("SELECT TOP (10)\n")
+
+    def test_sql_event_computes_the_display_form_when_the_turn_has_none(self, client_and_engine):
+        client, engine = client_and_engine
+        sid = client.post("/v2/sessions").json()["session_id"]
+        original_ask = engine.ask
+
+        def ask_without_display(*args, **kwargs):
+            turn = original_ask(*args, **kwargs)
+            turn.sql_display = None
+            return turn
+
+        engine.ask = ask_without_display
+        with client.stream(
+            "POST", f"/v2/sessions/{sid}/turns?stream=1", json={"question": "لیست مشتریان"},
+        ) as resp:
+            body = "".join(resp.iter_text())
+
+        sql_event = next(d for n, d in self._events(body) if n == "sql")
+        assert sql_event["sql_display"] == pretty_sql(sql_event["sql"], "tsql")
+
+    def test_stage_events_name_steps_the_ui_actually_draws(self, client_and_engine):
+        """The regression that made this whole class worth splitting: a
+        stage id with no matching element is dropped without a word, so
+        the only symptom is a pipeline that never moves."""
+        client, _ = client_and_engine
+        sid = client.post("/v2/sessions").json()["session_id"]
+        with client.stream(
+            "POST", f"/v2/sessions/{sid}/turns?stream=1", json={"question": "لیست مشتریان"},
+        ) as resp:
+            body = "".join(resp.iter_text())
+
+        stages = [d for n, d in self._events(body) if n == "stage"]
+        assert stages, "no stage events at all -- the pipeline cannot move"
+
+        ui_steps = {"understand", "generate", "validate", "execute", "interpret"}
+        unknown = {d["stage"] for d in stages} - ui_steps
+        assert not unknown, (
+            f"stage ids {sorted(unknown)} match no step in web/js/render/pipeline.js; "
+            "setStage drops them silently and the step stays at 'waiting'"
+        )
+        assert {d["state"] for d in stages} <= {"running", "done", "error"}
+
+    def test_a_stage_never_finishes_without_having_started(self, client_and_engine):
+        client, _ = client_and_engine
+        sid = client.post("/v2/sessions").json()["session_id"]
+        with client.stream(
+            "POST", f"/v2/sessions/{sid}/turns?stream=1", json={"question": "لیست مشتریان"},
+        ) as resp:
+            body = "".join(resp.iter_text())
+
+        started: set[str] = set()
+        for name, data in self._events(body):
+            if name != "stage":
+                continue
+            if data["state"] == "running":
+                started.add(data["stage"])
+            else:
+                assert data["stage"] in started, (
+                    f"stage {data['stage']!r} reported {data['state']!r} "
+                    "without ever reporting 'running'"
+                )
+
+    def test_stage_events_arrive_before_the_content_they_describe(self, client_and_engine):
+        """Progress reported after the answer is not progress. If the
+        engine's stages were collected and flushed at the end, every stage
+        frame would land after `sql` and `rows` and the pipeline would
+        still only fill in once the turn was already visible."""
+        client, _ = client_and_engine
+        sid = client.post("/v2/sessions").json()["session_id"]
+        with client.stream(
+            "POST", f"/v2/sessions/{sid}/turns?stream=1", json={"question": "لیست مشتریان"},
+        ) as resp:
+            body = "".join(resp.iter_text())
+
+        names = [n for n, _ in self._events(body)]
+        assert names.index("stage") < names.index("sql")
+        assert names[-1] == "done"
+
+
+class TestPatchAssumptions:
+    def test_unknown_turn_is_404(self, client_and_engine):
+        client, _ = client_and_engine
+        sid = client.post("/v2/sessions").json()["session_id"]
+        client.post(f"/v2/sessions/{sid}/turns", json={"question": "لیست مشتریان"})
+        resp = client.patch(
+            f"/v2/sessions/{sid}/turns/t_nope/assumptions",
+            json={"assumptions": [{"field": "ring", "value": "x"}]},
+        )
+        assert resp.status_code == 404
+
+    def test_patch_returns_new_turn_without_mutating_original(self, client_and_engine):
+        client, _ = client_and_engine
+        sid = client.post("/v2/sessions").json()["session_id"]
+        original = client.post(
+            f"/v2/sessions/{sid}/turns", json={"question": "۱۰ مشتری برتر را نشان بده"},
+        ).json()
+        assert original["ambiguity"]["is_ambiguous"] is True
+
+        resp = client.patch(
+            f"/v2/sessions/{sid}/turns/{original['turn_id']}/assumptions",
+            json={"assumptions": [{"field": "ring", "value": "تالار فلزات"}]},
+        )
+        assert resp.status_code == 200
+        patched = resp.json()
+        assert patched["turn_id"] != original["turn_id"]
+
+        transcript = client.get(f"/v2/sessions/{sid}").json()["turns"]
+        assert len(transcript) == 2
+        assert transcript[0] == original  # original entry in the transcript is untouched
+        ring_assumption = next(a for a in patched["ambiguity"]["assumptions"] if a["field"] == "ring")
+        assert ring_assumption["value"] == "تالار فلزات"
+
+
+class TestCORS:
+    def test_preflight_is_allowed_for_a_configured_origin(self):
+        from config import override_settings
+
+        with override_settings(cors_allowed_origins=("http://localhost:8080",)):
+            import importlib
+            importlib.reload(server_module)
+            server_module._system_prompt = "stub"
+            client = TestClient(server_module.app, raise_server_exceptions=False)
+            resp = client.options(
+                "/v2/sessions",
+                headers={
+                    "Origin": "http://localhost:8080",
+                    "Access-Control-Request-Method": "POST",
+                },
+            )
+        assert resp.headers.get("access-control-allow-origin") == "http://localhost:8080"
+        importlib.reload(server_module)  # restore the module-level app for later tests
+
+    def test_default_config_blocks_unlisted_origins(self, client_and_engine):
+        client, _ = client_and_engine
+        resp = client.options(
+            "/v2/sessions",
+            headers={"Origin": "http://evil.example", "Access-Control-Request-Method": "POST"},
+        )
+        assert "access-control-allow-origin" not in {k.lower() for k in resp.headers.keys()}

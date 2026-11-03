@@ -1,0 +1,465 @@
+# SPDX-License-Identifier: BUSL-1.1
+# Copyright (c) 2024-2026 Ali Sadeghi Aghili
+"""``/admin/maintenance``, ``/admin/schema-drift``, ``/admin/vocabulary``,
+``/admin/usage``, ``/admin/quality``, ``/admin/cache/*``, ``/admin/llm/warmup``,
+``/admin/security/*`` — the operational tier, admin panel phase 6.
+
+``docs/admin-panel-architecture.md`` §3 tier 3 is the design contract; the
+frozen phase 6 spec is what this module implements: the operator-facing
+pieces earlier phases referred to but never built. Every route here
+belongs to the ``operations`` capability per the architecture's §2 table
+("Maintenance mode, cache controls, ``verify_deployment``" — operations
+only) — reads that either admin role legitimately wants for mutual
+visibility (§2.4) are gated on :func:`api.auth.require_operations_or_security`
+instead, never on :func:`api.auth.require_admin` (phase 1's now-superseded
+single capability).
+
+What this module deliberately does NOT do
+------------------------------------------
+* **Apply a schema change.** ``GET /admin/schema-drift`` only ever reads —
+  see :func:`schema_data.drift.check_schema_drift`'s own docstring for why
+  there is no corresponding write route, in this module or anywhere else.
+* **Invent a second source for anything the audit log already answers.**
+  ``GET /admin/usage`` is a thin HTTP surface over
+  :func:`scripts.analyze_audit_log.per_principal_usage`; no aggregation
+  happens in this module.
+* **Touch the feedback loop, config versioning, or the migration tool** —
+  phases 3-5 own those (:mod:`api.admin_feedback_routes`,
+  :mod:`api.admin_config_routes`, :mod:`appdb.migrate`).
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
+
+import api.maintenance as maintenance
+import config as cfg
+from api.admin_result_cache import admin_expensive_cache
+from api.auth import require_operations, require_operations_or_security
+from api.models import CacheInvalidateRequest
+from appdb.admin_audit import record_admin_action
+from retrieval.dimension_vocabulary import (
+    PREFETCH_COLUMNS,
+    get_vocabulary_status,
+    manual_refresh,
+)
+from schema_data.drift import check_schema_drift
+from security.auth import OPERATIONS_CAPABILITY, Principal
+
+router = APIRouter(prefix="/admin", tags=["admin-ops"])
+
+#: The loaded system prompt, handed across by ``api/server.py``'s
+#: ``lifespan`` exactly the way it hands ``api.v2_routes`` its own copy --
+#: this module cannot import ``api.server`` at load time (``api/server.py``
+#: imports THIS module to mount its router, which would make that a
+#: cycle), so the value is assigned onto this module-level name from
+#: outside instead. Needed only for ``prompt_engine.static_prefix.prefix_version``,
+#: which every cache key (and therefore ``POST /admin/cache/invalidate``)
+#: is namespaced by.
+_system_prompt: str = ""
+
+
+# ---------------------------------------------------------------------------
+# 1. Maintenance mode (spec §1)
+# ---------------------------------------------------------------------------
+
+class MaintenanceToggleRequest(BaseModel):
+    """``POST /admin/maintenance`` body."""
+
+    model_config = {"extra": "forbid"}
+
+    active: bool
+    note: str | None = Field(default=None, max_length=2000)
+
+
+@router.get("/maintenance", summary="Current maintenance-mode state")
+def admin_maintenance_state(
+    principal: Principal = Depends(require_operations_or_security),
+) -> dict[str, Any]:
+    """Always reachable regardless of ``active`` — the panel itself must
+    never become part of what maintenance mode refuses (spec §1)."""
+    return maintenance.get_state()
+
+
+@router.post("/maintenance", summary="Switch maintenance mode on or off (operations)")
+def admin_maintenance_toggle(
+    req: MaintenanceToggleRequest, principal: Principal = Depends(require_operations),
+) -> dict[str, Any]:
+    """Both transitions are recorded in the admin-action trail (spec §1).
+    Turning maintenance ON does not gate this route itself — the toggle
+    is never a one-way door, see :mod:`api.maintenance`'s module
+    docstring."""
+    if req.active:
+        state = maintenance.enable(note=req.note, actor_principal_id=principal.id)
+        record_admin_action(
+            principal.id, OPERATIONS_CAPABILITY, "maintenance.enable", "system",
+            detail={"note": req.note},
+        )
+        return {
+            **state,
+            "drain_deadline_seconds": cfg.settings.maintenance_drain_deadline_seconds,
+            "drain_note": (
+                "In-flight requests are never force-cancelled -- they drain to "
+                "completion. If one is still running after the drain deadline, "
+                "treat it as a hang worth investigating, not as evidence the "
+                "switch failed."
+            ),
+        }
+    state = maintenance.disable(actor_principal_id=principal.id)
+    record_admin_action(principal.id, OPERATIONS_CAPABILITY, "maintenance.disable", "system")
+    return state
+
+
+# ---------------------------------------------------------------------------
+# 2. Schema drift (spec §2) -- read-only, proposes nothing, applies nothing
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/schema-drift",
+    summary="Read-only comparison of schema.yaml against the live warehouse (cached)",
+)
+def admin_schema_drift(
+    refresh: bool = Query(
+        False,
+        description=(
+            "Bypass this route's own cached result and reflect the "
+            "warehouse catalogue now, regardless of "
+            "ADMIN_EXPENSIVE_CACHE_TTL_SECONDS."
+        ),
+    ),
+    principal: Principal = Depends(require_operations_or_security),
+) -> dict[str, Any]:
+    """Never writes ``schema.yaml`` and never applies anything -- see
+    :func:`schema_data.drift.check_schema_drift`'s own docstring. A
+    warehouse this deployment's read-only login cannot currently reach is
+    reported as a clear 503, not a stack trace.
+
+    Required item 1, 2026 warehouse-load audit
+    ---------------------------------------------
+    ``check_schema_drift`` reflects EVERY table of EVERY schema
+    (``get_table_names``/``get_columns``) -- expensive enough that the
+    panel's own 30-second auto-refresh re-running it all day was a
+    material share of the reported warehouse load. The result is now
+    cached for :attr:`config.Settings.admin_expensive_cache_ttl_seconds`
+    (``refresh=1`` forces a fresh reflection); a failed reflection (this
+    503 path) is never itself cached, so a warehouse that comes back
+    reachable is reflected again on the very next call, cached or not --
+    see :mod:`api.admin_result_cache`'s "a failed computation is never
+    cached" note.
+    """
+    def _run() -> dict[str, Any]:
+        return check_schema_drift().as_dict()
+
+    try:
+        cached = admin_expensive_cache.get_or_compute(
+            "schema_drift", cfg.settings.admin_expensive_cache_ttl_seconds, _run, force=refresh,
+        )
+    except Exception as exc:  # noqa: BLE001 - the warehouse being unreachable is an operational fact, not a bug
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not read the live warehouse for a schema drift check: {exc}",
+        )
+    result = dict(cached.value)
+    result["cache"] = {
+        "cached": cached.cached,
+        "age_seconds": round(cached.age_seconds, 1),
+        "ttl_seconds": cached.ttl_seconds,
+    }
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 3. Vocabulary freshness and manual refresh (spec §3)
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/vocabulary",
+    summary="Per prefetched dimension column: freshness and failure state",
+)
+def admin_vocabulary_status(
+    principal: Principal = Depends(require_operations_or_security),
+) -> dict[str, Any]:
+    """Read straight off ``retrieval.dimension_vocabulary``'s own
+    bookkeeping -- see :func:`retrieval.dimension_vocabulary.get_vocabulary_status`."""
+    return {"columns": get_vocabulary_status()}
+
+
+@router.post(
+    "/vocabulary/{table}/{column}/refresh",
+    summary="Manually refresh one prefetched dimension column (operations)",
+)
+def admin_vocabulary_refresh(
+    table: str, column: str, principal: Principal = Depends(require_operations),
+) -> dict[str, Any]:
+    """An operations action that touches no data access -- it re-reads
+    what the engine already reads (spec §3). Reports a failing refresh as
+    a failure (``ok: false``), never as a silent success."""
+    if column not in PREFETCH_COLUMNS.get(table, ()):
+        raise HTTPException(
+            status_code=404,
+            detail=f"{table!r}.{column!r} is not a prefetched dimension column",
+        )
+    result = manual_refresh(table, column)
+    record_admin_action(
+        principal.id, OPERATIONS_CAPABILITY, "vocabulary.refresh", f"{table}.{column}",
+        detail={"ok": result["ok"]},
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 4. Per-analyst usage and rate-limit pressure (spec §4)
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/usage",
+    summary="Per-principal queries/failures/latency/rate-limit hits over a window",
+)
+def admin_usage(
+    since: str | None = Query(
+        None, description="ISO-8601 timestamp (inclusive lower bound). Omit for unbounded.",
+    ),
+    until: str | None = Query(
+        None, description="ISO-8601 timestamp (inclusive upper bound). Omit for unbounded.",
+    ),
+    principal: Principal = Depends(require_operations_or_security),
+) -> dict[str, Any]:
+    """A thin surface over :func:`scripts.analyze_audit_log.per_principal_usage`
+    -- the SAME audit log ``GET /admin/summary`` already reads, so these
+    per-principal figures can never diverge from that aggregate report for
+    the same window (spec §4: "not from a new counter")."""
+    from scripts.analyze_audit_log import (
+        iter_records,
+        per_principal_usage,
+        resolve_log_paths,
+        resolve_rate_limit_hit_paths,
+    )
+
+    audit_paths = resolve_log_paths([f"{cfg.settings.log_dir}/audit_log.jsonl*"])
+    audit_records = list(iter_records(audit_paths))
+    hit_paths = resolve_rate_limit_hit_paths()
+    hit_records = list(iter_records(hit_paths))
+
+    return per_principal_usage(audit_records, hit_records, since=since, until=until)
+
+
+# ---------------------------------------------------------------------------
+# 4b. Real-use quality (analyst confirmations + audit log)
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/quality",
+    summary="Real-use quality and latency over a window, overall and per data source (cached)",
+)
+def admin_quality(
+    days: int = Query(
+        7, ge=1, le=3650,
+        description=(
+            "Width in days of the windowed half of the report. The all-time "
+            "half is always included."
+        ),
+    ),
+    refresh: bool = Query(
+        False,
+        description=(
+            "Bypass this route's own cached result and recompute now, "
+            "regardless of ADMIN_EXPENSIVE_CACHE_TTL_SECONDS."
+        ),
+    ),
+    principal: Principal = Depends(require_operations_or_security),
+) -> dict[str, Any]:
+    """A thin surface over :func:`observability.quality.build_quality_report` --
+    the SAME function ``scripts/analyze_audit_log.py`` prints as a section, so
+    the card and the command line can never disagree about a figure.
+
+    Read-only: it reads the audit log files and the confirmation and flag
+    tables (identifiers only) and writes nothing. It returns counts, rates
+    and percentiles -- no question text, SQL or result rows. The confirmed
+    share is a lower-bound signal, not accuracy (the report's ``caveats``
+    say so, and so does the card).
+
+    The audit log is read in full on every computation, so the result is
+    cached for :attr:`config.Settings.admin_expensive_cache_ttl_seconds`
+    per ``days`` value (``refresh=1`` recomputes): the panel's 30-second
+    auto-refresh then costs one read of the log per TTL, not one per tick.
+    If the application database cannot be read, the report is still
+    returned with its ratings marked unavailable.
+    """
+    from observability.quality import build_quality_report, load_ratings
+    from scripts.analyze_audit_log import iter_records, resolve_log_paths
+
+    def _run() -> dict[str, Any]:
+        paths = resolve_log_paths([f"{cfg.settings.log_dir}/audit_log.jsonl*"])
+        records = list(iter_records(paths))
+        ratings = load_ratings()
+        return build_quality_report(
+            records, confirmations=ratings.confirmations, flags=ratings.flags, days=days,
+        )
+
+    cached = admin_expensive_cache.get_or_compute(
+        f"quality:{days}", cfg.settings.admin_expensive_cache_ttl_seconds, _run, force=refresh,
+    )
+    result = dict(cached.value)
+    result["cache"] = {
+        "cached": cached.cached,
+        "age_seconds": round(cached.age_seconds, 1),
+        "ttl_seconds": cached.ttl_seconds,
+    }
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 5. Cache controls (spec §5)
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/cache/clear",
+    summary="Flush the entire query-result cache (operations, recorded)",
+)
+def admin_cache_clear(principal: Principal = Depends(require_operations)) -> dict[str, Any]:
+    """Safe (the cache is derived state) but not free: the next requests
+    after this call pay full cost. ``GET /admin/cache`` (phase 1) is what
+    the panel shows *before* this button is offered, so an operator sees
+    exactly what will be discarded (size, hit rate) before clicking
+    clear -- this route's own response still echoes that same pre-clear
+    snapshot, but the panel must not wait until after the click to show
+    it (spec §5)."""
+    from api.query_cache import query_cache
+
+    snapshot = query_cache.stats()
+    query_cache.clear()
+    record_admin_action(
+        principal.id, OPERATIONS_CAPABILITY, "cache.clear", "query_cache",
+        detail={"stats_before_clear": snapshot},
+    )
+    return {"cleared": True, "stats_before_clear": snapshot}
+
+
+@router.post(
+    "/cache/invalidate",
+    summary="Evict a single cache entry (operations, recorded)",
+)
+def admin_cache_invalidate(
+    req: CacheInvalidateRequest, principal: Principal = Depends(require_operations),
+) -> dict[str, Any]:
+    from prompt_engine.static_prefix import prefix_version
+    from api.query_cache import query_cache
+
+    removed = query_cache.invalidate(
+        req.question, req.mode, prefix_version=prefix_version(_system_prompt)
+    )
+    record_admin_action(
+        principal.id, OPERATIONS_CAPABILITY, "cache.invalidate", req.question,
+        detail={"mode": req.mode, "removed": removed},
+    )
+    if not removed:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No cache entry for question={req.question!r} mode={req.mode!r}",
+        )
+    return {"removed": True, "stats": query_cache.stats()}
+
+
+# ---------------------------------------------------------------------------
+# 5b. LLM prefix-cache warm-up (latency)
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/llm/warmup",
+    summary="The periodic prefix-cache keep-warm: settings, last run and outcome",
+)
+def admin_llm_warmup_status(
+    principal: Principal = Depends(require_operations_or_security),
+) -> dict[str, Any]:
+    """What ``LLM_PREFIX_KEEPWARM_SECONDS`` is doing, read-only.
+
+    ``keepwarm`` says whether the periodic keep-warm (:class:`llm.warmup.KeepWarm`)
+    is running, its interval, whether it is paused (maintenance mode), how
+    many passes it has made, when the last one ran (``last_run_at``, UTC)
+    and how it ended (``last_run_outcome``: ``warmed``, ``skipped``,
+    ``failed``, ``paused`` or ``busy``), with one entry per data source in
+    ``last_run`` -- the same entries ``POST /admin/llm/warmup`` returns. A
+    source skipped because a real request used its prefix within the interval
+    says so in its ``detail``. With the keep-warm off, ``enabled`` is
+    ``false`` and ``reason`` says why. No prompt text, no endpoint, no key.
+    """
+    from llm.warmup import keepwarm_status
+
+    return {"keepwarm": keepwarm_status()}
+
+
+@router.post(
+    "/llm/warmup",
+    summary="Warm the model server's prompt-prefix cache now (operations, recorded)",
+)
+def admin_llm_warmup(principal: Principal = Depends(require_operations)) -> dict[str, Any]:
+    """Run the startup prefix-cache warm-up (:mod:`llm.warmup`) on demand.
+
+    The use for it is the moment after the model server restarted, or after
+    a configuration change rewrote the prompt prefix: the next question
+    would otherwise pay the full prefill (about a minute on a large local
+    model). It sends one one-token request per data source that uses the
+    static prefix, so it costs one prefill and no generation, and it touches
+    no data and no analyst's quota -- hence ``operations``, the capability
+    of the other "re-read what the engine already reads" actions here
+    (vocabulary refresh, cache clear). It runs whatever
+    ``LLM_PREFIX_WARMUP_ON_STARTUP`` says; that flag only governs startup.
+
+    Synchronous: it returns when the warm-up has finished, with one entry
+    per data source (``status``, ``duration_ms``, ``prompt_tokens``, never
+    prompt text), bounded by ``LLM_PREFIX_WARMUP_TIMEOUT_SECONDS``. A
+    source that failed or was skipped is reported in the body, not as an
+    HTTP error: the request itself did what it was asked. ``keepwarm`` is
+    the periodic keep-warm's status, as ``GET /admin/llm/warmup`` shows it.
+
+    Raises
+    ------
+    HTTPException
+        ``503`` if the system prompt has not been loaded (the server did
+        not start through its lifespan); ``409`` if a warm-up is already
+        running, in which case nothing was sent.
+    """
+    import api.runner as runner
+    from llm.warmup import warm_prefix_cache
+
+    if not _system_prompt:
+        raise HTTPException(status_code=503, detail="System prompt not loaded.")
+    results = warm_prefix_cache(_system_prompt, runner.get_llm_router)
+    if results is None:
+        raise HTTPException(
+            status_code=409, detail="A prefix-cache warm-up is already running.",
+        )
+    record_admin_action(
+        principal.id, OPERATIONS_CAPABILITY, "llm.warmup", "prefix_cache",
+        detail={r.source or "(whole schema)": r.status for r in results},
+    )
+    from llm.warmup import keepwarm_status
+
+    return {"results": [r.as_dict() for r in results], "keepwarm": keepwarm_status()}
+
+
+# ---------------------------------------------------------------------------
+# 6. Failed-authentication visibility (§9's resolved "is IP alone enough?")
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/security/auth-failures",
+    summary="Count and source-address breakdown of failed authentication attempts",
+)
+def admin_auth_failures(
+    window_seconds: float | None = Query(
+        None, description="Only count failures in the last N seconds. Omit for all time.",
+    ),
+    principal: Principal = Depends(require_operations_or_security),
+) -> dict[str, Any]:
+    """The real control for a leaked (vs. guessed) admin key: visibility
+    into a sudden run of failures, not a tighter rate limit -- see
+    ``docs/admin-panel-architecture.md`` §9 and
+    :mod:`security.auth_failures`'s own module docstring."""
+    from security.auth_failures import iter_auth_failures, summarize_auth_failures
+
+    records = iter_auth_failures()
+    return summarize_auth_failures(records, window_seconds=window_seconds)

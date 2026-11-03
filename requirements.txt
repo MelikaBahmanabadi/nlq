@@ -1,0 +1,27 @@
+# Auction NLQ Engine — dependencies
+# Install for a deployment: pip install -r requirements.lock (exact pins);
+# this file states the floors those pins must satisfy.
+#
+# These are floors, not pins -- two installs a month apart can resolve
+# different trees. For anything beyond quick local hacking (a real
+# deployment, CI, or reproducing a reported bug), install from
+# requirements.lock instead: pip install -r requirements.lock. See that
+# file's own header and docs/deployment-runbook.md.
+
+sqlalchemy>=2.0.0
+alembic>=1.13.0
+sqlglot>=23.0.0
+pyodbc>=5.0.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+requests>=2.31.0
+python-dotenv>=1.2.3
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+httpx>=0.27.0
+pydantic>=2.0
+pyyaml>=6.0
+
+# Setup wizard
+rich>=13.0.0
+questionary>=2.0.0

@@ -1,0 +1,1027 @@
+# SPDX-License-Identifier: BUSL-1.1
+# Copyright (c) 2024-2026 Ali Sadeghi Aghili
+"""v2 conversational session endpoints — ``docs/api-contract-v2.md`` §3, §7.
+
+Mounted onto ``api/server.py``'s ``app`` via ``app.include_router(router)``.
+``POST /query`` (v1) is untouched and keeps working exactly as before — this
+module is purely additive, per the contract's own preamble.
+
+Unlike v1, a turn-processing failure (LLM down, guard rejection, DB error)
+is **not** surfaced as an HTTP error status here: per §5 ("answer, then
+declare — never block"), ``session.engine.TurnEngine.ask`` already turns
+every such failure into a ``Turn`` with ``error`` populated, and this
+module returns that ``Turn`` with a normal ``200`` — the failure is data in
+the response body, not a transport-level error. The exceptions are request
+shape problems (empty question — 422, handled by Pydantic) and session/turn
+lookup failures (404), which genuinely are HTTP-level concerns.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import queue
+import threading
+from datetime import datetime, timezone
+from typing import Any, Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+import config as cfg
+from api.auth import require_principal
+from api.concurrency import run_bounded
+from api.maintenance import require_not_in_maintenance
+from appdb.access_requests import (
+    NotDeniedColumnError,
+    TurnNotAuditedError as AccessRequestTurnNotAuditedError,
+    list_requests as list_access_requests,
+    submit_request,
+)
+from appdb.confirmations import (
+    TurnNotConfirmableError,
+    confirm_turn,
+    list_confirmations,
+    withdraw_confirmation,
+)
+from appdb.feedback import TurnNotAuditedError, list_feedback, submit_flag, withdraw_open_flags
+from knowledge.memory_policy import get_memory_keys
+from security.auth import Principal
+from security.sql_guard import pretty_sql
+from session.engine import TurnEngine
+from session.memory import (
+    MemoryEntry,
+    MemoryValidationError,
+    has_disallowed_chars,
+    validate_memory_value,
+)
+from session.models import (
+    AskTurnRequest,
+    CreateSessionResponse,
+    MemoryEntryResponse,
+    MemoryIndexResponse,
+    PatchAssumptionsRequest,
+    RememberableKeyResponse,
+    RenameSessionRequest,
+    RenameSessionResponse,
+    SessionIndexEntry,
+    SessionIndexResponse,
+    SessionTranscriptResponse,
+    SetMemoryRequest,
+    Turn,
+)
+from session.persistence import SessionPersistence
+from session.store import SessionNotFoundError, SessionRecord, SessionStore
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/v2", tags=["v2"])
+
+#: Set by ``api/server.py``'s lifespan handler, mirroring that module's own
+#: ``_system_prompt`` — kept as a separate module attribute (rather than
+#: importing ``api.server`` here) so this module has no import-time
+#: dependency on ``api.server`` (which imports this module to mount it).
+_system_prompt: str = ""
+
+# ---------------------------------------------------------------------------
+# Lazily-constructed singletons — mirrors api.runner's agent singleton and
+# api.query_cache's module-level query_cache instance.
+# ---------------------------------------------------------------------------
+
+_store_lock = threading.Lock()
+_session_store: SessionStore | None = None
+
+_engine_lock = threading.Lock()
+_turn_engine: TurnEngine | None = None
+
+#: Cross-session memory's own backend, used ONLY when session persistence
+#: itself is disabled (``session_store_path=""``) -- see
+#: ``_get_memory_persistence`` for why memory still needs somewhere to
+#: live even then.
+_memory_persistence_lock = threading.Lock()
+_memory_only_persistence: SessionPersistence | None = None
+
+
+def get_session_store() -> SessionStore:
+    global _session_store
+    if _session_store is None:
+        with _store_lock:
+            if _session_store is None:
+                persistence = None
+                if cfg.settings.session_store_path:
+                    persistence = SessionPersistence(cfg.settings.session_store_path)
+                _session_store = SessionStore(
+                    ttl_seconds=cfg.settings.session_ttl_seconds,
+                    max_size=cfg.settings.session_max_count,
+                    max_turns=cfg.settings.session_max_turns,
+                    persistence=persistence,
+                    retention_days=cfg.settings.session_retention_days,
+                )
+    return _session_store
+
+
+def get_turn_engine() -> TurnEngine:
+    global _turn_engine
+    if _turn_engine is None:
+        with _engine_lock:
+            if _turn_engine is None:
+                _turn_engine = TurnEngine()
+    return _turn_engine
+
+
+def _get_memory_persistence() -> SessionPersistence:
+    """The backend ``GET``/``PUT``/``DELETE /v2/memory*`` read and write.
+
+    Reuses the session store's own attached backend when session
+    persistence is enabled (the common case — memory entries then live in
+    the very same SQLite file as everything else, and survive a restart).
+
+    When an operator has disabled session persistence entirely
+    (``session_store_path=""``), memory entries still need *somewhere*
+    durable enough to survive across requests within this one running
+    process — a private, process-lifetime, in-memory SQLite database (the
+    same :class:`~session.persistence.SessionPersistence`, pointed at
+    ``":memory:"``) rather than inventing a second storage mechanism.
+    Nothing in that configuration claims memory survives a restart —
+    ``session_store_path=""`` disables persistence for the whole feature
+    set, memory included; this only keeps memory *usable* within one
+    process's lifetime instead of failing outright.
+    """
+    store_persistence = get_session_store().persistence
+    if store_persistence is not None:
+        return store_persistence
+    global _memory_only_persistence
+    if _memory_only_persistence is None:
+        with _memory_persistence_lock:
+            if _memory_only_persistence is None:
+                _memory_only_persistence = SessionPersistence(":memory:")
+    return _memory_only_persistence
+
+
+def _load_memory_entries_for(principal: Principal) -> dict[str, MemoryEntry]:
+    """The caller's stored memory (§5), or ``{}`` when the master switch
+    (``cfg.settings.memory_enabled``) is off."""
+    if not cfg.settings.memory_enabled:
+        return {}
+    raw = _get_memory_persistence().get_memory_entries(principal.id)
+    return {
+        key: MemoryEntry(key=key, field=row["field"], value=row["value"], updated_at=row["updated_at"])
+        for key, row in raw.items()
+    }
+
+
+def _reset_for_testing() -> None:
+    """Clear both singletons. **Test-only helper.**"""
+    global _session_store, _turn_engine, _memory_only_persistence
+    with _store_lock:
+        if _session_store is not None and _session_store.persistence is not None:
+            _session_store.persistence.close()
+        _session_store = None
+    with _engine_lock:
+        _turn_engine = None
+    with _memory_persistence_lock:
+        if _memory_only_persistence is not None:
+            _memory_only_persistence.close()
+        _memory_only_persistence = None
+
+
+def _require_owned_session(record: SessionRecord, principal: Principal) -> None:
+    """Raise 404 (never 403) if *record* is owned by someone else (Phase 8).
+
+    ``record.owner_id is None`` covers a session created with no
+    principal at all (``AUTH_REQUIRED=false``) — treated as unrestricted
+    rather than "owned by nobody", so it stays reachable. A 403 would
+    itself confirm the session's existence to a caller who has no
+    business knowing that; 404 is indistinguishable from "never
+    existed"/"expired", exactly what a cross-principal probe should see.
+    """
+    if record.owner_id is not None and record.owner_id != principal.id:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown or expired session: {record.session_id!r}",
+        )
+
+
+def _require_system_prompt() -> str:
+    if not _system_prompt:
+        raise RuntimeError(
+            "System prompt not loaded -- lifespan startup did not run "
+            "(is this app being served without the ASGI lifespan protocol?)"
+        )
+    return _system_prompt
+
+
+# ---------------------------------------------------------------------------
+# POST /v2/sessions
+# ---------------------------------------------------------------------------
+
+
+@router.post("/sessions", response_model=CreateSessionResponse, status_code=201)
+def create_session(principal: Principal = Depends(require_principal)) -> CreateSessionResponse:
+    record = get_session_store().create(owner_id=principal.id)
+    expires_at = None
+    if cfg.settings.session_ttl_seconds > 0:
+        # Best-effort wall-clock estimate for the client; TTL bookkeeping
+        # itself is tracked in monotonic time (see session.store).
+        from datetime import timedelta
+
+        expires_at = (
+            record.created_at + timedelta(seconds=cfg.settings.session_ttl_seconds)
+        ).isoformat()
+    return CreateSessionResponse(
+        session_id=record.session_id,
+        created_at=record.created_at.isoformat(),
+        expires_at=expires_at,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /v2/sessions — the conversation index (§3)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/sessions", response_model=SessionIndexResponse)
+def list_sessions(principal: Principal = Depends(require_principal)) -> SessionIndexResponse:
+    rows = get_session_store().list_sessions(principal.id)
+    entries = [SessionIndexEntry(**row) for row in rows]
+    return SessionIndexResponse(sessions=entries, total=len(entries))
+
+
+# ---------------------------------------------------------------------------
+# PATCH /v2/sessions/{sid} — rename (§3)
+# ---------------------------------------------------------------------------
+
+
+@router.patch("/sessions/{session_id}", response_model=RenameSessionResponse)
+def rename_session(
+    session_id: str, req: RenameSessionRequest, principal: Principal = Depends(require_principal),
+) -> RenameSessionResponse:
+    try:
+        record = get_session_store().require(session_id)
+    except SessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _require_owned_session(record, principal)
+
+    title = req.title
+    if has_disallowed_chars(title):
+        raise HTTPException(
+            status_code=422, detail="title must not contain a newline or control character",
+        )
+    max_length = cfg.settings.session_title_max_length
+    if len(title) > max_length:
+        raise HTTPException(status_code=422, detail=f"title exceeds max_length={max_length}")
+
+    get_session_store().rename(record, title)
+    return RenameSessionResponse(session_id=record.session_id, title=record.title)
+
+
+# ---------------------------------------------------------------------------
+# GET /v2/sessions/{sid}
+# ---------------------------------------------------------------------------
+
+
+@router.get("/sessions/{session_id}", response_model=SessionTranscriptResponse)
+def get_session(
+    session_id: str, principal: Principal = Depends(require_principal),
+) -> SessionTranscriptResponse:
+    try:
+        record = get_session_store().require(session_id)
+    except SessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _require_owned_session(record, principal)
+    return SessionTranscriptResponse(
+        session_id=record.session_id,
+        created_at=record.created_at.isoformat(),
+        turns=record.turns,
+    )
+
+
+# ---------------------------------------------------------------------------
+# DELETE /v2/sessions/{sid}
+# ---------------------------------------------------------------------------
+
+
+@router.delete("/sessions/{session_id}", status_code=204)
+def delete_session(session_id: str, principal: Principal = Depends(require_principal)) -> None:
+    # Idempotent -- deleting an unknown id is not an error, and stays that
+    # way here: a session owned by someone else behaves exactly like an
+    # unknown one (204, not deleted, not a 403 confirming it exists).
+    record = get_session_store().get(session_id)
+    if record is None:
+        return
+    _require_owned_session(record, principal)
+    get_session_store().delete(session_id)
+
+
+# ---------------------------------------------------------------------------
+# POST /v2/sessions/{sid}/turns  (+ ?stream=1)
+# ---------------------------------------------------------------------------
+
+
+async def _ask_turn_bounded(
+    session_id: str, question: str, principal: Principal, *, interpret: bool = False,
+) -> Turn:
+    """Run the (blocking) turn engine off the event loop under a concurrency bound.
+
+    The TurnEngine.ask makes blocking HTTP/DB calls, so it must not run
+    directly on the async event loop. The concurrency bound ensures the
+    worker thread pool does not exhaust under concurrent requests.
+    """
+    try:
+        record = get_session_store().require(session_id)
+    except SessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _require_owned_session(record, principal)
+    system_prompt = _require_system_prompt()
+    memory_entries = _load_memory_entries_for(principal)
+    turn = await run_bounded(
+        get_turn_engine().ask, record, question, system_prompt,
+        denied_columns=principal.denied_columns, memory_entries=memory_entries,
+        interpret=interpret, principal_id=principal.id,
+    )
+    get_session_store().sync_turn(record, turn)
+    return turn
+
+
+@router.post("/sessions/{session_id}/turns", response_model=None)
+async def ask_turn(
+    session_id: str,
+    req: AskTurnRequest,
+    request: Request,
+    principal: Principal = Depends(require_principal),
+    _maintenance: None = Depends(require_not_in_maintenance),
+):
+    if request.query_params.get("stream") in ("1", "true"):
+        return StreamingResponse(
+            _turn_event_stream(
+                session_id,
+                req.question,
+                principal,
+                req.interpret,
+                request_id=getattr(request.state, "request_id", ""),
+            ),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    return await _ask_turn_bounded(
+        session_id, req.question, principal, interpret=req.interpret,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Live stage progress (contract §7's `stage` events)
+# ---------------------------------------------------------------------------
+
+#: ``StageTimer`` stage name -> the pipeline step the web UI draws.
+#:
+#: The two vocabularies are deliberately different sizes. The timer measures
+#: what is worth *timing* (``plan`` and ``prompt`` are separate costs in the
+#: audit record); the UI shows what is worth *watching*, and "working out
+#: what you meant" is one thing to a reader whether or not the prompt build
+#: is counted separately. Both fold onto ``understand``.
+#:
+#: A stage absent from this map emits no event rather than inventing a step
+#: id the UI has no element for. That silence is exactly what used to
+#: happen for every stage: the endpoint sent one frame naming stage
+#: ``"plan"``, ``renderPipeline`` looked for a ``[data-step="plan"]`` that
+#: does not exist, and `setStage` returned without doing anything. Five
+#: steps then sat at "waiting" for the whole turn while the answer arrived
+#: beside them.
+_STAGE_TO_UI_STEP: dict[str, str] = {
+    "plan": "understand",
+    "prompt": "understand",
+    "llm": "generate",
+    "guard": "validate",
+    "execute": "execute",
+    "interpret": "interpret",
+}
+
+#: Sentinel put on the queue by the worker thread when the turn is over, so
+#: the draining loop stops on a value rather than on a timeout it would
+#: have to guess the length of.
+_STAGES_DONE = object()
+
+
+async def _ask_turn_streaming_stages(
+    session_id: str, question: str, principal: Principal, interpret: bool = False,
+):
+    """Run one turn, yielding ``(ui_step, state)`` as each stage happens,
+    then finally ``("", turn)``.
+
+    ``TurnEngine.ask`` is blocking and runs in a worker thread, so its
+    progress cannot be awaited -- it has to be *pushed* out. The bridge is
+    a plain :class:`queue.Queue`: the worker thread puts stage transitions
+    on it from inside :class:`~observability.timing.StageTimer`, and this
+    coroutine drains it without blocking the event loop by waiting on the
+    queue in a thread of its own (``asyncio.to_thread(queue.get)``).
+
+    A queue rather than ``loop.call_soon_threadsafe`` because the producer
+    is deep inside synchronous engine code that has no business knowing an
+    event loop exists, let alone which one. ``StageTimer`` takes a plain
+    callable; this keeps it that way.
+    """
+    try:
+        record = get_session_store().require(session_id)
+    except SessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _require_owned_session(record, principal)
+    system_prompt = _require_system_prompt()
+    memory_entries = _load_memory_entries_for(principal)
+
+    events: "queue.Queue[Any]" = queue.Queue()
+
+    def on_stage(name: str, state: str) -> None:
+        step = _STAGE_TO_UI_STEP.get(name)
+        if step is not None:
+            events.put((step, state))
+
+    def run() -> Turn:
+        try:
+            return get_turn_engine().ask(
+                record, question, system_prompt,
+                denied_columns=principal.denied_columns,
+                memory_entries=memory_entries,
+                on_stage=on_stage,
+                interpret=interpret,
+                principal_id=principal.id,
+            )
+        finally:
+            # In a `finally` so a raising turn still releases the drain
+            # loop below; otherwise a failed turn would hang the response
+            # on a queue that nothing will ever put to again.
+            events.put(_STAGES_DONE)
+
+    # Run the worker under the shared concurrency bound. The queue draining
+    # (events.get) does NOT hold a semaphore slot — only the pipeline worker
+    # thread does. This prevents deadlock when the queue is accessed from an
+    # asyncio context while the worker waits on the semaphore.
+    task = asyncio.create_task(run_bounded(run))
+    while True:
+        item = await asyncio.to_thread(events.get)
+        if item is _STAGES_DONE:
+            break
+        yield item
+
+    turn = await task
+    get_session_store().sync_turn(record, turn)
+    yield ("", turn)
+
+
+def _sse_event(name: str, data: dict) -> str:
+    return f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+
+
+async def _turn_event_stream(
+    session_id: str,
+    question: str,
+    principal: Principal,
+    interpret: bool = False,
+    *,
+    request_id: str = "",
+):
+    """Yield SSE events per contract §7.
+
+    ``stage`` events are live: :func:`_ask_turn_streaming_stages` bridges
+    the worker thread running ``TurnEngine.ask`` back to this generator, so
+    each pipeline step is reported as it starts and as it finishes rather
+    than all at once at the end. Everything after them (``resolved``,
+    ``sql``, ``rows``, ...) still arrives together, because the engine
+    computes them together -- this is not per-token streaming, and the
+    content events are emitted once there is content to emit.
+
+    ``request_id`` (Finding 11, 2026 audit): this generator builds its own
+    ``error`` SSE event instead of going through ``api/errors.py``'s HTTP
+    handlers, which is exactly why it regressed independently of the fix
+    there -- a separate path with the same bug needs its own fix. The
+    unexpected-exception branch below used to yield ``str(exc)`` verbatim,
+    which is how a live transport failure (the LLM endpoint's host, port
+    and retry trace) reached an analyst over this stream. It now yields a
+    generic message plus this request id, and logs the real exception
+    server-side via ``logger.exception`` above -- so an operator can still
+    find the failure, and the client still has something to quote back
+    when reporting it, without the client itself seeing the internal detail.
+    """
+    turn: Turn | None = None
+    try:
+        async for step, payload in _ask_turn_streaming_stages(
+            session_id, question, principal, interpret,
+        ):
+            if step:
+                yield _sse_event("stage", {"stage": step, "state": payload})
+            else:
+                turn = payload
+    except HTTPException as exc:
+        yield _sse_event("error", {"code": "SESSION_NOT_FOUND", "message": str(exc.detail)})
+        return
+    except Exception:  # noqa: BLE001 - surfaced as an SSE error event
+        logger.exception("Unexpected error while streaming turn for session=%s", session_id)
+        yield _sse_event(
+            "error",
+            {
+                "code": "INTERNAL_ERROR",
+                "message": (
+                    "An internal error occurred while processing this turn. "
+                    "Please try again."
+                ),
+                "request_id": request_id,
+            },
+        )
+        return
+
+    if turn is None:  # pragma: no cover - the generator always yields it last
+        yield _sse_event("error", {"code": "INTERNAL_ERROR", "message": "no turn produced"})
+        return
+
+    yield _sse_event(
+        "resolved",
+        {"resolved_question": turn.resolved_question, "basis": turn.basis.model_dump()},
+    )
+    yield _sse_event("assumptions", turn.ambiguity.model_dump())
+    if turn.sql is not None:
+        yield _sse_event(
+            "sql",
+            {
+                "sql": turn.sql,
+                # The layout `done`'s `turn.sql_display` carries, so the
+                # first paint is the final one. Display only: `sql` is what
+                # ran. Computed here when the turn has none.
+                "sql_display": turn.sql_display or pretty_sql(turn.sql, cfg.settings.sql_dialect),
+                "guard": turn.guard.model_dump() if turn.guard else None,
+            },
+        )
+    if turn.result is not None:
+        yield _sse_event(
+            "rows",
+            {
+                "columns": [c.model_dump() for c in turn.result.columns],
+                "rows": turn.result.rows,
+                "row_count": turn.result.row_count,
+            },
+        )
+    if turn.interpretation:
+        yield _sse_event("interpretation_delta", {"text": turn.interpretation})
+    if turn.llm is not None:
+        yield _sse_event("llm", turn.llm)
+    if turn.error is not None:
+        yield _sse_event(
+            "error",
+            {
+                "code": turn.error.code,
+                "message": turn.error.message,
+                "request_id": turn.error.request_id,
+            },
+        )
+    yield _sse_event("done", {"turn": turn.model_dump()})
+
+
+# ---------------------------------------------------------------------------
+# PATCH /v2/sessions/{sid}/turns/{tid}/assumptions
+# ---------------------------------------------------------------------------
+
+
+@router.patch("/sessions/{session_id}/turns/{turn_id}/assumptions", response_model=Turn)
+async def patch_assumptions(
+    session_id: str,
+    turn_id: str,
+    req: PatchAssumptionsRequest,
+    principal: Principal = Depends(require_principal),
+) -> Turn:
+    try:
+        record = get_session_store().require(session_id)
+    except SessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _require_owned_session(record, principal)
+
+    target = get_session_store().find_turn(record, turn_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"Unknown turn_id: {turn_id!r}")
+
+    system_prompt = _require_system_prompt()
+    overrides = {e.field: e.value for e in req.assumptions}
+    memory_entries = _load_memory_entries_for(principal)
+    turn = await run_bounded(
+        get_turn_engine().ask,
+        record,
+        target.question,
+        system_prompt,
+        assumption_overrides=overrides,
+        denied_columns=principal.denied_columns,
+        memory_entries=memory_entries,
+        principal_id=principal.id,
+    )
+    get_session_store().sync_turn(record, turn)
+    return turn
+
+
+# ---------------------------------------------------------------------------
+# POST/GET /v2/sessions/{sid}/turns/{tid}/feedback -- admin panel phase 4
+# ---------------------------------------------------------------------------
+# The one piece of phase 4 that lives in the analyst UI, not the admin
+# panel (docs/admin-panel-architecture.md §3 Tier 1; the phase 4 spec §2):
+# an analyst is the only person who knows whether an answer was wrong.
+# Ownership is enforced exactly like every other route in this module
+# (_require_owned_session -- 404, never 403, for a turn on someone else's
+# session) precisely because a feedback row references a turn, and a turn
+# lives inside a session an analyst may not read in the first place.
+
+
+class SubmitFeedbackRequest(BaseModel):
+    """``POST .../feedback`` body -- deliberately mirrors the closed set
+    plus free text the spec's §2.1 UI offers, nothing more: no field here
+    can carry the question or the SQL (this endpoint never reads them from
+    the request at all -- see :mod:`appdb.feedback`'s module docstring for
+    why the join, not a copy, is what the audit log is for)."""
+
+    model_config = {"extra": "forbid"}
+
+    category: Literal[
+        "wrong_number", "different_question", "wrong_filter_or_period", "other",
+    ]
+    note: str = Field(default="", max_length=2000)
+
+
+@router.post(
+    "/sessions/{session_id}/turns/{turn_id}/feedback",
+    status_code=201,
+    summary="Flag this turn's answer as wrong (analyst-facing, admin panel phase 4)",
+)
+def submit_turn_feedback(
+    session_id: str,
+    turn_id: str,
+    req: SubmitFeedbackRequest,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    try:
+        record = get_session_store().require(session_id)
+    except SessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _require_owned_session(record, principal)
+
+    if get_session_store().find_turn(record, turn_id) is None:
+        raise HTTPException(status_code=404, detail=f"Unknown turn_id: {turn_id!r}")
+
+    try:
+        row = submit_flag(
+            session_id=session_id,
+            turn_id=turn_id,
+            reporter_principal_id=principal.id,
+            category=req.category,
+            note=req.note,
+        )
+    except TurnNotAuditedError as exc:
+        # The turn exists in the session store but no audit record can be
+        # joined to it (e.g. the audit log has since rotated past it) --
+        # 422, not 404: the turn itself is real, only the join failed.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # The later action wins (see submit_turn_confirmation): flagging a turn
+    # this principal had confirmed takes the confirmation back. Done after
+    # the flag is stored, so a failure here leaves both rather than neither;
+    # repeating the flag converges.
+    withdrew_confirmation = withdraw_confirmation(
+        session_id=session_id, turn_id=turn_id, principal_id=principal.id,
+    )
+    return {**row, "withdrew_confirmation": withdrew_confirmation}
+
+
+@router.get(
+    "/sessions/{session_id}/turns/{turn_id}/feedback",
+    summary="Flags already raised on this turn, by the caller alone",
+)
+def get_turn_feedback(
+    session_id: str, turn_id: str, principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    """Lets the UI show "already flagged" without a second submission --
+    scoped to *this session*, which :func:`_require_owned_session` already
+    restricts to the session's own owner. A principal may not read
+    feedback on another principal's session any more than they may read
+    that session's turns (§2's ownership rule extends unchanged)."""
+    try:
+        record = get_session_store().require(session_id)
+    except SessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _require_owned_session(record, principal)
+
+    if get_session_store().find_turn(record, turn_id) is None:
+        raise HTTPException(status_code=404, detail=f"Unknown turn_id: {turn_id!r}")
+
+    all_for_session = list_feedback(session_id=session_id)
+    return {"feedback": [f for f in all_for_session if f["turn_id"] == turn_id]}
+
+
+# ---------------------------------------------------------------------------
+# POST/DELETE /v2/sessions/{sid}/turns/{tid}/confirmation -- "this answer is
+# correct" (پاسخ درست است)
+# ---------------------------------------------------------------------------
+# The positive twin of the feedback route above. Ownership is enforced the
+# same way (_require_owned_session -- 404, never 403, for a turn on someone
+# else's session), so only the turn's own principal can confirm or withdraw
+# it. The body is empty: the principal is stamped server-side and the
+# request id is resolved from the audit record, so there is nothing for a
+# client to forge. See appdb/confirmations.py for what is stored (ids only).
+
+
+@router.post(
+    "/sessions/{session_id}/turns/{turn_id}/confirmation",
+    status_code=201,
+    summary="Confirm this turn's answer is correct (analyst-facing)",
+)
+def submit_turn_confirmation(
+    session_id: str,
+    turn_id: str,
+    response: Response,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    """Record that the caller confirms this turn's answer as correct.
+
+    * **Authorisation:** the turn's owner only -- the same rule as
+      flagging (``_require_owned_session``: 404 for another principal's
+      session, so a turn's existence is not disclosed).
+    * **Only a successful answer:** the turn's audit record must show SQL
+      that ran and returned a result. A rejected, declined or failed turn,
+      or one with no audit record to check, is refused with ``409`` and a
+      message saying why.
+    * **Idempotent:** confirming a turn the caller has already confirmed
+      returns the existing confirmation with ``200`` (``already_confirmed:
+      true``) and changes nothing; the first confirmation returns ``201``.
+      At most one confirmation exists per (turn, principal).
+    * **Flag and confirmation interplay:** the later action wins and the
+      earlier one is removed, per principal. Confirming a turn the caller
+      had flagged deletes that flag if it is still open (``removed_flags``
+      says how many); a flag an admin has already resolved is kept, since
+      triage recorded a decision on it. Flagging a confirmed turn removes
+      the confirmation (``withdrew_confirmation`` on the feedback
+      response). Other principals' flags and confirmations are untouched.
+
+    Raises
+    ------
+    HTTPException
+        404 unknown session or turn (or not the caller's session); 409 the
+        turn is not a successful answer.
+    """
+    try:
+        record = get_session_store().require(session_id)
+    except SessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _require_owned_session(record, principal)
+
+    if get_session_store().find_turn(record, turn_id) is None:
+        raise HTTPException(status_code=404, detail=f"Unknown turn_id: {turn_id!r}")
+
+    try:
+        row, created = confirm_turn(
+            session_id=session_id, turn_id=turn_id, principal_id=principal.id,
+        )
+    except TurnNotConfirmableError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    # The later action wins: confirming a turn this principal had flagged
+    # takes the (still open) flag back. After the confirmation is stored,
+    # so a failure leaves both rather than neither; repeating converges.
+    removed_flags = withdraw_open_flags(
+        session_id=session_id, turn_id=turn_id, reporter_principal_id=principal.id,
+    )
+    if not created:
+        response.status_code = 200
+    return {
+        "confirmed": True,
+        "already_confirmed": not created,
+        "removed_flags": removed_flags,
+        **row,
+    }
+
+
+@router.delete(
+    "/sessions/{session_id}/turns/{turn_id}/confirmation",
+    summary="Withdraw the caller's confirmation of this turn's answer",
+)
+def withdraw_turn_confirmation(
+    session_id: str, turn_id: str, principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    """Delete the caller's own confirmation of the turn.
+
+    Authorised like the confirmation itself (the turn's owner). Withdrawing
+    when there is nothing to withdraw is not an error: the response is
+    ``200`` with ``withdrawn: false``, so the call is safe to repeat.
+    Another principal's confirmation of the same turn is never affected.
+
+    Raises
+    ------
+    HTTPException
+        404 unknown session or turn (or not the caller's session).
+    """
+    try:
+        record = get_session_store().require(session_id)
+    except SessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _require_owned_session(record, principal)
+
+    if get_session_store().find_turn(record, turn_id) is None:
+        raise HTTPException(status_code=404, detail=f"Unknown turn_id: {turn_id!r}")
+
+    withdrawn = withdraw_confirmation(
+        session_id=session_id, turn_id=turn_id, principal_id=principal.id,
+    )
+    return {"confirmed": False, "withdrawn": withdrawn}
+
+
+@router.get(
+    "/sessions/{session_id}/confirmations",
+    summary="The turns of this session the caller has confirmed",
+)
+def list_session_confirmations(
+    session_id: str, principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    """Lets the UI show each turn's confirmed state when a transcript is
+    opened, with one request per session instead of one per turn. Scoped to
+    the caller's own confirmations of a session they own; nothing about
+    another principal's confirmations is exposed."""
+    try:
+        record = get_session_store().require(session_id)
+    except SessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _require_owned_session(record, principal)
+
+    rows = list_confirmations(session_id=session_id, principal_id=principal.id)
+    return {"confirmations": rows, "turn_ids": [r["turn_id"] for r in rows]}
+
+
+# ---------------------------------------------------------------------------
+# POST /v2/sessions/{sid}/turns/{tid}/access-request -- ADR-004 part 1
+# ---------------------------------------------------------------------------
+# "Request access", the next action DESIGN-INVARIANTS.md §8's failure-
+# anatomy table names beside "Ask without that column" for a denied-column
+# guard rejection. Ownership is enforced exactly like the feedback routes
+# above (_require_owned_session -- 404, never 403, for a turn on someone
+# else's session). The request body carries only session_id/turn_id (path
+# parameters, not even a JSON body): the requester is stamped server-side
+# from the authenticated principal, and the column is re-derived
+# server-side from the joined audit record -- appdb.access_requests never
+# accepts either from the client, so there is nothing here for a client to
+# forge.
+
+
+@router.post(
+    "/sessions/{session_id}/turns/{turn_id}/access-request",
+    status_code=201,
+    summary="Request access to this turn's denied column (analyst-facing, ADR-004)",
+)
+def submit_access_request(
+    session_id: str,
+    turn_id: str,
+    response: Response,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    try:
+        record = get_session_store().require(session_id)
+    except SessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _require_owned_session(record, principal)
+
+    if get_session_store().find_turn(record, turn_id) is None:
+        raise HTTPException(status_code=404, detail=f"Unknown turn_id: {turn_id!r}")
+
+    try:
+        row, created = submit_request(
+            session_id=session_id, turn_id=turn_id, requester_principal_id=principal.id,
+        )
+    except AccessRequestTurnNotAuditedError as exc:
+        # Same reasoning as submit_turn_feedback's identical branch: the
+        # turn exists in the session store but no audit record can be
+        # joined to it (the audit log has since rotated past it) -- 422,
+        # not 404: the turn itself is real, only the join failed.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except NotDeniedColumnError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # 200 for "this merged into an existing open request" vs. 201 for a
+    # genuinely new one -- the default the route decorator sets is for the
+    # common case; this is the one branch that must override it.
+    if not created:
+        response.status_code = 200
+    return {"already_pending": not created, **row}
+
+
+@router.get(
+    "/access-requests",
+    summary="The caller's own access requests and their status (analyst-facing, ADR-004)",
+)
+def list_own_access_requests(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    """The minimal status read an analyst needs: every request THEY raised,
+    across every session, with its current status and -- once resolved --
+    a denial reason. Scoped by `requester_principal_id` alone (never by
+    session), the same "an id, never a second store" posture the rest of
+    this module holds; a security admin's denial reason is visible here
+    because this read is already confined to the requester's own rows,
+    never to the general triage queue (`api/admin_access_requests_routes.py`)."""
+    return {"access_requests": list_access_requests(requester_principal_id=principal.id)}
+
+
+# ---------------------------------------------------------------------------
+# GET /v2/examples -- questions to start with (analyst page, empty state)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/examples",
+    summary="Questions from examples.yaml the caller can start with (question text only)",
+)
+def list_start_examples(
+    limit: int = 6,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    """The ``examples.yaml`` questions the analyst page offers as one-click
+    starts in an empty conversation (:mod:`core.start_examples`).
+
+    Only question text is returned, never SQL or tags, and only questions
+    whose SQL passes the guard for this principal's ``denied_columns``. A
+    deployment without a readable ``examples.yaml`` answers with an empty
+    list, not an error: the page then shows its plain hint, as before.
+    """
+    from core.start_examples import offered_questions
+
+    try:
+        import knowledge.examples as examples_module
+
+        examples = examples_module.EXAMPLES
+    except Exception:  # noqa: BLE001 -- a missing or invalid file is "no examples", never a 500
+        logger.warning("GET /v2/examples: examples.yaml could not be read; offering none")
+        examples = []
+    questions = offered_questions(examples, denied_columns=principal.denied_columns, limit=limit)
+    return {"examples": [{"question": q} for q in questions]}
+
+
+# ---------------------------------------------------------------------------
+# GET/PUT/DELETE /v2/memory* — cross-session memory (§5)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/memory", response_model=MemoryIndexResponse)
+def get_memory(principal: Principal = Depends(require_principal)) -> MemoryIndexResponse:
+    keys = get_memory_keys()
+    stored = _get_memory_persistence().get_memory_entries(principal.id)
+    denied = set(principal.denied_columns)
+
+    entries = [
+        MemoryEntryResponse(
+            key=key,
+            field=row["field"],
+            value=row["value"],
+            updated_at=row["updated_at"],
+            # A stored entry for a key this deployment no longer declares
+            # (config edited after the entry was written) is reported as
+            # not applicable -- there is no column left to re-check.
+            applicable=(key in keys and keys[key].column not in denied),
+        )
+        for key, row in stored.items()
+    ]
+    rememberable = [
+        RememberableKeyResponse(
+            key=key, field=key_cfg.field_name,
+            options=list(key_cfg.options), max_length=key_cfg.max_length,
+        )
+        for key, key_cfg in keys.items()
+    ]
+    return MemoryIndexResponse(entries=entries, rememberable=rememberable)
+
+
+@router.put("/memory/{key}", response_model=MemoryEntryResponse)
+def put_memory(
+    key: str, req: SetMemoryRequest, principal: Principal = Depends(require_principal),
+) -> MemoryEntryResponse:
+    try:
+        validate_memory_value(key, req.value)
+    except MemoryValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    persistence = _get_memory_persistence()
+    existing = persistence.get_memory_entries(principal.id)
+    if key not in existing and len(existing) >= cfg.settings.memory_max_entries_per_principal:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "memory_max_entries_per_principal "
+                f"({cfg.settings.memory_max_entries_per_principal}) would be exceeded by "
+                "pinning a new key -- forget an existing entry first"
+            ),
+        )
+
+    key_cfg = get_memory_keys()[key]  # validate_memory_value already proved this key is declared
+    updated_at = datetime.now(timezone.utc).isoformat()
+    persistence.set_memory_entry(principal.id, key, key_cfg.field_name, req.value, updated_at)
+    return MemoryEntryResponse(
+        key=key, field=key_cfg.field_name, value=req.value, updated_at=updated_at, applicable=True,
+    )
+
+
+@router.delete("/memory/{key}", status_code=204)
+def delete_memory_key(key: str, principal: Principal = Depends(require_principal)) -> None:
+    # Idempotent -- forgetting a never-set (or another principal's) key is
+    # not an error.
+    _get_memory_persistence().delete_memory_entry(principal.id, key)
+
+
+@router.delete("/memory", status_code=204)
+def delete_all_memory(principal: Principal = Depends(require_principal)) -> None:
+    _get_memory_persistence().delete_all_memory_entries(principal.id)

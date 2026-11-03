@@ -1,0 +1,1579 @@
+# SPDX-License-Identifier: BUSL-1.1
+# Copyright (c) 2024-2026 Ali Sadeghi Aghili
+"""Command-line entry point for the evaluation harness.
+
+Usage::
+
+    python -m eval.cli run --golden eval_data.example/golden.jsonl
+    python -m eval.cli run --golden eval_data/golden.jsonl --live
+    python -m eval.cli run --golden eval_data/golden.jsonl --live \\
+        --baseline eval_data/baseline.json
+    python -m eval.cli run --golden eval_data/golden.jsonl --live \\
+        --save-baseline eval_data/baseline.json
+
+    # Absolute floors (off unless set): fail the run when overall accuracy,
+    # or any one data source's accuracy, is below a fixed percentage --
+    # whatever the baseline says, and with or without --baseline.
+    python -m eval.cli run --golden eval_data/golden.jsonl --live \\
+        --min-accuracy 90 --min-source-accuracy 80
+
+    # Release gate against a warehouse that changes daily: run every case's
+    # expected_sql in the same run and compare the two results (execution
+    # accuracy, see eval.compare) instead of a fingerprint recorded once.
+    python -m eval.cli run --golden eval_data/golden.jsonl --live \\
+        --reference live --baseline eval_data/baseline.json
+
+    # Last step of building a golden set: run each reviewed case's
+    # expected_sql read-only, record its rows/fingerprint, and (only with
+    # --accept) activate the cases that passed. See eval.verify.
+    python -m eval.cli verify --golden eval_data/golden.jsonl
+    python -m eval.cli verify --golden eval_data/golden.jsonl --accept
+
+    # Table-selection recall, offline (no LLM, no database): which of the
+    # tables each case's expected_sql reads does retrieval put in the prompt?
+    # See eval.recall.
+    python -m eval.cli recall --golden eval_data/golden.jsonl
+    python -m eval.cli recall --golden eval_data/golden.jsonl --json
+    python -m eval.cli recall --golden eval_data/golden.jsonl --min-recall 0.9
+
+    # Phase 2 task 3: compare free-text-plus-clean_sql against constrained
+    # JSON output on the same golden set (requires a real, reachable endpoint):
+    python -m eval.cli run --golden eval_data.example/golden.jsonl --live
+    python -m eval.cli run --golden eval_data.example/golden.jsonl --live --structured
+
+    # Determinism probe (see eval.determinism): run every golden question
+    # through the live generator several times and report how often it
+    # comes back byte-identical. Requires a real, reachable endpoint --
+    # --determinism without --live is refused, see _run below.
+    python -m eval.cli run --golden eval_data.example/golden.jsonl --live --determinism
+    python -m eval.cli run --golden eval_data.example/golden.jsonl --live --determinism \\
+        --determinism-repeats 5 --determinism-out eval_data/determinism.json
+
+    # Accuracy rounds with a reviewer (runbook 18.6). Split the golden set once
+    # into a dev half the reviewer may study and a test half nobody tunes to:
+    python -m eval.cli split --golden eval_data/golden.jsonl --out eval_data/split
+    # A run that also writes ONE share-safe file (needs --live --reference live);
+    # --share-only-ids keeps the test half's content on the server. --live
+    # generates through the server's own correction loop; --single-shot makes
+    # one model call instead (a model-only number):
+    python -m eval.cli run --golden eval_data/golden.jsonl --live --reference live \\
+        --share eval_data/share/round-1.json --share-only-ids eval_data/split/dev_ids.txt \\
+        --out eval_data/round-1.report.json
+    # Compare two rounds; limit to the held-out half and fail on a regression:
+    python -m eval.cli compare eval_data/share/round-1.json eval_data/share/round-2.json \\
+        --split test --split-file eval_data/split/test_ids.txt --fail-on-regression
+
+    # Benchmark track (runbook 18.7): a public text-to-SQL benchmark (BIRD mini-dev) loaded
+    # into your own SQL Server, run through the production pipeline. It does NOT replace the
+    # private golden set and is never this deployment's accuracy.
+    python -m eval.cli bench-import bird --source DIR --target-url "$ADMIN_URL" --out DIR \\
+        --datasource bench [--dbs a,b] [--descriptions] [--with-evidence] [--replace]
+    python -m eval.cli bench-run bird --bench DIR --mode per-db [--evidence]
+
+By default the harness runs in **offline** mode: no database connection,
+no LLM call — see :func:`eval.runner.make_offline_generator` and
+:func:`eval.runner.make_offline_executor`. Passing ``--live`` switches to
+a real :class:`~llm.providers.OpenAIBackend` (built from :mod:`config`'s
+``OPENAI_*`` settings) and :func:`database.executor.execute_sql`; both are
+imported lazily, inside :func:`_build_live_callables`, only when
+``--live`` is actually requested — this module never opens a network or
+database connection at import time.
+
+Start-up needs no ``project_config/``: ``--help``, ``split`` and ``compare``
+work without one, because everything that reads it (the runner, the SQL guard,
+the prompt builder) is imported inside the command that needs it. ``run``,
+``verify`` and ``recall`` check the files first
+(:func:`core.config_preflight.exit_if_project_config_unusable`) and, when one
+cannot be loaded, print ``cannot load project_config: ...`` on one line and
+exit with status 2, as ``scripts/prompt_budget.py`` does.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from collections.abc import Callable, Sequence
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import config as cfg
+from core.config_preflight import SERVER_IMPORT_FILES, exit_if_project_config_unusable
+from core.console import use_utf8_console
+from eval.baseline import (
+    BaselineThresholds,
+    check_absolute_floors,
+    compare_to_baseline,
+    exit_code,
+    load_baseline,
+    save_baseline,
+)
+from eval.compare import ComparisonOptions
+from eval.determinism import DEFAULT_REPEATS as DEFAULT_DETERMINISM_REPEATS
+from eval.models import GoldenCase
+from eval.recall import evaluate_recall, render_recall_text, report_to_json
+from eval.report import build_report, render_text, save_json_report
+from eval.store import load_golden_cases, write_golden_cases
+
+if TYPE_CHECKING:  # the runner and everything it imports read project_config/
+    from eval.runner import ExecuteFn, GenerateFn, SourceTrace
+
+#: ``run``, ``verify`` and ``recall`` import the runner, the SQL guard or
+#: retrieval, which bind these files at import time.
+_COMMANDS_NEEDING_PROJECT_CONFIG = frozenset({"run", "verify", "recall"})
+
+
+def _load_system_prompt(path: Path | None = None) -> str:
+    """Read the system prompt text used to build a live prompt.
+
+    Parameters
+    ----------
+    path:
+        Path to the system prompt file; ``<PROJECT_CONFIG_DIR>/system_prompt.md``
+        when ``None``.
+
+    Returns
+    -------
+    str
+
+    Raises
+    ------
+    FileNotFoundError
+        If *path* does not exist.
+
+    Examples
+    --------
+    >>> import tempfile, os
+    >>> fd, path = tempfile.mkstemp(suffix=".md")
+    >>> _ = os.write(fd, b"You are a T-SQL expert.")
+    >>> os.close(fd)
+    >>> _load_system_prompt(Path(path))
+    'You are a T-SQL expert.'
+    >>> os.remove(path)
+    """
+    if path is None:
+        from knowledge.config_loader import resolve_system_prompt_path
+
+        path = resolve_system_prompt_path()
+    if not path.exists():
+        raise FileNotFoundError(f"system prompt not found: {path}")
+    return path.read_text(encoding="utf-8")
+
+
+def _build_live_callables(
+    structured: bool = False,
+    trace: SourceTrace | None = None,
+    single_shot: bool = False,
+) -> tuple[GenerateFn, ExecuteFn]:
+    """Lazily construct a real ``(generate_fn, execute_fn)`` pair for ``--live`` mode.
+
+    Every import here is deferred to call time so that plain ``import
+    eval.cli`` (e.g. from a test collector) never opens a network
+    connection or a database engine.
+
+    Parameters
+    ----------
+    structured:
+        With *single_shot*, use :func:`~eval.runner.make_live_structured_generator`
+        (Phase 2 task 3's constrained-JSON path) instead of
+        :func:`~eval.runner.make_live_generator` (free text + ``clean_sql``).
+        This is what ``--structured`` compares against the default.
+    trace:
+        Optional :class:`~eval.runner.SourceTrace` the generator records
+        its data-source choice, correction rounds and rejections on.
+    single_shot:
+        ``False`` (the default) builds the production pipeline
+        (:func:`eval.pipeline.make_production_pipeline`): the server's own
+        ``SQLAgent`` loop with the guard, correction rounds, row cap and
+        query timeout. ``True`` makes one model call per question and no
+        correction (``--single-shot``): the model-only number.
+
+    Returns
+    -------
+    tuple[GenerateFn, ExecuteFn]
+    """
+    from database.executor import execute_sql
+
+    from eval.runner import SourceTrace as _SourceTrace
+
+    system_prompt = _load_system_prompt()
+    if not single_shot:
+        from eval.pipeline import make_production_pipeline
+
+        return make_production_pipeline(
+            system_prompt, trace if trace is not None else _SourceTrace(), execute_sql
+        )
+
+    from llm.providers import OpenAIBackend
+
+    from eval.runner import make_live_generator, make_live_structured_generator
+
+    backend = OpenAIBackend.from_settings()
+    generate_fn = (
+        make_live_structured_generator(backend, system_prompt, trace)
+        if structured
+        else make_live_generator(backend, system_prompt, trace)
+    )
+    return generate_fn, execute_sql
+
+
+def _build_executor() -> ExecuteFn:
+    """The application's own executor, imported lazily (see the module docstring).
+
+    Used by ``verify``: the same routing, ``NOLOCK`` rewriting, timeouts and
+    rolled-back read-only transaction as a production query.
+    """
+    from database.executor import execute_sql
+
+    return execute_sql
+
+
+def _build_offline_callables(cases: Sequence[GoldenCase]) -> tuple[GenerateFn, ExecuteFn]:
+    """Build the offline/CI replay ``(generate_fn, execute_fn)`` pair for *cases*."""
+    from eval.runner import make_offline_executor, make_offline_generator
+
+    return make_offline_generator(cases), make_offline_executor(cases)
+
+
+def _print_prefix_cache_probe(question: str) -> None:
+    """Print the Phase 2 (latency) prefix-cache measurement for ``--live`` runs.
+
+    Asks the exact same *question* twice against a real
+    :class:`~llm.providers.OpenAIBackend` and reports each call's
+    ``prompt_tokens`` and wall-clock time, plus the derived
+    ``prefix_cache_hit`` — see :func:`~eval.runner.measure_prefix_cache`.
+    This is deliberately printed, never silently skipped or guessed at: if
+    no endpoint is reachable, the failure is reported as UNMEASURED with
+    the underlying exception, rather than an invented number.
+    """
+    from llm.providers import OpenAIBackend
+
+    from eval.runner import measure_prefix_cache
+
+    system_prompt = _load_system_prompt()
+    backend = OpenAIBackend.from_settings()
+    print("\nPrefix-cache probe (Phase 2 latency baseline):")
+    try:
+        report = measure_prefix_cache(backend, system_prompt, question)
+    except Exception as exc:  # noqa: BLE001 - report, never crash the whole run
+        print(f"  UNMEASURED -- could not reach {backend.name!r}: {type(exc).__name__}: {exc}")
+        return
+    first, second = report["first"], report["second"]
+    print(
+        f"  first call:  prompt_tokens={first['prompt_tokens']}  "
+        f"wall_clock={first['wall_clock_seconds']:.3f}s"
+    )
+    print(
+        f"  second call: prompt_tokens={second['prompt_tokens']}  "
+        f"wall_clock={second['wall_clock_seconds']:.3f}s"
+    )
+    print(f"  prefix_cache_hit={report['prefix_cache_hit']}")
+
+
+def _refuse_offline_determinism() -> None:
+    """Raise the explicit refusal for ``--determinism`` without ``--live``.
+
+    Raises
+    ------
+    ValueError
+        Always. Named after the fixture it refuses to run against:
+        offline mode's generator (:func:`eval.runner.make_offline_generator`)
+        replays each case's own ``expected_sql`` from a lookup table, so
+        every repeat would return byte-identical text purely because the
+        "generator" is a dictionary lookup, not a model. The determinism
+        probe would then report 100% determinism unconditionally -- a
+        confident, precise, and completely meaningless number, the same
+        shape of bug this project has already been bitten by twice (an
+        offline accuracy figure that was true by construction, and a
+        ``prefix_cache_hit`` that was vacuously true at zero prompt
+        tokens). This is a hard refusal, not a silent skip or a footnote.
+    """
+    raise ValueError(
+        "--determinism requires --live: offline mode's generator "
+        "(eval.runner.make_offline_generator) replays each golden case's own "
+        "expected_sql from a lookup table, so every repeat returns byte-identical "
+        "text by construction -- there is no model in the loop to vary. Running the "
+        "determinism probe against it would report 100% determinism unconditionally, "
+        "which measures nothing about any real endpoint. Pass --live to measure a "
+        "real endpoint instead."
+    )
+
+
+def _print_determinism_probe(
+    cases: Sequence[GoldenCase],
+    *,
+    structured: bool,
+    repeats: int,
+    out: str | None,
+    reference: str = "stored",
+    float_tolerance: float | None = None,
+    execute_fn: ExecuteFn | None = None,
+) -> None:
+    """Print the live-only determinism probe for ``--live --determinism`` runs.
+
+    Builds its own real generator (mirroring :func:`_print_prefix_cache_probe`,
+    which likewise constructs its own :class:`~llm.providers.OpenAIBackend`
+    rather than reusing the one built for the main accuracy run) and drives
+    every case in *cases* through :func:`eval.determinism.probe_determinism`.
+    Never silently skipped and never invented: a failure to reach the
+    endpoint propagates as a real exception, exactly like
+    :func:`_print_prefix_cache_probe` would rather report UNMEASURED than a
+    fabricated number -- except here there is nothing sensible to fall
+    back to print, so it is left to propagate.
+
+    Parameters
+    ----------
+    cases:
+        The golden questions to probe.
+    structured:
+        Same meaning as :func:`_build_live_callables`'s ``structured``
+        argument -- use the constrained-JSON generation path instead of
+        free text + ``clean_sql``.
+    repeats:
+        Number of times to generate each question. See
+        :data:`eval.determinism.MIN_REPEATS`.
+    out:
+        Optional path to also save the determinism report as JSON.
+    reference, float_tolerance:
+        How a repeat is judged, as for ``run`` (only used with *execute_fn*).
+    execute_fn:
+        When given, each repeat's SQL is also executed and judged against the
+        case's reference, and the report adds the outcome consistency and the
+        mean accuracy over the repeats. Reads only, like ``run``.
+    """
+    from llm.providers import OpenAIBackend
+
+    from eval.determinism import (
+        make_judge,
+        probe_determinism,
+        render_determinism_text,
+        save_determinism_json,
+    )
+    from eval.runner import make_live_generator, make_live_structured_generator
+
+    system_prompt = _load_system_prompt()
+    backend = OpenAIBackend.from_settings()
+    generate_fn = (
+        make_live_structured_generator(backend, system_prompt)
+        if structured
+        else make_live_generator(backend, system_prompt)
+    )
+
+    print("\nDeterminism probe (live only -- see eval.determinism):")
+    judge = (
+        make_judge(
+            execute_fn,
+            reference="live" if reference == "live" else "stored",
+            options=ComparisonOptions(tolerance=float_tolerance)
+            if float_tolerance is not None else None,
+        )
+        if execute_fn is not None else None
+    )
+    report = probe_determinism(
+        generate_fn, cases, endpoint=backend.name, repeats=repeats, judge=judge
+    )
+    print(render_determinism_text(report))
+
+    if out:
+        save_determinism_json(report, out)
+        print(f"Determinism report written to {out}")
+
+
+def _refuse_offline_reference() -> None:
+    """Raise the explicit refusal for ``--reference live`` without ``--live``.
+
+    Raises
+    ------
+    ValueError
+        Always. Offline mode has no database: its "executor" serves each
+        case's recorded rows, so running the reference query through it
+        would compare a recorded answer with itself and report 100%
+        unconditionally.
+    """
+    raise ValueError(
+        "--reference live requires --live: offline mode has no database, its executor "
+        "replays each case's recorded expected_rows, so the reference result would be "
+        "compared with itself and every case would pass by construction. Pass --live to "
+        "run the reference queries against the real warehouse."
+    )
+
+
+def _percent(text: str) -> float:
+    """``argparse`` type for a percentage between 0 and 100.
+
+    Args:
+        text: The command-line value.
+
+    Returns:
+        The value as a float.
+
+    Raises:
+        argparse.ArgumentTypeError: If *text* is not a number in ``[0, 100]``.
+
+    Examples:
+        >>> _percent("92.5")
+        92.5
+        >>> _percent("101")
+        Traceback (most recent call last):
+            ...
+        argparse.ArgumentTypeError: must be a percentage between 0 and 100 (got '101')
+    """
+    try:
+        value = float(text)
+    except ValueError:
+        value = float("nan")
+    if not (0.0 <= value <= 100.0):  # also rejects nan
+        raise argparse.ArgumentTypeError(
+            f"must be a percentage between 0 and 100 (got {text!r})"
+        )
+    return value
+
+
+def _print_floor_failures(messages: Sequence[str]) -> None:
+    """Print the absolute-floor violations under a header of their own."""
+    print("\nBELOW ABSOLUTE ACCURACY FLOOR:")
+    for message in messages:
+        print(f"  - {message}")
+
+
+def _pipeline_refusal(args: argparse.Namespace) -> str | None:
+    """Why ``--single-shot`` / ``--structured`` cannot be honoured, or ``None``."""
+    if args.single_shot and not args.live:
+        return "--single-shot only applies with --live (offline replay has no model)"
+    if args.structured and args.live and not args.single_shot:
+        return (
+            "--structured needs --single-shot: the constrained-JSON generator makes one "
+            "call and has no correction loop, so it cannot be the production pipeline"
+        )
+    return None
+
+
+def _share_refusal(args: argparse.Namespace) -> str | None:
+    """Why ``--share`` / ``--share-redact-literals`` cannot be honoured, or ``None``.
+
+    A share bundle carries a diagnosis of how each answer differs from its
+    reference, which only a ``--live --reference live`` run has: offline
+    replay is right by construction, and a stored fingerprint cannot say
+    *how* a result differs. Checked before anything is loaded or run, so a
+    wrong command line costs nothing.
+    """
+    if args.share_redact_literals and not args.share:
+        return "--share-redact-literals only applies together with --share PATH"
+    if args.share_only_ids and not args.share:
+        return "--share-only-ids only applies together with --share PATH"
+    if not args.share:
+        return None
+    if not (args.live and args.reference == "live"):
+        return (
+            "--share requires --live --reference live: the share file diagnoses how each "
+            "generated result differs from its live reference, and offline replay or a "
+            "stored fingerprint has no such result to compare. "
+            "Run: python -m eval.cli run --golden FILE --live --reference live --share PATH"
+        )
+    from eval.share import check_share_path
+
+    problem = check_share_path(args.share)
+    if problem is None and args.out and Path(args.out).resolve() == Path(args.share).resolve():
+        problem = "--share and --out must be different files"
+    return problem
+
+
+def _model_name(args: argparse.Namespace) -> str:
+    """The name of the model that generates SQL: the router's primary in the production pipeline."""
+    if not args.single_shot:
+        try:
+            from llm.router import LLMRouter, TaskType
+
+            return str(LLMRouter.from_settings()._chain_for(TaskType.SQL_GENERATION)[0].name)
+        except Exception:  # noqa: BLE001 - the header falls back to the plain setting
+            pass
+    return str(cfg.settings.openai_model)
+
+
+def _collect_run_info(args: argparse.Namespace) -> dict[str, object]:
+    """The header facts of a share bundle, read from the live configuration.
+
+    Imported lazily like the other live wiring. Holds the model *name* (never
+    the endpoint, host or key), the prompt prefix version and, for each data
+    source, whether its questions take the static-prefix or the retrieval
+    path. Tests replace this function.
+    """
+    from core.version import __version__
+    from database.datasources import datasource_names
+    from prompt_engine.static_prefix import prefix_version, should_use_static_prefix
+
+    system_prompt = _load_system_prompt()
+    return {
+        "app_version": __version__,
+        "prefix_version": prefix_version(system_prompt),
+        "model": _model_name(args),
+        "prompt_retrieval_token_budget": cfg.settings.prompt_retrieval_token_budget,
+        "sources": {
+            name: "static" if should_use_static_prefix(system_prompt, name) else "retrieval"
+            for name in datasource_names()
+        },
+        "structured": bool(args.structured),
+        "float_tolerance": args.float_tolerance,
+    }
+
+
+def _read_detail_ids(args: argparse.Namespace, cases: Sequence[GoldenCase]) -> set[str]:
+    """The ids of ``--share-only-ids FILE``; a typo costs a warning, not the run."""
+    from eval.rounds import read_case_ids
+
+    ids = set(read_case_ids(args.share_only_ids))
+    unknown = ids - {c.id for c in cases}
+    if unknown:
+        print(
+            f"warning: {len(unknown)} id(s) in {Path(args.share_only_ids).name} are not in "
+            "the golden file and are ignored",
+            file=sys.stderr,
+        )
+    return ids
+
+
+def describe_not_scored(cases: Sequence[GoldenCase]) -> str | None:
+    """One line saying how many cases of the file were not scored, and why.
+
+    A case that is not ``active`` is skipped by the runner; the line keeps that
+    from being silent. An ``excluded`` case is broken down by its reason.
+
+    Examples
+    --------
+    >>> cases = [
+    ...     GoldenCase(id="a", question="q", expected_sql="SELECT 1"),
+    ...     GoldenCase(id="b", question="q", status="excluded", exclusion_reason="load_fidelity"),
+    ...     GoldenCase(id="c", question="q", status="excluded", exclusion_reason="load_fidelity"),
+    ...     GoldenCase(id="d", question="q", status="pending_expected"),
+    ... ]
+    >>> describe_not_scored(cases)
+    'Not scored: 3 of 4 case(s) -- excluded 2 (load_fidelity: 2), pending_expected 1'
+    >>> describe_not_scored(cases[:1]) is None
+    True
+    """
+    skipped = [c for c in cases if not c.is_runnable]
+    if not skipped:
+        return None
+    parts: list[str] = []
+    for status in sorted({c.status for c in skipped}):
+        group = [c for c in skipped if c.status == status]
+        if status == "excluded":
+            reasons: dict[str, int] = {}
+            for case in group:
+                reasons[case.exclusion_reason or "?"] = reasons.get(case.exclusion_reason or "?", 0) + 1
+            detail = ", ".join(f"{r}: {n}" for r, n in sorted(reasons.items()))
+            parts.append(f"excluded {len(group)} ({detail})")
+        else:
+            parts.append(f"{status} {len(group)}")
+    return f"Not scored: {len(skipped)} of {len(cases)} case(s) -- " + ", ".join(parts)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _run(args: argparse.Namespace) -> int:
+    """Execute the ``run`` subcommand. Returns the process exit code."""
+    from eval.runner import SourceTrace, run_golden_set
+
+    refusal = _pipeline_refusal(args) or _share_refusal(args)
+    if refusal is not None:
+        print(f"error: {refusal}", file=sys.stderr)
+        return 2
+    if args.determinism and not args.live:
+        _refuse_offline_determinism()
+    if args.reference == "live" and not args.live:
+        _refuse_offline_reference()
+
+    cases = load_golden_cases(args.golden)
+    # Only active cases are replayed, determinism-probed or counted; a
+    # pending/reviewed case must not trip the offline fixture's
+    # duplicate-question check either.
+    runnable = [c for c in cases if c.is_runnable]
+
+    # Read before anything is built or run, so a configuration problem costs nothing.
+    run_info = _collect_run_info(args) if args.share else {}
+    try:
+        detail_ids = _read_detail_ids(args, cases) if args.share_only_ids else None
+    except (OSError, ValueError) as exc:
+        print(f"error: --share-only-ids: {exc}", file=sys.stderr)
+        return 2
+    pipeline = ("single_shot" if args.single_shot else "production") if args.live else None
+
+    trace: SourceTrace | None = None
+    if args.live:
+        trace = SourceTrace()
+        generate_fn, execute_fn = _build_live_callables(
+            structured=args.structured, trace=trace, single_shot=args.single_shot
+        )
+        mode = "live"
+    else:
+        generate_fn, execute_fn = _build_offline_callables(runnable)
+        mode = "offline"
+
+    started_at = _now_iso()
+    results = run_golden_set(
+        cases,
+        generate_fn,
+        execute_fn,
+        reference=args.reference,
+        options=ComparisonOptions(tolerance=args.float_tolerance),
+        source_trace=trace,
+    )
+    finished_at = _now_iso()
+    report = build_report(
+        results, mode=mode, reference=args.reference, pipeline=pipeline,
+    )
+
+    print(render_text(report))
+    not_scored = describe_not_scored(cases)
+    if not_scored:
+        print(not_scored)
+
+    if args.live and runnable:
+        _print_prefix_cache_probe(runnable[0].question)
+
+    if args.determinism:
+        _print_determinism_probe(
+            runnable,
+            structured=args.structured,
+            repeats=args.determinism_repeats,
+            out=args.determinism_out,
+            reference=args.reference,
+            float_tolerance=args.float_tolerance,
+            execute_fn=execute_fn,
+        )
+
+    if args.out:
+        save_json_report(report, args.out)
+        print(f"\nJSON report written to {args.out}")
+
+    if args.share:
+        from eval.share import build_share_bundle, write_share_bundle
+
+        bundle = build_share_bundle(
+            report,
+            cases,
+            golden_path=args.golden,
+            run_info=run_info,
+            started_at=started_at,
+            finished_at=finished_at,
+            redact_literals=args.share_redact_literals,
+            detail_ids=detail_ids,
+        )
+        write_share_bundle(bundle, args.share)
+        literals = "redacted" if args.share_redact_literals else "verbatim"
+        scope = (
+            "" if detail_ids is None
+            else f"; full detail for {bundle['detail']['cases_with_detail']} of "
+                 f"{bundle['detail']['cases_total']} cases"
+        )
+        print(
+            f"Share file written to {args.share} (pipeline {pipeline}; SQL literals "
+            f"{literals}{scope}; no result values)"
+        )
+
+    if args.save_baseline:
+        save_baseline(report, args.save_baseline)
+        print(f"Baseline saved to {args.save_baseline}")
+
+    thresholds = BaselineThresholds(
+        max_accuracy_drop_pct=args.max_accuracy_drop_pct,
+        max_latency_p95_increase_pct=args.max_latency_p95_increase_pct,
+        max_guard_rejection_increase=args.max_guard_rejection_increase,
+        min_accuracy_pct=args.min_accuracy,
+        min_source_accuracy_pct=args.min_source_accuracy,
+    )
+
+    if args.baseline:
+        baseline_report = load_baseline(args.baseline)
+        comparison = compare_to_baseline(report, baseline_report, thresholds)
+        if comparison.messages:
+            print("\nREGRESSION DETECTED versus baseline:")
+            for message in comparison.messages:
+                print(f"  - {message}")
+        else:
+            print("\nNo regression versus baseline.")
+        if comparison.floor_messages:
+            _print_floor_failures(comparison.floor_messages)
+        for source, delta in comparison.source_deltas_pct.items():
+            print(f"  source {source}: execution accuracy {delta:+.2f} points versus baseline")
+        if comparison.source_selection_delta_pct is not None:
+            print(
+                "  source-selection accuracy "
+                f"{comparison.source_selection_delta_pct:+.2f} points versus baseline"
+            )
+        return exit_code(comparison)
+
+    # No baseline was supplied: there is nothing to regress against, so the
+    # report is the whole job unless an absolute floor is set, which needs
+    # no baseline.
+    floor_failures = check_absolute_floors(report, thresholds)
+    if floor_failures:
+        _print_floor_failures(floor_failures)
+        return 1
+    if args.min_accuracy is not None or args.min_source_accuracy is not None:
+        print("\nAbsolute accuracy floors met.")
+    return 0
+
+
+def _verify(
+    args: argparse.Namespace,
+    executor_factory: Callable[[], ExecuteFn] | None = None,
+) -> int:
+    """Execute the ``verify`` subcommand. Returns the process exit code.
+
+    ``0`` when every examined case's reference held up, ``1`` when any
+    had a problem. Prints counts and case ids only -- never a question or
+    a row.
+    """
+    from eval.verify import render_verify_text, verify_cases
+
+    cases = load_golden_cases(args.golden)
+    execute_fn = (executor_factory or _build_executor)()
+    result = verify_cases(cases, execute_fn, accept=args.accept, refresh=args.refresh)
+
+    written = False
+    if result.changed and not args.dry_run:
+        write_golden_cases(args.golden, result.cases, backup=True)
+        written = True
+    print(render_verify_text(result, accept=args.accept, written=written))
+    return 1 if result.problems else 0
+
+
+def _bench_import(args: argparse.Namespace) -> int:
+    """Execute ``bench-import bird``. Returns the process exit code.
+
+    ``0`` when everything was loaded, checked and written; ``2`` for a refusal
+    or an unusable input (a non-empty schema without ``--replace``, a missing
+    package, a bad ``--dbs``); ``1`` when a row count differs from the source or
+    the inspector could not draft a configuration.
+    """
+    from eval.benchmarks.bird_config import inspector_runner
+    from eval.benchmarks.bird_import import (
+        ImportOptions,
+        LoadMismatch,
+        render_import_report,
+        run_import,
+    )
+    from eval.benchmarks.sqlite_load import SchemaNotEmpty, create_target_engine
+
+    if not args.target_url and not args.datasource:
+        print("error: give --target-url (an administrator login) or --datasource", file=sys.stderr)
+        return 2
+    target_url = args.target_url
+    if target_url and target_url.startswith("env:"):
+        # env:NAME keeps the administrator password out of the command line and the shell history.
+        target_url = os.environ.get(target_url[4:], "")
+        if not target_url:
+            print(f"error: --target-url {args.target_url} names an empty or unset variable", file=sys.stderr)
+            return 2
+    options = ImportOptions(
+        source=Path(args.source),
+        out=Path(args.out),
+        dbs=tuple(d.strip() for d in args.dbs.split(",") if d.strip()) if args.dbs else None,
+        replace=args.replace,
+        skip_load=args.skip_load,
+        descriptions=args.descriptions,
+        with_evidence=args.with_evidence,
+        exclude_semantic_difference=args.exclude_semantic_difference,
+        allow_ci_collation=args.allow_ci_collation,
+        skip_config=args.skip_config,
+        base_config=Path(args.base_config) if args.base_config else None,
+        max_rows=args.max_rows if args.max_rows is not None else cfg.settings.max_rows_returned,
+        query_timeout=args.query_timeout,
+        chunk_size=args.chunk_size,
+    )
+    owns_engine = bool(target_url)
+    if target_url:
+        engine = create_target_engine(target_url, fast_executemany=not args.no_fast_executemany)
+    else:
+        print(
+            "warning: --datasource without --target-url loads through the application's own login; "
+            "that login needs DDL rights, which the application's read-only login must not have "
+            "(runbook 18.7). Use --target-url with an administrator login.",
+            file=sys.stderr,
+        )
+        from database.connection import get_engine
+
+        engine = get_engine(args.datasource)
+    try:
+        report = run_import(
+            options, engine,
+            inspect=None if args.skip_config else inspector_runner(args.datasource),
+            progress=lambda message: print(message, file=sys.stderr),
+        )
+    except LoadMismatch as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except (SchemaNotEmpty, FileNotFoundError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        if owns_engine:
+            engine.dispose()
+    print(render_import_report(report))
+    broken = [n for n, c in report.configs.items() if c.get("inspector_exit") != 0]
+    if broken:
+        print(f"error: the schema inspector failed for: {', '.join(sorted(broken))}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _bench_run(args: argparse.Namespace) -> int:
+    """Execute ``bench-run bird``. Returns the process exit code.
+
+    Runs ``run --live --reference stored`` once per database (or once, for
+    ``--mode combined``) with ``PROJECT_CONFIG_DIR`` set to that configuration,
+    then merges the reports. ``0`` when a merged report was written, ``1`` when
+    a run produced no report, ``2`` for unusable input.
+    """
+    from eval.benchmarks.bird_run import (
+        merge_reports,
+        plan_runs,
+        read_import_report,
+        run_plans,
+        run_subprocess,
+        write_merged,
+    )
+    from eval.report import render_text
+
+    mode = "combined" if args.mode == "combined" else "per_db"
+    dbs = [d.strip() for d in args.dbs.split(",") if d.strip()] if args.dbs else None
+    bench = Path(args.bench)
+    try:
+        plans = plan_runs(bench, mode=mode, evidence=args.evidence, dbs=dbs, label=args.label)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    run_args = [a for a in args.run_args if a != "--"]
+    if not args.merge_only:
+        failed = run_plans(
+            plans, lambda plan: run_subprocess(plan, run_args),
+            progress=lambda message: print(message, file=sys.stderr),
+        )
+        if failed:
+            print(
+                "error: no report for: " + ", ".join(p.label for p in failed)
+                + " (merging only what exists)",
+                file=sys.stderr,
+            )
+    existing = [p.report for p in plans if p.report.is_file()]
+    try:
+        merged = merge_reports(
+            existing, mode=mode, evidence=args.evidence, import_report=read_import_report(bench)
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    json_path, text_path = write_merged(merged, plans[0].report.parent)
+    print(render_text(merged))
+    print(f"\nMerged report: {json_path} (text: {text_path})")
+    return 1 if len(existing) < len(plans) else 0
+
+
+def _recall(args: argparse.Namespace) -> int:
+    """Execute the ``recall`` subcommand. Returns the process exit code.
+
+    ``0`` normally; ``1`` when ``--min-recall`` is given and the mean recall
+    is below it, or when no case could be scored at all (a recall of ``0.0``
+    over zero cases must not read as a pass).
+    """
+    cases = load_golden_cases(args.golden)
+    report = evaluate_recall(cases, token_budget=args.token_budget)
+
+    if args.json:
+        print(report_to_json(report))
+    else:
+        print(render_recall_text(report, all_cases=args.all_cases))
+
+    if args.out:
+        Path(args.out).write_text(report_to_json(report) + "\n", encoding="utf-8")
+        if not args.json:
+            print(f"\nJSON report written to {args.out}")
+
+    if report.scored == 0:
+        print("No case could be scored.", file=sys.stderr)
+        return 1
+    if args.min_recall is not None and report.mean_recall < args.min_recall:
+        print(
+            f"Mean recall {report.mean_recall:.4f} is below --min-recall {args.min_recall:g}.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def _split(args: argparse.Namespace) -> int:
+    """Execute the ``split`` subcommand: write the dev / test id files.
+
+    ``0`` on success, ``2`` when an output path is refused or the split files
+    already exist with other content (the held-out half must not move between
+    rounds; ``--force`` replaces them on purpose).
+    """
+    import json
+
+    from eval.share import check_share_path, golden_file_info
+    from eval.split import split_cases
+    from eval.store import write_text_atomic
+
+    out_dir = Path(args.out)
+    targets = {name: out_dir / name for name in ("dev_ids.txt", "test_ids.txt", "split.json")}
+    for target in targets.values():
+        problem = check_share_path(target, what="split files")
+        if problem is not None:
+            print(f"error: {problem}", file=sys.stderr)
+            return 2
+
+    try:
+        cases = load_golden_cases(args.golden)
+        result = split_cases(cases)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    texts = {
+        "dev_ids.txt": "".join(f"{i}\n" for i in result.dev_ids),
+        "test_ids.txt": "".join(f"{i}\n" for i in result.test_ids),
+    }
+    summary = {
+        "golden": golden_file_info(args.golden),
+        "rule": (
+            "within each tags[0] category, case ids sorted ascending; even positions to dev, "
+            "odd positions to test"
+        ),
+        "counts": result.counts,
+        "categories": result.categories,
+    }
+    texts["split.json"] = json.dumps(summary, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+
+    if not args.force:
+        changed = [
+            name for name in ("dev_ids.txt", "test_ids.txt")
+            if targets[name].exists()
+            and targets[name].read_text(encoding="utf-8").replace("\r\n", "\n") != texts[name]
+        ]
+        if changed:
+            print(
+                f"error: {', '.join(changed)} already exist in {out_dir} with other content. "
+                "The test half must stay fixed between rounds; pass --force only to start a "
+                "new held-out set on purpose.",
+                file=sys.stderr,
+            )
+            return 2
+    for name, text in texts.items():
+        write_text_atomic(targets[name], text)
+
+    counts = result.counts
+    print(f"Split of {args.golden}: {counts['total']} cases -> {counts['dev']} dev, {counts['test']} test")
+    for category, halves in result.categories.items():
+        print(f"  {category:<24s} dev {halves['dev']:>3d}   test {halves['test']:>3d}")
+    print(f"Written to {out_dir}: dev_ids.txt, test_ids.txt, split.json")
+    return 0
+
+
+def _compare(args: argparse.Namespace) -> int:
+    """Execute the ``compare`` subcommand. Returns the process exit code.
+
+    ``0`` normally; ``1`` with ``--fail-on-regression`` when any compared
+    case regressed (with ``--split test``, a regression in the held-out
+    half); ``2`` when an input cannot be read.
+    """
+    import json
+
+    from eval.rounds import (
+        PipelineMismatch,
+        compare_runs,
+        load_run,
+        read_case_ids,
+        render_comparison,
+    )
+
+    if bool(args.split) != bool(args.split_file):
+        print("error: --split and --split-file go together", file=sys.stderr)
+        return 2
+    try:
+        old = load_run(args.old)
+        new = load_run(args.new)
+        only_ids = read_case_ids(args.split_file, args.split) if args.split else None
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        comparison = compare_runs(
+            old, new, only_ids=only_ids, split=args.split, allow_mixed=args.allow_mixed
+        )
+    except PipelineMismatch as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(comparison.to_dict(), indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        print(render_comparison(comparison))
+    if args.fail_on_regression and comparison.regressed:
+        where = f" in {args.split}" if args.split else ""
+        print(
+            f"REGRESSION{where}: {len(comparison.regressed)} case(s) passed before and fail now",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the ``eval.cli`` argument parser.
+
+    Returns
+    -------
+    argparse.ArgumentParser
+
+    Examples
+    --------
+    >>> parser = build_parser()
+    >>> args = parser.parse_args(["run", "--golden", "golden.jsonl"])
+    >>> args.golden
+    'golden.jsonl'
+    >>> args.live
+    False
+    """
+    parser = argparse.ArgumentParser(
+        prog="python -m eval.cli",
+        description="Run the NL->SQL golden-set evaluation harness.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    run_parser = subparsers.add_parser("run", help="Run a golden set and report results.")
+    run_parser.add_argument(
+        "--golden", required=True, help="Path to a golden.jsonl file."
+    )
+    run_parser.add_argument(
+        "--live",
+        action="store_true",
+        default=False,
+        help="Use a real OpenAI-compatible backend and database connection instead of offline replay.",
+    )
+    run_parser.add_argument(
+        "--single-shot",
+        action="store_true",
+        default=False,
+        dest="single_shot",
+        help=(
+            "With --live, make ONE model call per question and no correction (the old "
+            "behaviour): a model-only figure. Without it --live generates through the "
+            "server's own loop (SQLAgent: guard, correction rounds with hints, row cap, "
+            "query timeout), which is what an analyst gets. The mode is recorded in the "
+            "report (pipeline) and the share file (run.pipeline); a baseline or a "
+            "comparison across the two is refused. No principal policy "
+            "(denied columns) is applied in either mode. Requires --live."
+        ),
+    )
+    run_parser.add_argument(
+        "--structured",
+        action="store_true",
+        default=False,
+        help=(
+            "With --live --single-shot, use Phase 2 task 3's constrained-JSON generation "
+            "path (llm.structured_schema.SQL_GENERATION_SCHEMA) instead of free text + "
+            "clean_sql. Ignored without --live; refused with --live unless --single-shot."
+        ),
+    )
+    run_parser.add_argument(
+        "--determinism",
+        action="store_true",
+        default=False,
+        help=(
+            "Run the determinism probe (eval.determinism): generate every golden "
+            "question several times and report how often the SQL comes back "
+            "byte-identical. Requires --live -- offline replay is refused outright, "
+            "since it would report 100%% determinism unconditionally (see "
+            "eval/determinism.py's module docstring)."
+        ),
+    )
+    run_parser.add_argument(
+        "--determinism-repeats",
+        type=int,
+        default=DEFAULT_DETERMINISM_REPEATS,
+        dest="determinism_repeats",
+        help=(
+            "Number of times to generate each golden question for the determinism "
+            "probe. Must be at least 2 (a single draw has nothing to compare "
+            "against). Ignored without --determinism."
+        ),
+    )
+    run_parser.add_argument(
+        "--determinism-out",
+        default=None,
+        dest="determinism_out",
+        help="Path to save the determinism probe's report as JSON. Ignored without --determinism.",
+    )
+    run_parser.add_argument(
+        "--reference",
+        choices=("stored", "live"),
+        default="stored",
+        help=(
+            "How a --live run decides a result is right. 'stored' (default) compares "
+            "the result's fingerprint with the case's recorded expected_fingerprint. "
+            "'live' executes each case's expected_sql in the same run and compares the "
+            "two results (eval.compare: rows as a multiset, column names ignored, row "
+            "order only when the reference has ORDER BY with TOP/OFFSET, numeric "
+            "tolerance, NULL equals NULL) -- use it against a warehouse whose data "
+            "changes, where a recorded fingerprint goes stale. A baseline can only be "
+            "compared with a run that used the same reference. Requires --live."
+        ),
+    )
+    run_parser.add_argument(
+        "--float-tolerance",
+        type=float,
+        default=ComparisonOptions().tolerance,
+        dest="float_tolerance",
+        help=(
+            "With --reference live: relative tolerance for numbers that are not both "
+            "integers (|a-b| <= tol * max(1, |a|, |b|)). Integers always compare "
+            "exactly. Default %(default)g; 0 demands exact equality."
+        ),
+    )
+    run_parser.add_argument(
+        "--baseline",
+        default=None,
+        help="Path to a baseline JSON file to compare this run against (non-zero exit on regression).",
+    )
+    run_parser.add_argument(
+        "--save-baseline",
+        default=None,
+        help="Path to save this run's report as a new baseline JSON file.",
+    )
+    run_parser.add_argument(
+        "--out",
+        default=None,
+        help="Path to save this run's full JSON report.",
+    )
+    run_parser.add_argument(
+        "--max-accuracy-drop-pct",
+        type=float,
+        default=cfg.settings.eval_max_accuracy_drop_pct,
+        dest="max_accuracy_drop_pct",
+        help=(
+            "Maximum tolerated accuracy drop, in percentage points, versus the "
+            "baseline. Defaults to config.Settings.eval_max_accuracy_drop_pct "
+            "(env EVAL_MAX_ACCURACY_DROP_PCT)."
+        ),
+    )
+    run_parser.add_argument(
+        "--max-latency-p95-increase-pct",
+        type=float,
+        default=cfg.settings.eval_max_latency_p95_increase_pct,
+        dest="max_latency_p95_increase_pct",
+        help=(
+            "Maximum tolerated relative increase in latency p95 versus the "
+            "baseline. Defaults to config.Settings.eval_max_latency_p95_increase_pct "
+            "(env EVAL_MAX_LATENCY_P95_INCREASE_PCT)."
+        ),
+    )
+    run_parser.add_argument(
+        "--max-guard-rejection-increase",
+        type=int,
+        default=cfg.settings.eval_max_guard_rejection_increase,
+        dest="max_guard_rejection_increase",
+        help=(
+            "Maximum tolerated increase in guard-rejected cases versus the "
+            "baseline. Defaults to config.Settings.eval_max_guard_rejection_increase "
+            "(env EVAL_MAX_GUARD_REJECTION_INCREASE)."
+        ),
+    )
+    run_parser.add_argument(
+        "--min-accuracy",
+        type=_percent,
+        default=cfg.settings.eval_min_accuracy,
+        dest="min_accuracy",
+        metavar="PCT",
+        help=(
+            "Absolute floor (0-100) on overall execution accuracy: the run fails "
+            "(exit 1) when accuracy is below it, with or without --baseline. Off "
+            "unless set. Defaults to config.Settings.eval_min_accuracy (env "
+            "EVAL_MIN_ACCURACY). Only meaningful with --live."
+        ),
+    )
+    run_parser.add_argument(
+        "--min-source-accuracy",
+        type=_percent,
+        default=cfg.settings.eval_min_source_accuracy,
+        dest="min_source_accuracy",
+        metavar="PCT",
+        help=(
+            "Absolute floor (0-100) on each data source's execution accuracy: the "
+            "run fails when any source is below it, or when the run has no "
+            "per-source figures to check. Off unless set. Defaults to "
+            "config.Settings.eval_min_source_accuracy (env EVAL_MIN_SOURCE_ACCURACY). "
+            "Only meaningful with --live."
+        ),
+    )
+    run_parser.add_argument(
+        "--share",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Also write a share-safe JSON bundle to PATH: per case the question, both SQL "
+            "texts, the status and a value-free diagnosis of how the result differs from "
+            "the reference (a class, row and column counts, column names), plus a summary. "
+            "No result rows or cell values, credentials, endpoints or principal ids; error "
+            "text is redacted. Requires --live --reference live. PATH must be outside the "
+            "repository checkout or under its git-ignored eval_data/; the file is "
+            "owner-only (runbook 18.6)."
+        ),
+    )
+    run_parser.add_argument(
+        "--share-redact-literals",
+        action="store_true",
+        default=False,
+        dest="share_redact_literals",
+        help=(
+            "With --share: replace every string and numeric literal in the generated and "
+            "expected SQL with a placeholder. Without it the SQL is kept verbatim, because "
+            "diagnosing a wrong filter needs the filter."
+        ),
+    )
+    run_parser.add_argument(
+        "--share-only-ids",
+        default=None,
+        metavar="FILE",
+        dest="share_only_ids",
+        help=(
+            "With --share: a file of case ids (dev_ids.txt from 'split': one id per "
+            "line, or a JSON list). Only those cases carry the question, SQL, error "
+            "text and diagnosis in the share file; every other case carries only "
+            "case_id, tags, passed and mismatch_class, and the summary still covers "
+            "all cases. Use it so the held-out half's content never leaves the server."
+        ),
+    )
+    run_parser.set_defaults(func=_run)
+
+    verify_parser = subparsers.add_parser(
+        "verify",
+        help=(
+            "Run each reviewed case's expected_sql read-only against the database, "
+            "report failures and record expected_rows / expected_fingerprint."
+        ),
+    )
+    verify_parser.add_argument(
+        "--golden", required=True, help="Path to the golden.jsonl file to verify (rewritten in place)."
+    )
+    verify_parser.add_argument(
+        "--accept",
+        action="store_true",
+        default=False,
+        help=(
+            "Move 'reviewed' cases that passed to 'active' so the regression gate runs "
+            "them. Without it the recorded rows are written but statuses stay."
+        ),
+    )
+    verify_parser.add_argument(
+        "--refresh",
+        action="store_true",
+        default=False,
+        help=(
+            "Also overwrite the recorded expected_rows / expected_fingerprint of "
+            "'active' cases that already have them (by default only missing ones are filled)."
+        ),
+    )
+    verify_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        dest="dry_run",
+        help="Report only; do not rewrite the golden file.",
+    )
+    verify_parser.set_defaults(func=_verify)
+
+    recall_parser = subparsers.add_parser(
+        "recall",
+        help=(
+            "Measure table-selection recall offline (no LLM, no database): the "
+            "share of each case's expected_sql tables that retrieval puts in the prompt."
+        ),
+    )
+    recall_parser.add_argument(
+        "--golden", required=True, help="Path to a golden.jsonl file."
+    )
+    recall_parser.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Print the full report as JSON instead of the text summary.",
+    )
+    recall_parser.add_argument(
+        "--out",
+        default=None,
+        help="Also write the full JSON report to this path.",
+    )
+    recall_parser.add_argument(
+        "--all-cases",
+        action="store_true",
+        default=False,
+        dest="all_cases",
+        help="List every scored case in the text summary, not only those that missed a table.",
+    )
+    recall_parser.add_argument(
+        "--min-recall",
+        type=float,
+        default=None,
+        dest="min_recall",
+        help="Exit non-zero when the mean recall is below this value (0 to 1).",
+    )
+    recall_parser.add_argument(
+        "--token-budget",
+        type=int,
+        default=None,
+        dest="token_budget",
+        help=(
+            "Estimated schema tokens a retrieved set may take before the in-budget recall "
+            "counts the case as 0. Defaults to PROMPT_RETRIEVAL_TOKEN_BUDGET."
+        ),
+    )
+    recall_parser.set_defaults(func=_recall)
+
+    bench_import = subparsers.add_parser(
+        "bench-import",
+        help=(
+            "Benchmark track: load a public text-to-SQL benchmark into your own SQL Server and "
+            "write its golden files and per-database configurations. Not the deployment's accuracy."
+        ),
+    )
+    bench_import_kinds = bench_import.add_subparsers(dest="benchmark", required=True)
+    bird = bench_import_kinds.add_parser("bird", help="BIRD mini-dev (500 questions, 11 databases).")
+    bird.add_argument("--source", required=True, help="The unpacked BIRD mini-dev package.")
+    bird.add_argument("--out", required=True, help="Output directory (golden files, configurations, report).")
+    bird.add_argument(
+        "--target-url", default=None, metavar="URL", dest="target_url",
+        help=(
+            "SQLAlchemy URL of the benchmark database, with an administrator login that may "
+            "create schemas and tables. NOT the application's read-only login. 'env:NAME' reads "
+            "the URL from that environment variable, keeping the password off the command line."
+        ),
+    )
+    bird.add_argument(
+        "--datasource", default=None, metavar="NAME",
+        help=(
+            "A data source of datasources.yaml: the application's login through which each "
+            "configuration is drafted (the inspector). Without --target-url it is also the load "
+            "target, which needs DDL rights and is not recommended."
+        ),
+    )
+    bird.add_argument("--dbs", default=None, metavar="a,b", help="Only these db_ids (default: all).")
+    bird.add_argument(
+        "--descriptions", action="store_true", default=False,
+        help="Add the dataset's column descriptions to schema.yaml (a curated configuration).",
+    )
+    bird.add_argument(
+        "--with-evidence", action="store_true", default=False, dest="with_evidence",
+        help="Also write golden.with_evidence.jsonl: the annotators' hint appended to each question.",
+    )
+    bird.add_argument(
+        "--replace", action="store_true", default=False,
+        help="Drop the tables of a schema that already holds some, then load again.",
+    )
+    bird.add_argument(
+        "--skip-load", action="store_true", default=False, dest="skip_load",
+        help="The schemas are already loaded: compare their row counts with the source and go on.",
+    )
+    bird.add_argument(
+        "--exclude-semantic-difference", action="store_true", default=False,
+        dest="exclude_semantic_difference",
+        help=(
+            "Remove the questions whose transpiled reference returned another result on the copy "
+            "although every table it reads is identical (a dialect-semantics difference). By default "
+            "they stay in, flagged and listed; the report gives the accuracy with and without them."
+        ),
+    )
+    bird.add_argument(
+        "--allow-ci-collation", action="store_true", default=False, dest="allow_ci_collation",
+        help=(
+            "Import into a database whose collation is not case- and accent-sensitive. Refused by "
+            "default: SQLite compares text case-sensitively, so such a database makes some correct "
+            "answers differ from the reference. The report flags it prominently."
+        ),
+    )
+    bird.add_argument(
+        "--skip-config", action="store_true", default=False, dest="skip_config",
+        help="Do not draft any project_config/.",
+    )
+    bird.add_argument(
+        "--base-config", default=None, metavar="DIR", dest="base_config",
+        help="Where system_prompt.md and the policies are copied from (default: project_config.example).",
+    )
+    bird.add_argument(
+        "--max-rows", type=int, default=None, dest="max_rows",
+        help="Row cap: a reference with this many rows is excluded (default: MAX_ROWS_RETURNED).",
+    )
+    bird.add_argument(
+        "--query-timeout", type=float, default=60.0, dest="query_timeout",
+        help="Seconds a reference query may run, on SQLite and on the copy (default %(default)g).",
+    )
+    bird.add_argument(
+        "--chunk-size", type=int, default=5000, dest="chunk_size", help="Rows per insert batch (default %(default)d).",
+    )
+    bird.add_argument(
+        "--no-fast-executemany", action="store_true", default=False, dest="no_fast_executemany",
+        help="Do not set pyodbc's fast_executemany on the target engine.",
+    )
+    bird.set_defaults(func=_bench_import)
+
+    bench_run = subparsers.add_parser(
+        "bench-run",
+        help="Benchmark track: run an imported benchmark through the production pipeline and merge the reports.",
+    )
+    bench_run_kinds = bench_run.add_subparsers(dest="benchmark", required=True)
+    bird_run = bench_run_kinds.add_parser("bird", help="BIRD mini-dev.")
+    bird_run.add_argument("--bench", required=True, help="The --out directory of bench-import.")
+    bird_run.add_argument(
+        "--mode", choices=("per-db", "combined"), default="per-db",
+        help=(
+            "per-db: one configuration per database, merged (default). combined: one configuration "
+            "over every schema, a separate and harder measurement."
+        ),
+    )
+    bird_run.add_argument(
+        "--evidence", action="store_true", default=False,
+        help="Use golden.with_evidence.jsonl (the ablation).",
+    )
+    bird_run.add_argument("--dbs", default=None, metavar="a,b", help="Only these databases (per-db mode).")
+    bird_run.add_argument(
+        "--label", default=None, metavar="NAME",
+        help=(
+            "Folder under runs/ for this run's reports (default: per_db, per_db-evidence, combined). "
+            "Give each model or setting you compare its own, or the next run replaces this one."
+        ),
+    )
+    bird_run.add_argument(
+        "--merge-only", action="store_true", default=False, dest="merge_only",
+        help="Do not run anything; merge the per-database reports that exist.",
+    )
+    bird_run.add_argument(
+        "run_args", nargs=argparse.REMAINDER,
+        help="After --: extra arguments for each 'run' (for example --single-shot).",
+    )
+    bird_run.set_defaults(func=_bench_run)
+
+    split_parser = subparsers.add_parser(
+        "split",
+        help=(
+            "Write a deterministic dev / test split of a golden set: within each tags[0] "
+            "category, ids sorted, even positions to dev, odd to test."
+        ),
+    )
+    split_parser.add_argument("--golden", required=True, help="Path to a golden.jsonl file.")
+    split_parser.add_argument(
+        "--out",
+        required=True,
+        help="Directory to write dev_ids.txt, test_ids.txt and split.json into.",
+    )
+    split_parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Replace existing split files that differ (the held-out half then changes).",
+    )
+    split_parser.set_defaults(func=_split)
+
+    compare_parser = subparsers.add_parser(
+        "compare",
+        help=(
+            "Compare two rounds (share bundles or --out reports) by case id: fixed, "
+            "regressed, still failing, added, removed, accuracy deltas and the shift in "
+            "mismatch classes. Needs no database, model or project_config."
+        ),
+    )
+    compare_parser.add_argument("old", help="The earlier round: a --share bundle or an --out report.")
+    compare_parser.add_argument("new", help="The later round.")
+    compare_parser.add_argument(
+        "--split",
+        choices=("dev", "test"),
+        default=None,
+        help="Limit the comparison to one half of a split. Needs --split-file.",
+    )
+    compare_parser.add_argument(
+        "--split-file",
+        default=None,
+        dest="split_file",
+        metavar="PATH",
+        help=(
+            "A file of case ids for --split: dev_ids.txt / test_ids.txt as written by "
+            "'split' (one id per line), a JSON list, or a JSON object with dev / test lists."
+        ),
+    )
+    compare_parser.add_argument(
+        "--fail-on-regression",
+        action="store_true",
+        default=False,
+        dest="fail_on_regression",
+        help=(
+            "Exit 1 when any compared case passed in OLD and fails in NEW. With "
+            "--split test that is a regression in the held-out half."
+        ),
+    )
+    compare_parser.add_argument(
+        "--allow-mixed",
+        action="store_true",
+        default=False,
+        dest="allow_mixed",
+        help=(
+            "Compare rounds generated by different pipelines (production against "
+            "single_shot). Refused by default, because the production pipeline corrects "
+            "its own mistakes and the difference would be the pipeline, not a fix."
+        ),
+    )
+    compare_parser.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Print the comparison as JSON (ids, counts and percentages only).",
+    )
+    compare_parser.set_defaults(func=_compare)
+
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Parse *argv* and dispatch to the requested subcommand.
+
+    Parameters
+    ----------
+    argv:
+        Command-line arguments (excluding the program name). Defaults to
+        ``sys.argv[1:]`` when ``None``.
+
+    Returns
+    -------
+    int
+        Process exit code: ``0`` on success/no-regression, ``1`` on
+        regression versus a baseline or a run below an absolute
+        accuracy floor.
+
+    Examples
+    --------
+    Missing required ``--golden`` produces argparse's usual usage error:
+
+    >>> import contextlib, io
+    >>> buf = io.StringIO()
+    >>> with contextlib.redirect_stderr(buf):
+    ...     code = None
+    ...     try:
+    ...         main(["run"])
+    ...     except SystemExit as exc:
+    ...         code = exc.code
+    >>> code
+    2
+    """
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command in _COMMANDS_NEEDING_PROJECT_CONFIG:
+        # One line and exit status 2 instead of an import-time traceback;
+        # --help, split and compare never get here, so they work with no
+        # project_config/ at all.
+        exit_if_project_config_unusable(SERVER_IMPORT_FILES, status=2)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    use_utf8_console()
+    sys.exit(main())

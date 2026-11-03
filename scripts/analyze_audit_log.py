@@ -1,0 +1,1550 @@
+# SPDX-License-Identifier: BUSL-1.1
+# Copyright (c) 2024-2026 Ali Sadeghi Aghili
+"""Aggregate report over ``logs/audit_log.jsonl`` — the deployment week's
+only source of real accuracy/latency numbers, analysed WITHOUT letting the
+raw log (which contains real user questions) leave the server.
+
+Usage (from repo root, on the machine that produced the log)::
+
+    python scripts/analyze_audit_log.py
+    python scripts/analyze_audit_log.py logs/audit_log.jsonl
+    python scripts/analyze_audit_log.py "logs/audit_log.jsonl*"
+    python scripts/analyze_audit_log.py logs/audit_log.jsonl logs/audit_log.jsonl.1
+    python scripts/analyze_audit_log.py --json > report.json
+    python scripts/analyze_audit_log.py --include-examples > report_internal.txt
+
+With no arguments, reads every ``logs/audit_log.jsonl*`` file next to this
+script's repo root (the active file plus any rotated ``.1``, ``.2``, ...
+backups — see ``logs/logger.py``'s rotation). Multiple explicit paths and/or
+shell-style glob patterns are both accepted, so a rotated deployment's
+history can be analysed in one run without hand-listing every backup.
+
+Two modes — read this before sending a report anywhere
+---------------------------------------------------------------------------
+``AuditRecord.question`` (``observability/audit.py``) is real user text
+from a commodity exchange's trading desk. This script runs *on the
+server that produced the log* and its normal output is a fully
+aggregated report — counts, percentiles, distributions — with **no
+question text, no generated SQL, and no error messages** anywhere in it,
+so that report is safe to copy off the server (paste into a chat, attach
+to an email) without a second thought.
+
+``--include-examples`` is the opt-in escape hatch for when the deployment
+owner has separately decided that sharing example questions is
+acceptable (e.g. debugging a specific miss with the person who wrote this
+code). It adds a small number of verbatim ``question`` strings (and, for
+guard rejections, the ``error_message``) alongside the aggregates. It is
+never the default, and the report's own ``"mode"`` field always says
+which one produced it — see :func:`build_report`'s ``mode`` key — so a
+reader (or a future you) can tell at a glance whether a given report file
+is safe to forward or not, without re-deriving that from the flags used
+to generate it.
+
+What leaves the machine in the default (safe) mode
+----------------------------------------------------------
+Record counts, latency percentiles, distributions (``finish_reason``,
+``error_code``, provider, cache hit rates, correction-round counts), and
+generated-SQL *shape* (which tables were touched and how many joins —
+never the SQL text or the question that produced it). The same holds for
+a guard *rejection*: its ``reason``, its ``subject`` (the single
+keyword/column/table the guard named — already shown to the analyst on
+screen, so nothing new leaves the machine), and the refused statement's
+shape (tables touched + join count) leave the machine — never the refused
+SQL text itself, exactly as strictly as for an executed query. Nothing
+that could identify a specific query, a specific user, or a specific piece
+of commodity-exchange business data.
+
+Report sections
+----------------
+1. :func:`_records_by_model`      — record counts by ``llm.model``, so a
+   reader sees at a glance whether they are looking at real traffic or a
+   stub/test backend (``mock:stub``, ``ollama:test``, ...) before trusting
+   any other number in the report.
+2. :func:`_latency_report`        — p50/p95/p99 overall and per stage
+   (``plan``, ``prompt``, ``llm``, ``guard``, ``execute``, ``interpret``)
+   from ``timings``. Where the time actually goes.
+3. :func:`_finish_reason_distribution` — ``length`` means truncation, i.e.
+   ``llm_num_predict`` is set too low (see ``docs/api-contract-v2.md`` §6).
+4. :func:`_failure_taxonomy`      — counts by ``error_code``, plus guard
+   rejections split policy (no retry could ever fix it) vs. correctable
+   (a retry could plausibly have fixed it, but the budget ran out) — see
+   ``security/sql_guard.py``'s ``PolicyRejection``/``CorrectableRejection``
+   split, which :data:`_POLICY_ERROR_CODES` / :data:`_CORRECTABLE_ERROR_CODES`
+   mirror via the ``error_code`` ``api/runner.py`` already assigns.
+5. :func:`_cache_behaviour`       — T0 (cache-hit tier) rate, and
+   ``prefix_cache_hit`` rate among calls that actually reached the LLM —
+   the number the whole Phase 2 static-prefix latency premise rests on
+   and that has never actually been measured against real traffic.
+6. :func:`_sql_shape_clusters`    — intent clusters by generated-SQL
+   *shape* (tables touched + join count), not by question text — Phase
+   6's input, computed without reading a single word of any question.
+7. :func:`guard_rejection_report` — guard rejections by ``reason``; for
+   each reason, a count by ``guard.subject`` (the single keyword/column/
+   table the guard named — safe in every mode, since it is already shown
+   to the analyst on screen); and, in the default report, the most
+   frequent refused-statement *shapes* (tables touched + join count, via
+   the same normalisation :func:`_sql_shape_clusters` uses) — REFUSED,
+   NEVER EXECUTED, never the raw statement text. ``--include-examples``
+   additionally attaches up to 3 verbatim refused statements per reason,
+   labelled the same way, exactly mirroring how :func:`failure_taxonomy`
+   already opts ``question``/``error_message`` into that flag. A rejection
+   with no ``guard.rejected_sql`` (a record written before PR #105, or one
+   from the older v1 path) is counted under an explicit "statement not
+   recorded" bucket rather than dropped, and a table-less refusal
+   (``no_table_reference``, a session-state read) still gets a shape entry
+   — and, via ``subject``, a name — instead of being silently excluded the
+   way :func:`_sql_shape_clusters` excludes an empty ``tables_touched`` for
+   *executed* SQL.
+8. :func:`_correction_rounds`     — how many self-correction rounds a
+   query needed, and whether spending them ever actually succeeded.
+9. :func:`_llm_meta_summary`      — reasoning-channel detections,
+   provider / fallback usage, and how often a requested seed was
+   confirmed honoured.
+10. :func:`llm_latency_split`     — the ``llm`` stage opened up: p50/p95 of
+    time-to-first-token (``ttft_ms``: queue plus prefill), generation time
+    (``generation_ms``) and reasoning tokens, from the ``llm`` block's
+    fields of the same names. Only calls that carry them count (streamed
+    ones, for the timings -- ``LLM_STREAM_TIMINGS=true``); a record written
+    before the fields existed contributes to nothing and breaks nothing.
+
+11. ``observability.quality``     — the real-use quality report: the same
+    audit records joined with the analysts' confirmations ("this answer is
+    correct") and wrong-answer flags, over the last ``--quality-days`` days
+    (default 7) and all time, overall and per data source: success, guard
+    rejection, correction, empty-result and out-of-scope rates, error rate
+    by class, confirmed vs flagged answers (a lower-bound signal, **not**
+    accuracy) and latency p50/p95 per stage. Printed after the sections
+    above and added to ``--json`` output as ``"quality"``; counts and
+    percentiles only, so it keeps this script's default privacy mode. The
+    confirmations and flags are read from the application database; when it
+    cannot be read the section says so and the rest still prints.
+
+Handling a partly-stub log
+----------------------------
+A dev machine's log is typically dominated by ``mock:stub`` / ``ollama:test``
+(or similarly named) records from the test suite, not real traffic — see
+section 1 above. This script does not filter those out (a deployment week
+should also show its own mix), it just makes the mix visible so nobody
+mistakes 111 stub records for a week of real usage, or a week of real
+usage for "mostly noise" because a few hundred leftover test records are
+mixed in.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import logging
+import os
+import re
+import statistics
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable, Iterator
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from core.console import use_utf8_console
+import config as cfg
+from logs.logger import append_jsonl
+from observability.timing import STAGE_NAMES
+from security.sql_guard import extract_touched_tables
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_GLOB = "logs/audit_log.jsonl*"
+
+#: Default glob for :func:`record_rate_limit_hit`'s own log -- see that
+#: function's docstring for why a 429 needs a stream of its own rather
+#: than an entry in ``audit_log.jsonl`` itself.
+_DEFAULT_RATE_LIMIT_HIT_GLOB = "logs/rate_limit_hits.jsonl*"
+
+# Module-level path variable so tests can patch
+# "scripts.analyze_audit_log._RATE_LIMIT_HIT_LOG_FILE", mirroring
+# appdb.admin_audit._ADMIN_ACTION_LOG_FILE's own test seam.
+_RATE_LIMIT_HIT_LOG_FILE: str = ""
+
+#: ``error_code`` values that mean the guard rejected the SQL for a reason
+#: no re-prompt could ever fix (a forbidden statement/keyword, an
+#: injection attempt) — mirrors ``security.sql_guard.PolicyRejection`` via
+#: the mapping ``api/runner.py``'s ``_GUARD_REJECTED_ERRORS`` already
+#: performs onto these two ``NLQError`` subclasses' ``error_code``s.
+_POLICY_ERROR_CODES: frozenset[str] = frozenset({"FORBIDDEN_SQL", "INJECTION_ATTEMPT"})
+
+#: ``error_code`` values that mean a guard-shaped rejection was, in
+#: principle, fixable by a retry (a malformed or hallucinated candidate)
+#: but the self-correction budget ran out before one succeeded, or the
+#: model returned nothing usable at all — mirrors
+#: ``security.sql_guard.CorrectableRejection`` (``INVALID_SQL_RESPONSE``)
+#: plus the closely related ``EMPTY_SQL_RESPONSE`` (never reached the
+#: guard at all, but for the same "a retry might have helped" reason).
+_CORRECTABLE_ERROR_CODES: frozenset[str] = frozenset(
+    {"INVALID_SQL_RESPONSE", "EMPTY_SQL_RESPONSE"}
+)
+
+#: A genuine scope decline — not a guard rejection at all (the SQL was
+#: never generated), but reported alongside the guard taxonomy since an
+#: operator reading "how often did we refuse to answer" wants both.
+_SCOPE_DECLINE_ERROR_CODES: frozenset[str] = frozenset({"OUT_OF_SCOPE"})
+
+#: Transport-level failures: the call never completed against a real
+#: backend, or the backend/database itself was unreachable/slow. Not a
+#: property of the *question* at all — an operator sees these as
+#: "something downstream is unhealthy", not "the model got this wrong".
+_TRANSPORT_ERROR_CODES: frozenset[str] = frozenset(
+    {"MODEL_UNAVAILABLE", "MODEL_TIMEOUT", "DATABASE_UNAVAILABLE",
+     "QUERY_TIMEOUT", "SERVER_OVERLOAD"}
+)
+
+_JOIN_RE = re.compile(r"\bJOIN\b", re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# Reading the log
+# ---------------------------------------------------------------------------
+
+def resolve_log_paths(patterns: Iterable[str]) -> list[Path]:
+    """Expand *patterns* (literal paths and/or glob patterns) to a sorted,
+    deduplicated list of existing files.
+
+    Each entry in *patterns* is tried both as a literal path and as a glob
+    pattern (``glob.glob`` on a path with no wildcard characters just
+    returns that path itself if it exists, so this is safe either way).
+    Non-existent literal paths that are not glob patterns are silently
+    skipped rather than raising, so a caller can pass
+    ``logs/audit_log.jsonl logs/audit_log.jsonl.1`` without the second one
+    existing yet on a fresh deployment.
+
+    Examples
+    --------
+    >>> import tempfile, os
+    >>> d = tempfile.mkdtemp()
+    >>> a = os.path.join(d, "audit_log.jsonl")
+    >>> b = os.path.join(d, "audit_log.jsonl.1")
+    >>> _ = open(a, "w").close()
+    >>> _ = open(b, "w").close()
+    >>> paths = resolve_log_paths([os.path.join(d, "audit_log.jsonl*")])
+    >>> len(paths)
+    2
+    >>> resolve_log_paths([os.path.join(d, "does_not_exist.jsonl")])
+    []
+    """
+    found: set[Path] = set()
+    for pattern in patterns:
+        matches = glob.glob(pattern)
+        for m in matches:
+            found.add(Path(m))
+        if not matches:
+            p = Path(pattern)
+            if p.exists():
+                found.add(p)
+    return sorted(found)
+
+
+def iter_records(paths: Iterable[Path]) -> Iterator[dict[str, Any]]:
+    """Yield every well-formed JSON object across *paths*, in file order.
+
+    A line that fails to parse as JSON is silently skipped (a truncated
+    final line from a write in progress is expected, not an error worth
+    stopping the whole report over).
+    """
+    for path in paths:
+        try:
+            with path.open(encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(record, dict):
+                        yield record
+        except OSError:
+            continue
+
+
+# ---------------------------------------------------------------------------
+# Latency
+# ---------------------------------------------------------------------------
+
+def _percentile(values: list[float], pct: float) -> float | None:
+    """Linear-interpolation percentile of *values* (0-100 scale).
+
+    Matches ``numpy.percentile``'s default ("linear") method so numbers
+    computed here agree with anyone re-deriving them with pandas/numpy on
+    the exported figures. *values* need not be sorted.
+
+    Examples
+    --------
+    >>> _percentile([1, 2, 3, 4, 5], 50)
+    3.0
+    >>> _percentile([1, 2, 3, 4], 50)
+    2.5
+    >>> _percentile([], 50) is None
+    True
+    >>> _percentile([42], 99)
+    42
+    """
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    k = (len(ordered) - 1) * (pct / 100)
+    lo, hi = int(k), min(int(k) + 1, len(ordered) - 1)
+    if lo == hi:
+        return ordered[lo]
+    frac = k - lo
+    return ordered[lo] * (1 - frac) + ordered[hi] * frac
+
+
+def _stats(values: list[float]) -> dict[str, Any]:
+    """``{count, mean, p50, p95, p99}`` for *values*, or an all-``None``
+    shape (with ``count`` still accurate) when *values* is empty.
+
+    Examples
+    --------
+    >>> _stats([1, 2, 3])["count"]
+    3
+    >>> _stats([])["p50"] is None
+    True
+    """
+    if not values:
+        return {"count": 0, "mean": None, "p50": None, "p95": None, "p99": None}
+    return {
+        "count": len(values),
+        "mean": round(statistics.fmean(values), 1),
+        "p50": _percentile(values, 50),
+        "p95": _percentile(values, 95),
+        "p99": _percentile(values, 99),
+    }
+
+
+def latency_report(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Overall and per-stage latency percentiles from each record's
+    ``timings`` block (``total_ms`` plus one ``<stage>_ms`` per
+    ``observability.timing.STAGE_NAMES`` entry).
+
+    Records with no ``timings`` (or an empty one — e.g. a request
+    rejected before any stage timer ran) contribute to no bucket; each
+    bucket's own ``count`` says how many records actually had a number
+    for that specific stage, which need not equal the total record count.
+    """
+    totals: list[float] = []
+    by_stage: dict[str, list[float]] = {name: [] for name in STAGE_NAMES}
+
+    for rec in records:
+        timings = rec.get("timings") or {}
+        total = timings.get("total_ms")
+        if isinstance(total, (int, float)):
+            totals.append(total)
+        for stage in STAGE_NAMES:
+            val = timings.get(f"{stage}_ms")
+            if isinstance(val, (int, float)):
+                by_stage[stage].append(val)
+
+    return {
+        "overall_ms": _stats(totals),
+        "by_stage_ms": {stage: _stats(vals) for stage, vals in by_stage.items()},
+    }
+
+
+# ---------------------------------------------------------------------------
+# finish_reason
+# ---------------------------------------------------------------------------
+
+def finish_reason_distribution(records: list[dict[str, Any]]) -> dict[str, int]:
+    """Counts of ``llm.finish_reason`` across every record that reached an
+    LLM at all (``llm`` is ``None`` for e.g. a T0 cache hit — excluded,
+    not counted as any particular finish reason).
+
+    ``"length"`` means the response was truncated by ``llm_num_predict``
+    — see ``docs/api-contract-v2.md`` §6 and PR #41, which made this
+    field derived-not-hardcoded and therefore trustworthy for the first
+    time.
+    """
+    counts: Counter[str] = Counter()
+    for rec in records:
+        llm = rec.get("llm")
+        if not llm:
+            continue
+        reason = llm.get("finish_reason")
+        if reason:
+            counts[reason] += 1
+    return dict(counts.most_common())
+
+
+# ---------------------------------------------------------------------------
+# Failure taxonomy
+# ---------------------------------------------------------------------------
+
+def _classify_error_code(code: str) -> str:
+    """Bucket label for one ``error_code`` — see the module-level
+    ``_..._ERROR_CODES`` sets for exactly which codes land in which bucket.
+
+    Examples
+    --------
+    >>> _classify_error_code("FORBIDDEN_SQL")
+    'guard_policy'
+    >>> _classify_error_code("INVALID_SQL_RESPONSE")
+    'guard_correctable'
+    >>> _classify_error_code("OUT_OF_SCOPE")
+    'scope_decline'
+    >>> _classify_error_code("MODEL_TIMEOUT")
+    'transport'
+    >>> _classify_error_code("QUERY_EXECUTION_ERROR")
+    'execution'
+    >>> _classify_error_code("SOME_FUTURE_CODE")
+    'other'
+    """
+    if code in _POLICY_ERROR_CODES:
+        return "guard_policy"
+    if code in _CORRECTABLE_ERROR_CODES:
+        return "guard_correctable"
+    if code in _SCOPE_DECLINE_ERROR_CODES:
+        return "scope_decline"
+    if code in _TRANSPORT_ERROR_CODES:
+        return "transport"
+    if code == "QUERY_EXECUTION_ERROR":
+        return "execution"
+    return "other"
+
+
+def failure_taxonomy(
+    records: list[dict[str, Any]], *, include_examples: bool = False,
+) -> dict[str, Any]:
+    """Failure counts by ``error_code`` and by the coarser bucket
+    :func:`_classify_error_code` assigns it to (guard policy / guard
+    correctable / scope decline / transport / execution / other).
+
+    A successful record (``error_code`` is ``None``) is counted in
+    ``success_count`` and nowhere else.
+
+    When *include_examples* is true, up to 3 verbatim ``(question,
+    error_message)`` pairs are attached per ``error_code`` — never
+    populated otherwise, per this module's two-mode design (see the
+    module docstring).
+    """
+    by_code: Counter[str] = Counter()
+    by_bucket: Counter[str] = Counter()
+    examples: dict[str, list[dict[str, str]]] = defaultdict(list)
+    success_count = 0
+
+    for rec in records:
+        code = rec.get("error_code")
+        if not code:
+            success_count += 1
+            continue
+        by_code[code] += 1
+        by_bucket[_classify_error_code(code)] += 1
+        if include_examples and len(examples[code]) < 3:
+            examples[code].append({
+                "question": rec.get("question", ""),
+                "error_message": rec.get("error_message") or "",
+            })
+
+    result: dict[str, Any] = {
+        "success_count": success_count,
+        "failure_count": sum(by_code.values()),
+        "by_error_code": dict(by_code.most_common()),
+        "by_bucket": dict(by_bucket.most_common()),
+    }
+    if include_examples:
+        result["examples_by_error_code"] = {k: v for k, v in examples.items()}
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Cache behaviour
+# ---------------------------------------------------------------------------
+
+def cache_behaviour(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """T0 (cache-hit tier) rate over all records, and ``prefix_cache_hit``
+    rate among the subset that actually reached the LLM (``llm`` present).
+
+    ``prefix_cache_hit`` is the number the whole Phase 2 static-prefix
+    latency premise rests on — see ``observability/llm_status.py``'s
+    module docstring — and, per that field's own derivation, is never
+    ``True`` for a record with zero prompt tokens (a transport failure),
+    so this rate is never inflated by requests that never reached a
+    model at all.
+    """
+    total = len(records)
+    t0_count = sum(1 for rec in records if rec.get("tier") == "T0")
+
+    llm_records = [rec for rec in records if rec.get("llm")]
+    prefix_hits = sum(1 for rec in llm_records if rec["llm"].get("prefix_cache_hit"))
+    server = [
+        rec for rec in llm_records
+        if rec["llm"].get("prefix_cache_hit_source") == "server"
+    ]
+    server_hits = sum(1 for rec in server if rec["llm"].get("prefix_cache_hit"))
+
+    return {
+        "total_records": total,
+        "t0_count": t0_count,
+        "t0_rate": round(t0_count / total, 4) if total else None,
+        "llm_call_count": len(llm_records),
+        "prefix_cache_hit_count": prefix_hits,
+        "prefix_cache_hit_rate": (
+            round(prefix_hits / len(llm_records), 4) if llm_records else None
+        ),
+        # The rate above mixes the server's word with a prompt-size
+        # estimate (runbook 20.8). These count only the calls whose server
+        # reported cached_tokens, and so are the real cache hit rate.
+        "server_reported_count": len(server),
+        "server_hit_count": server_hits,
+        "server_hit_rate": round(server_hits / len(server), 4) if server else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# SQL-shape intent clustering (never reads question text)
+# ---------------------------------------------------------------------------
+
+def _join_bucket(sql: str) -> str:
+    """``"0"``, ``"1"``, or ``"2+"`` — how many ``JOIN`` keywords *sql*
+    contains, bucketed rather than reported as an exact count so the
+    cluster table stays small and readable.
+
+    Examples
+    --------
+    >>> _join_bucket("SELECT 1")
+    '0'
+    >>> _join_bucket("SELECT * FROM A JOIN B ON A.id = B.id")
+    '1'
+    >>> _join_bucket("A JOIN B JOIN C JOIN D")
+    '2+'
+    """
+    n = len(_JOIN_RE.findall(sql or ""))
+    if n == 0:
+        return "0"
+    if n == 1:
+        return "1"
+    return "2+"
+
+
+def sql_shape_clusters(
+    records: list[dict[str, Any]], *, include_examples: bool = False, top_n: int = 25,
+) -> list[dict[str, Any]]:
+    """Cluster successful, guard-allowed records by generated-SQL *shape*
+    — the sorted tuple of ``guard.tables_touched`` plus a join-count
+    bucket (:func:`_join_bucket`) — never by question text. This is
+    exactly Phase 6's clustering input, and it is computable from the
+    audit log alone without reading a single word any user typed.
+
+    Only records with a non-empty ``tables_touched`` are clustered — a
+    record that never reached table resolution (an early rejection, a
+    transport failure) has no SQL shape to report.
+
+    Returned as a list of clusters sorted by descending record count,
+    capped at *top_n* entries so a long-tail of one-off shapes does not
+    drown out the handful of shapes that actually dominate real traffic.
+    """
+    clusters: dict[tuple[tuple[str, ...], str], list[dict[str, Any]]] = defaultdict(list)
+
+    for rec in records:
+        guard = rec.get("guard") or {}
+        tables = guard.get("tables_touched")
+        if not tables:
+            continue
+        key = (tuple(sorted(tables)), _join_bucket(rec.get("generated_sql", "")))
+        clusters[key].append(rec)
+
+    ranked = sorted(clusters.items(), key=lambda kv: len(kv[1]), reverse=True)[:top_n]
+
+    result: list[dict[str, Any]] = []
+    for (tables, join_bucket), recs in ranked:
+        entry: dict[str, Any] = {
+            "tables_touched": list(tables),
+            "join_count": join_bucket,
+            "count": len(recs),
+        }
+        if include_examples:
+            entry["example_questions"] = [r.get("question", "") for r in recs[:3]]
+        result.append(entry)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Guard rejections -- what the guard refused, never what it let through
+# ---------------------------------------------------------------------------
+
+#: Bucket label for a guard rejection whose ``guard.rejected_sql`` is
+#: absent -- either the key is missing entirely (an audit record written
+#: before PR #105 added the field to ``GuardVerdict``) or present but
+#: ``None`` (the older v1 path, or a rejection whose composition step
+#: never produced a candidate at all -- see
+#: ``session.models.GuardVerdict.rejected_sql``'s own docstring for that
+#: same "``None`` ... or a rejection this contract predates" case from the
+#: writer's side). Counted explicitly rather than skipped, per *reason*,
+#: so the report says plainly how many rejections in this window have no
+#: refused statement to show.
+_STATEMENT_NOT_RECORDED = "statement not recorded (pre-5.1.x record)"
+
+#: Bucket label for a guard rejection whose ``guard.subject`` is missing or
+#: ``None`` -- the rejection was about the query's *shape* rather than one
+#: nameable identifier (see ``session.models.GuardVerdict.subject``'s own
+#: docstring: "``None`` when it is about the query's shape rather than a
+#: single identifier"). Counted explicitly rather than skipped, so a reason
+#: with mostly shape-level rejections does not read as having no subjects
+#: worth reporting at all.
+_NO_SINGLE_SUBJECT = "(no single subject)"
+
+
+def _safe_display(text: str) -> str:
+    """Collapse *text* to a single line for the human-readable renderer.
+
+    ``text`` here is always untrusted model output (a guard ``subject`` or
+    a refused statement) -- ``render_text`` builds each of its rows by
+    joining one entry per output line, so an embedded newline (or run of
+    other whitespace) in untrusted text would otherwise let that text
+    masquerade as extra report lines / rows. Collapsing every run of
+    whitespace to a single space neutralises that without needing a
+    spreadsheet-specific defusal (``exporters.sanitize.defuse_formula``
+    guards a *different* threat -- a leading ``=``/``+``/``-``/``@`` opened
+    as a formula by Excel/LibreOffice on an *exported* file -- and does not
+    apply here since this module never writes CSV/Excel; JSON output needs
+    no such treatment either, since :func:`json.dumps` already escapes
+    quotes/commas/newlines correctly on its own).
+    """
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _guard_rejection_shape(sql: str) -> tuple[tuple[str, ...], str]:
+    """The same ``(tables_touched, join_bucket)`` shape key
+    :func:`sql_shape_clusters` uses for *executed* SQL, computed here for a
+    *refused* statement instead.
+
+    ``guard.tables_touched`` -- the field :func:`sql_shape_clusters` reads
+    -- is never populated for a rejection: ``session.engine.TurnEngine``
+    only passes ``tables_touched=extract_touched_tables(...)`` to
+    ``GuardVerdict`` on an *allowed* verdict; every rejection branch
+    constructs ``GuardVerdict`` without that argument at all, so it
+    defaults to an empty list. This calls
+    :func:`security.sql_guard.extract_touched_tables` directly on *sql*
+    itself instead -- exactly what that function's own docstring says is
+    safe to do: "safe to call on a *rejected* candidate query ... where
+    some references may legitimately be unresolvable." Reusing it here,
+    together with this module's own :func:`_join_bucket`, is the "reuse it
+    rather than writing a second normaliser" this function exists to
+    satisfy -- no new SQL-text canonicaliser is written for this section.
+
+    Never raises, even on SQL that failed to parse at all (a hallucinated
+    or garbled candidate is exactly what a rejection's ``rejected_sql``
+    most often is): both helpers it calls degrade to an empty result/
+    ``"0"`` rather than raising on unparsable text, and *sql* is only ever
+    read as text by a SQL *parser* here -- nothing from it is executed.
+    """
+    tables = extract_touched_tables(sql, dialect=cfg.settings.sql_dialect)
+    return tuple(sorted(tables)), _join_bucket(sql)
+
+
+def guard_rejection_report(
+    records: list[dict[str, Any]], *, include_examples: bool = False, top_n: int = 25,
+) -> dict[str, Any]:
+    """Counts of guard rejections by ``guard.reason``; for each reason, a
+    count by ``guard.subject`` (the single keyword/column/table the guard
+    named); and, in the default (safe) mode, the most frequent
+    refused-statement *shapes* — REFUSED, NEVER EXECUTED — normalised
+    exactly the way :func:`sql_shape_clusters` normalises executed SQL
+    (tables touched + join-count bucket, via :func:`_guard_rejection_shape`),
+    never the raw statement text.
+
+    ``guard.subject`` is safe to show unconditionally, in every mode:
+    ``session.models.GuardVerdict.subject``'s own docstring calls it
+    "[s]erver-supplied text originating from the analyst's own question and
+    the schema ... but still untrusted input" — the same status ordinary
+    generated-SQL *shape* already has in this report — and it is already
+    shown to the analyst on screen (``web/js/render/turn.js``), so there is
+    nothing here a reader of this report could not already see in the
+    product. The shape breakdown carries the same "never raw text" rule the
+    rest of this module's default mode follows.
+
+    ``rejected_sql`` itself is the one piece of this section that follows
+    this module's ``include_examples`` opt-in, exactly like ``question``
+    and ``error_message`` elsewhere (see :func:`failure_taxonomy`): when
+    *include_examples* is true, up to 3 verbatim refused statements are
+    attached per reason, each labelled ``"REFUSED, NEVER EXECUTED"`` so a
+    reader can never mistake one for SQL that ran — never populated
+    otherwise, per this module's two-mode design (see the module
+    docstring).
+
+    A record counts as a guard rejection when ``guard.verdict ==
+    "rejected"`` (read directly off the record, not inferred from
+    ``error_code`` — a v1-shaped or otherwise malformed record might carry
+    one without the other). A ``guard`` block that is missing or not a
+    ``dict`` at all (an older or differently-shaped record) is simply
+    skipped, never raised on.
+
+    ``guard.reason`` missing entirely — an older record, or a rejection
+    ``GuardVerdict.reason``'s own docstring says predates that field — is
+    bucketed under ``"(reason not recorded)"`` rather than dropped.
+    ``guard.subject`` missing or ``None`` — a rejection about the query's
+    shape rather than one nameable identifier — is bucketed under
+    :data:`_NO_SINGLE_SUBJECT` rather than dropped.
+
+    A rejection with no ``guard.rejected_sql`` is counted in
+    :data:`_STATEMENT_NOT_RECORDED` (per *reason*) rather than skipped
+    silently — see that constant's own docstring for the two cases this
+    covers. Such a rejection still contributes to ``by_reason`` and the
+    subject counts (both independent of whether a statement was recorded),
+    just not to the shape breakdown or the examples.
+
+    A table-less refusal (``no_table_reference``, or any other reason
+    whose statement resolves to zero known tables — a session-state read
+    like ``SELECT @@version`` never references one either) still gets a
+    shape entry, with ``tables_touched == []``. :func:`sql_shape_clusters`
+    deliberately excludes an empty ``tables_touched`` for *executed* SQL
+    (a record that never reached table resolution has no SQL shape to
+    report — see that function's own docstring); that exclusion is correct
+    there and is left untouched, but applying it here would silently drop
+    exactly the class of rejection — ADR-001's own table-less exclusion —
+    this section exists to surface. ``guard.subject`` is exactly what
+    fills the gap a table-less *shape* alone cannot: an unknown-table or
+    state-reading rejection resolves to the same empty shape as any other
+    table-less statement, but its ``subject`` (``"NoSuchTable"``,
+    ``"SERVERPROPERTY"``, ...) says what was actually attempted.
+
+    Returned as ``{"total_rejections", "by_reason",
+    "statement_not_recorded_total", "statement_not_recorded_by_reason",
+    "subject_counts_by_reason", "refused_statement_shapes_by_reason"}``,
+    plus ``"refused_statement_examples_by_reason"`` when *include_examples*
+    is true. Both the shape and subject mappings are ``{reason: [...]}``,
+    sorted by descending count and capped at *top_n* per reason, mirroring
+    :func:`sql_shape_clusters`'s own ``top_n`` cap.
+    """
+    by_reason: Counter[str] = Counter()
+    not_recorded_by_reason: Counter[str] = Counter()
+    shape_counts: Counter[tuple[str, tuple[tuple[str, ...], str]]] = Counter()
+    subject_counts: Counter[tuple[str, str]] = Counter()
+    examples: dict[str, list[dict[str, str]]] = defaultdict(list)
+
+    for rec in records:
+        guard = rec.get("guard")
+        if not isinstance(guard, dict) or guard.get("verdict") != "rejected":
+            continue
+
+        reason = guard.get("reason") or "(reason not recorded)"
+        by_reason[reason] += 1
+
+        subject = guard.get("subject") or _NO_SINGLE_SUBJECT
+        subject_counts[(reason, subject)] += 1
+
+        rejected_sql = guard.get("rejected_sql")
+        if not rejected_sql:
+            not_recorded_by_reason[reason] += 1
+            continue
+
+        shape_counts[(reason, _guard_rejection_shape(rejected_sql))] += 1
+
+        if include_examples and len(examples[reason]) < 3:
+            examples[reason].append({
+                "rejected_sql": rejected_sql,
+                "label": "REFUSED, NEVER EXECUTED",
+            })
+
+    by_reason_shapes: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for (reason, (tables, join_bucket)), count in shape_counts.items():
+        by_reason_shapes[reason].append({
+            "tables_touched": list(tables),
+            "join_count": join_bucket,
+            "count": count,
+        })
+
+    shapes_result: dict[str, list[dict[str, Any]]] = {}
+    for reason, shapes in by_reason_shapes.items():
+        shapes.sort(key=lambda e: e["count"], reverse=True)
+        shapes_result[reason] = shapes[:top_n]
+
+    by_reason_subjects: dict[str, Counter[str]] = defaultdict(Counter)
+    for (reason, subject), count in subject_counts.items():
+        by_reason_subjects[reason][subject] = count
+
+    subjects_result: dict[str, dict[str, int]] = {
+        reason: dict(counts.most_common(top_n))
+        for reason, counts in by_reason_subjects.items()
+    }
+
+    result: dict[str, Any] = {
+        "total_rejections": sum(by_reason.values()),
+        "by_reason": dict(by_reason.most_common()),
+        "statement_not_recorded_total": sum(not_recorded_by_reason.values()),
+        "statement_not_recorded_by_reason": dict(not_recorded_by_reason.most_common()),
+        "subject_counts_by_reason": subjects_result,
+        "refused_statement_shapes_by_reason": shapes_result,
+    }
+    if include_examples:
+        result["refused_statement_examples_by_reason"] = {k: v for k, v in examples.items()}
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Correction rounds
+# ---------------------------------------------------------------------------
+
+def correction_rounds(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Distribution of ``llm.corrections`` (self-correction rounds spent
+    before the final result), and whether spending any ever correlated
+    with an eventual success (``error_code`` is ``None``).
+    """
+    distribution: Counter[int] = Counter()
+    success_by_rounds: Counter[int] = Counter()
+    total_by_rounds: Counter[int] = Counter()
+
+    for rec in records:
+        llm = rec.get("llm")
+        if not llm:
+            continue
+        rounds = llm.get("corrections")
+        if not isinstance(rounds, int):
+            continue
+        distribution[rounds] += 1
+        total_by_rounds[rounds] += 1
+        if not rec.get("error_code"):
+            success_by_rounds[rounds] += 1
+
+    success_rate_by_rounds = {
+        str(rounds): round(success_by_rounds[rounds] / total, 4)
+        for rounds, total in total_by_rounds.items()
+    }
+
+    corrected = {r: n for r, n in distribution.items() if r > 0}
+    return {
+        "distribution": {str(k): v for k, v in sorted(distribution.items())},
+        "success_rate_by_rounds": success_rate_by_rounds,
+        "records_with_any_correction": sum(corrected.values()),
+        "records_with_any_correction_that_succeeded": sum(
+            success_by_rounds[r] for r in corrected
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# LLM meta summary
+# ---------------------------------------------------------------------------
+
+def llm_meta_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Reasoning-channel detections, provider/fallback usage, and how
+    often a requested seed was confirmed honoured — all among records
+    that reached an LLM at all.
+    """
+    llm_records = [rec["llm"] for rec in records if rec.get("llm")]
+    n = len(llm_records)
+    if n == 0:
+        return {
+            "llm_call_count": 0,
+            "reasoning_detected_count": 0,
+            "reasoning_detected_rate": None,
+            "provider_distribution": {},
+            "fallback_used_count": 0,
+            "fallback_used_rate": None,
+            "seed_requested_count": 0,
+            "seed_honored_count": 0,
+            "seed_honored_rate_among_seed_requested": None,
+        }
+
+    reasoning = sum(1 for llm in llm_records if llm.get("reasoning_detected"))
+    fallback = sum(1 for llm in llm_records if llm.get("fallback_used"))
+    providers: Counter[str] = Counter(
+        llm.get("provider") for llm in llm_records if llm.get("provider")
+    )
+    seed_requested = [llm for llm in llm_records if llm.get("seed") is not None]
+    seed_honored = sum(1 for llm in seed_requested if llm.get("seed_honored") is True)
+
+    return {
+        "llm_call_count": n,
+        "reasoning_detected_count": reasoning,
+        "reasoning_detected_rate": round(reasoning / n, 4),
+        "provider_distribution": dict(providers.most_common()),
+        "fallback_used_count": fallback,
+        "fallback_used_rate": round(fallback / n, 4),
+        "seed_requested_count": len(seed_requested),
+        "seed_honored_count": seed_honored,
+        "seed_honored_rate_among_seed_requested": (
+            round(seed_honored / len(seed_requested), 4) if seed_requested else None
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# The llm stage, opened up
+# ---------------------------------------------------------------------------
+
+def _llm_numbers(records: list[dict[str, Any]], key: str) -> list[float]:
+    """Every real number the ``llm`` blocks of *records* hold under *key*.
+
+    ``None`` (a call that could not measure it), a missing key (a record
+    written before the field existed) and a boolean are all skipped, so an
+    old log reads as "no data" rather than raising or reading as zeros.
+
+    Examples
+    --------
+    >>> _llm_numbers([{"llm": {"ttft_ms": 900}}, {"llm": {}}, {"llm": None}, {}], "ttft_ms")
+    [900]
+    """
+    numbers: list[float] = []
+    for rec in records:
+        value = (rec.get("llm") or {}).get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            numbers.append(value)
+    return numbers
+
+
+def llm_latency_split(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Time-to-first-token, generation time and reasoning tokens, among LLM calls.
+
+    ``latency_report`` says how long the ``llm`` stage took; this says what
+    it was made of. ``ttft_ms`` is the wait before the first generated token
+    -- the server's queue plus prefill, so the number a cold prefix cache
+    or a saturated model server inflates -- and ``generation_ms`` is the
+    rest, decoding including any reasoning. Both exist only for calls made
+    with ``LLM_STREAM_TIMINGS=true``; ``streamed_call_count`` says how many
+    of ``llm_call_count`` those are, and every figure here is over that
+    subset, never over a mix with calls that could not measure it.
+
+    ``reasoning_tokens`` is over every call that showed reasoning, streamed
+    or not. ``reasoning_tokens_estimated_count`` of
+    ``reasoning_tokens_count`` are the analyser's estimate from the
+    reasoning text's length rather than the server's own count, so a reader
+    knows how far to trust the percentiles. ``reasoning_share_of_completion``
+    is the reasoning tokens as a fraction of the completion tokens of the
+    same calls: close to 1.0 means most of what the model generates is
+    thinking, which is what to look at before raising ``LLM_NUM_PREDICT``.
+
+    The ``llm`` block describes the call that produced the record's result;
+    when a request spent self-correction rounds the earlier calls are in
+    ``timings.llm_ms`` (which accumulates them) but not in these figures.
+
+    Returns
+    -------
+    dict
+        ``llm_call_count``, ``streamed_call_count``, ``ttft_ms`` and
+        ``generation_ms`` (each ``{count, mean, p50, p95, p99}``),
+        ``ttft_share_of_total`` (the median of ``ttft_ms / total_ms`` over
+        streamed calls, ``None`` without any), ``reasoning_tokens`` (the
+        same stats), ``reasoning_tokens_count``,
+        ``reasoning_tokens_estimated_count`` and
+        ``reasoning_share_of_completion``.
+
+    Examples
+    --------
+    >>> rec = {"llm": {"ttft_ms": 900, "generation_ms": 2100, "total_ms": 3000,
+    ...                "reasoning_tokens": 80, "reasoning_tokens_estimated": True,
+    ...                "completion_tokens": 100}}
+    >>> out = llm_latency_split([rec])
+    >>> out["ttft_ms"]["p50"], out["generation_ms"]["p50"], out["ttft_share_of_total"]
+    (900, 2100, 0.3)
+    >>> out["reasoning_tokens_estimated_count"], out["reasoning_share_of_completion"]
+    (1, 0.8)
+    >>> llm_latency_split([{"llm": {"model": "old record"}}])["ttft_ms"]["count"]
+    0
+    """
+    llm_blocks = [rec["llm"] for rec in records if rec.get("llm")]
+
+    streamed = [
+        b for b in llm_blocks
+        if isinstance(b.get("ttft_ms"), (int, float)) and not isinstance(b.get("ttft_ms"), bool)
+    ]
+    shares = [
+        b["ttft_ms"] / b["total_ms"] for b in streamed
+        if isinstance(b.get("total_ms"), (int, float)) and b["total_ms"] > 0
+    ]
+
+    with_reasoning = [
+        b for b in llm_blocks
+        if isinstance(b.get("reasoning_tokens"), (int, float))
+        and not isinstance(b.get("reasoning_tokens"), bool)
+    ]
+    comparable = [
+        b for b in with_reasoning
+        if isinstance(b.get("completion_tokens"), (int, float)) and b["completion_tokens"] > 0
+    ]
+    completion_total = sum(b["completion_tokens"] for b in comparable)
+
+    return {
+        "llm_call_count": len(llm_blocks),
+        "streamed_call_count": len(streamed),
+        "ttft_ms": _stats(_llm_numbers(records, "ttft_ms")),
+        "generation_ms": _stats(_llm_numbers(records, "generation_ms")),
+        "ttft_share_of_total": round(_percentile(shares, 50), 4) if shares else None,
+        "reasoning_tokens": _stats(_llm_numbers(records, "reasoning_tokens")),
+        "reasoning_tokens_count": len(with_reasoning),
+        "reasoning_tokens_estimated_count": sum(
+            1 for b in with_reasoning if b.get("reasoning_tokens_estimated") is True
+        ),
+        "reasoning_share_of_completion": (
+            round(sum(b["reasoning_tokens"] for b in comparable) / completion_total, 4)
+            if completion_total else None
+        ),
+    }
+
+
+def latency_by_cache(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """The ``llm`` stage's time, grouped by whether the server really had the prefix cached.
+
+    Only a call whose ``llm`` block says ``prefix_cache_hit_source ==
+    "server"`` (the server reported ``cached_tokens``) is put in ``hit`` or
+    ``miss``. Every other call -- a record written before the field existed,
+    or by a server that does not report cached tokens -- goes in
+    ``unreported``, because its ``prefix_cache_hit`` is only the prompt-size
+    estimate and grouping by it would call a short prompt a cache hit.
+
+    Each group has ``count`` and, over its records, ``llm_ms`` (the whole
+    stage, ``timings.llm_ms``, which includes correction rounds),
+    ``call_ms`` (``llm.total_ms``: the call the block describes),
+    ``prompt_tokens`` and ``cached_tokens``, each ``{count, mean, p50, p95,
+    p99}``.
+
+    Examples
+    --------
+    >>> recs = [
+    ...     {"timings": {"llm_ms": 900}, "llm": {"prefix_cache_hit": True,
+    ...      "prefix_cache_hit_source": "server", "cached_tokens": 24000, "prompt_tokens": 24100}},
+    ...     {"timings": {"llm_ms": 61000}, "llm": {"prefix_cache_hit": False,
+    ...      "prefix_cache_hit_source": "server", "cached_tokens": 0, "prompt_tokens": 24100}},
+    ...     {"timings": {"llm_ms": 2000}, "llm": {"prefix_cache_hit": True}},
+    ... ]
+    >>> out = latency_by_cache(recs)
+    >>> [(k, out[k]["count"]) for k in ("hit", "miss", "unreported")]
+    [('hit', 1), ('miss', 1), ('unreported', 1)]
+    >>> out["miss"]["llm_ms"]["p50"], out["hit"]["cached_tokens"]["p50"]
+    (61000, 24000)
+    """
+    groups: dict[str, list[dict[str, Any]]] = {"hit": [], "miss": [], "unreported": []}
+    for rec in records:
+        block = rec.get("llm")
+        if not isinstance(block, dict) or not block:
+            continue
+        if block.get("prefix_cache_hit_source") == "server":
+            groups["hit" if block.get("prefix_cache_hit") else "miss"].append(rec)
+        else:
+            groups["unreported"].append(rec)
+
+    def summary(group: list[dict[str, Any]]) -> dict[str, Any]:
+        stage = [
+            r["timings"]["llm_ms"] for r in group
+            if isinstance(r.get("timings"), dict)
+            and isinstance(r["timings"].get("llm_ms"), (int, float))
+            and not isinstance(r["timings"].get("llm_ms"), bool)
+        ]
+        return {
+            "count": len(group),
+            "llm_ms": _stats(stage),
+            "call_ms": _stats(_llm_numbers(group, "total_ms")),
+            "prompt_tokens": _stats(_llm_numbers(group, "prompt_tokens")),
+            "cached_tokens": _stats(_llm_numbers(group, "cached_tokens")),
+        }
+
+    return {name: summary(group) for name, group in groups.items()}
+
+
+# ---------------------------------------------------------------------------
+# Record counts by model, and time range
+# ---------------------------------------------------------------------------
+
+def records_by_model(records: list[dict[str, Any]]) -> dict[str, int]:
+    """Record counts keyed by ``llm.model`` (``"(no llm call)"`` for a
+    record whose ``llm`` block is absent, e.g. a T0 cache hit or a
+    pre-generation rejection).
+
+    Surfaced first in the report (see :func:`build_report`) so a reader
+    sees, before trusting any other number, whether this log is real
+    traffic or a stub/test backend (``mock:stub``, ``ollama:test``,
+    ``counting:test``, ...) left over from local development or CI.
+    """
+    counts: Counter[str] = Counter()
+    for rec in records:
+        llm = rec.get("llm")
+        model = (llm or {}).get("model") or "(no llm call)"
+        counts[model] += 1
+    return dict(counts.most_common())
+
+
+def _time_range(records: list[dict[str, Any]]) -> dict[str, str | None]:
+    """``{"start", "end"}`` ISO timestamps spanned by *records*, or
+    ``None``/``None`` for an empty log."""
+    timestamps = sorted(
+        rec["timestamp"] for rec in records if isinstance(rec.get("timestamp"), str)
+    )
+    if not timestamps:
+        return {"start": None, "end": None}
+    return {"start": timestamps[0], "end": timestamps[-1]}
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit hits — a stream of their own (admin panel phase 6, §4)
+# ---------------------------------------------------------------------------
+#
+# A 429 never reaches api/runner.py: api.middleware.RateLimitMiddleware
+# rejects it before the route (and therefore observability.audit's
+# AuditRecord writer) ever runs. audit_log.jsonl's own contract is "one
+# record per API query" (see observability/audit.py's module docstring),
+# and a throttled request never became one -- so there is genuinely
+# nothing in the analyst audit log to read for "how many times did this
+# principal hit the limit", and inventing an entry there would misuse a
+# compliance artefact whose shape means something specific.
+#
+# Rather than a second, independent counter (the exact thing the frozen
+# spec warns against for query counts), this is a second STREAM read by
+# the SAME per-principal report function below, through the SAME
+# resolve_log_paths/iter_records machinery every other section of this
+# module already uses -- one report, two inputs it is honest about,
+# rather than one input pretending to be the whole picture.
+
+def _rate_limit_hit_log_file() -> str:
+    if _RATE_LIMIT_HIT_LOG_FILE:
+        return _RATE_LIMIT_HIT_LOG_FILE
+    return os.path.join(cfg.settings.log_dir, "rate_limit_hits.jsonl")
+
+
+def record_rate_limit_hit(principal_id: str, path: str) -> None:
+    """Append one rate-limit-hit record. Called by
+    ``api.middleware.RateLimitMiddleware`` for every 429 issued to an
+    authenticated principal (never for an unauthenticated/anonymous 429,
+    which has no principal to attribute usage pressure to).
+
+    Never raises -- this runs on the rate limiter's own hot path, and a
+    logging failure must not turn into a second reason to reject a
+    request that was already being rejected for an unrelated one.
+    """
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "principal_id": principal_id,
+        "path": path,
+    }
+    try:
+        append_jsonl(_rate_limit_hit_log_file(), record)
+    except OSError as exc:  # pragma: no cover - defensive, mirrors appdb.admin_audit
+        logger.warning("Failed to write rate-limit-hit record: %s", exc)
+
+
+def resolve_rate_limit_hit_paths(patterns: Iterable[str] | None = None) -> list[Path]:
+    """:func:`resolve_log_paths` against :data:`_DEFAULT_RATE_LIMIT_HIT_GLOB`
+    rooted at ``cfg.settings.log_dir`` -- the read-side counterpart to
+    :func:`record_rate_limit_hit`, mirroring how ``api/admin_routes.py``
+    roots its own audit-log glob at that same setting rather than the
+    module-level default meant for the CLI."""
+    if patterns is None:
+        patterns = [os.path.join(cfg.settings.log_dir, "rate_limit_hits.jsonl*")]
+    return resolve_log_paths(patterns)
+
+
+# ---------------------------------------------------------------------------
+# Per-principal usage (admin panel phase 6, §4)
+# ---------------------------------------------------------------------------
+
+def per_principal_usage(
+    records: list[dict[str, Any]],
+    rate_limit_hit_records: list[dict[str, Any]] | None = None,
+    *,
+    since: str | None = None,
+    until: str | None = None,
+) -> dict[str, Any]:
+    """Per-``principal_id`` queries/failures/latency/rate-limit-hits over
+    a window -- the frozen spec's §4: "the bucket is the (principal, ip)
+    pair, and nobody can currently see whether its allowance is right."
+
+    Everything except the rate-limit-hit count comes from *records*
+    (``audit_log.jsonl``-shaped dicts, e.g. from :func:`iter_records`) --
+    the SAME records :func:`build_report` consumes for the exact same
+    window, so these figures can never diverge from what that report
+    already says about the same traffic. The rate-limit-hit count comes
+    from *rate_limit_hit_records* (e.g. from
+    :func:`resolve_rate_limit_hit_paths` + :func:`iter_records`) -- see
+    the section comment above this function for why that is a second
+    STREAM, not a second COUNTER for anything *records* already answers.
+
+    Parameters
+    ----------
+    since, until:
+        ISO-8601 timestamp strings (inclusive), compared as plain strings
+        -- safe because every timestamp this codebase writes is
+        ``datetime.now(timezone.utc).isoformat()``, which sorts
+        lexicographically in chronological order. ``None`` means
+        unbounded on that side.
+
+    Returns
+    -------
+    dict
+        ``{"since", "until", "principals": {principal_id: {...}},
+        "rate_limit_never_triggered"}``. Each principal's entry carries
+        ``queries``, ``failures``, ``latency_ms`` (:func:`_stats`'s shape
+        -- ``count``/``mean``/``p50``/``p95``/``p99``, so "median" is
+        ``p50``), and ``rate_limit_hits``. ``rate_limit_never_triggered``
+        is ``True`` when nobody, across every principal, hit the limit in
+        this window -- the frozen spec's own instruction: say that
+        plainly rather than rendering an all-zero chart that reads as "no
+        data" instead of "this control has never fired".
+    """
+
+    def _in_window(ts: Any) -> bool:
+        if not isinstance(ts, str):
+            return False
+        if since is not None and ts < since:
+            return False
+        if until is not None and ts > until:
+            return False
+        return True
+
+    selected = [r for r in records if _in_window(r.get("timestamp"))]
+    hits = [r for r in (rate_limit_hit_records or []) if _in_window(r.get("timestamp"))]
+
+    by_principal: dict[str, dict[str, Any]] = {}
+
+    def _bucket(principal_id: str) -> dict[str, Any]:
+        return by_principal.setdefault(
+            principal_id,
+            {
+                "principal_id": principal_id,
+                "queries": 0,
+                "failures": 0,
+                "rate_limit_hits": 0,
+                "_latencies_ms": [],
+            },
+        )
+
+    for rec in selected:
+        principal_id = rec.get("principal_id") or "(no principal)"
+        bucket = _bucket(principal_id)
+        bucket["queries"] += 1
+        if rec.get("error_code"):
+            bucket["failures"] += 1
+        total_ms = (rec.get("timings") or {}).get("total_ms")
+        if isinstance(total_ms, (int, float)):
+            bucket["_latencies_ms"].append(total_ms)
+
+    for rec in hits:
+        principal_id = rec.get("principal_id") or "(no principal)"
+        _bucket(principal_id)["rate_limit_hits"] += 1
+
+    total_rate_limit_hits = sum(b["rate_limit_hits"] for b in by_principal.values())
+
+    principals: dict[str, Any] = {}
+    for principal_id, bucket in by_principal.items():
+        latencies = bucket.pop("_latencies_ms")
+        bucket["latency_ms"] = _stats(latencies)
+        principals[principal_id] = bucket
+
+    return {
+        "since": since,
+        "until": until,
+        "principals": principals,
+        "rate_limit_never_triggered": total_rate_limit_hits == 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Top-level report
+# ---------------------------------------------------------------------------
+
+def build_report(
+    records: list[dict[str, Any]], *, include_examples: bool = False,
+) -> dict[str, Any]:
+    """Assemble the full aggregate report for *records*.
+
+    Parameters
+    ----------
+    records:
+        Parsed audit-log entries, e.g. from :func:`iter_records`.
+    include_examples:
+        Opt-in flag (default ``False``) — when true, a small number of
+        verbatim ``question`` strings (and guard-rejection error
+        messages) are attached alongside the aggregates. See the module
+        docstring's "Two modes" section before ever setting this true on
+        a report that will leave the server.
+
+    Returns
+    -------
+    dict
+        Always carries a top-level ``"mode"`` key
+        (``"aggregate_safe"`` or ``"aggregate_with_examples"``) naming
+        which mode produced it, so the report is self-describing even
+        once separated from the command that generated it.
+    """
+    return {
+        "mode": "aggregate_with_examples" if include_examples else "aggregate_safe",
+        "record_count": len(records),
+        "time_range": _time_range(records),
+        "records_by_model": records_by_model(records),
+        "latency": latency_report(records),
+        "finish_reason_distribution": finish_reason_distribution(records),
+        "failure_taxonomy": failure_taxonomy(records, include_examples=include_examples),
+        "cache_behaviour": cache_behaviour(records),
+        "sql_shape_clusters": sql_shape_clusters(records, include_examples=include_examples),
+        "guard_rejections": guard_rejection_report(records, include_examples=include_examples),
+        "correction_rounds": correction_rounds(records),
+        "llm_meta_summary": llm_meta_summary(records),
+        "llm_latency_split": llm_latency_split(records),
+        "latency_by_cache": latency_by_cache(records),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Human-readable rendering
+# ---------------------------------------------------------------------------
+
+def _fmt_ms(stats: dict[str, Any]) -> str:
+    if not stats or stats.get("count") == 0:
+        return "(no data)"
+    return (
+        f"n={stats['count']:<6} p50={stats['p50']:.0f}ms  "
+        f"p95={stats['p95']:.0f}ms  p99={stats['p99']:.0f}ms  "
+        f"mean={stats['mean']:.0f}ms"
+    )
+
+
+def _fmt_p(stats: dict[str, Any], unit: str) -> str:
+    """One line of p50/p95 for *stats*, or ``(no data)``; *unit* is ``"ms"`` or ``"tokens"``."""
+    if not stats or stats.get("count") == 0:
+        return "(no data)"
+    return (
+        f"n={stats['count']:<6} p50={stats['p50']:.0f} {unit}  "
+        f"p95={stats['p95']:.0f} {unit}"
+    )
+
+
+def render_text(report: dict[str, Any]) -> str:
+    """Render *report* (from :func:`build_report`) as a human-readable
+    summary suitable for a terminal or a pasted-into-chat message."""
+    lines: list[str] = []
+    w = lines.append
+
+    w("Audit log analysis report")
+    w("=" * 60)
+    w(f"mode            : {report['mode']}")
+    w(f"record_count    : {report['record_count']}")
+    w(f"time_range      : {report['time_range']['start']} .. {report['time_range']['end']}")
+    if report["mode"] != "aggregate_safe":
+        w(
+            "*** THIS REPORT INCLUDES VERBATIM EXAMPLE QUESTIONS. "
+            "Do not send it anywhere without checking that is acceptable. ***"
+        )
+    w("")
+
+    w("Records by model (real traffic vs. stub/test backends)")
+    w("-" * 60)
+    for model, count in report["records_by_model"].items():
+        w(f"  {model:<30} {count}")
+    w("")
+
+    w("Latency — overall")
+    w("-" * 60)
+    w(f"  {_fmt_ms(report['latency']['overall_ms'])}")
+    w("")
+    w("Latency — by stage")
+    w("-" * 60)
+    for stage, stats in report["latency"]["by_stage_ms"].items():
+        w(f"  {stage:<12} {_fmt_ms(stats)}")
+    w("")
+
+    w("finish_reason distribution ('length' == truncated, raise llm_num_predict)")
+    w("-" * 60)
+    for reason, count in report["finish_reason_distribution"].items():
+        w(f"  {reason:<20} {count}")
+    w("")
+
+    ft = report["failure_taxonomy"]
+    w("Failure taxonomy")
+    w("-" * 60)
+    w(f"  success_count : {ft['success_count']}")
+    w(f"  failure_count : {ft['failure_count']}")
+    w("  by bucket:")
+    for bucket, count in ft["by_bucket"].items():
+        w(f"    {bucket:<18} {count}")
+    w("  by error_code:")
+    for code, count in ft["by_error_code"].items():
+        w(f"    {code:<25} {count}")
+    w("")
+
+    cb = report["cache_behaviour"]
+    w("Cache behaviour")
+    w("-" * 60)
+    w(f"  T0 rate                : {cb['t0_rate']}  ({cb['t0_count']}/{cb['total_records']})")
+    w(
+        f"  prefix_cache_hit rate  : {cb['prefix_cache_hit_rate']}  "
+        f"({cb['prefix_cache_hit_count']}/{cb['llm_call_count']} llm calls)"
+    )
+    # .get(): a saved report from an older version has no such keys.
+    if cb.get("server_reported_count"):
+        w(
+            f"  real hit rate (server) : {cb['server_hit_rate']}  "
+            f"({cb['server_hit_count']}/{cb['server_reported_count']} calls with cached_tokens)"
+        )
+    else:
+        w("  real hit rate (server) : n/a (no call reported cached_tokens; the rate above is a "
+          "prompt-size estimate, see runbook 20.8)")
+    w("")
+
+    w("SQL-shape intent clusters (tables touched + join count; no question text)")
+    w("-" * 60)
+    for cluster in report["sql_shape_clusters"]:
+        tables = ", ".join(cluster["tables_touched"]) or "(none)"
+        w(f"  [{cluster['count']:>4}] joins={cluster['join_count']:<3} tables={tables}")
+    w("")
+
+    gr = report["guard_rejections"]
+    w("Guard rejections -- statement shapes below were REFUSED, NEVER EXECUTED")
+    w("-" * 60)
+    w(f"  total_rejections : {gr['total_rejections']}")
+    w(f"  {_STATEMENT_NOT_RECORDED:<45} {gr['statement_not_recorded_total']}")
+    w("  by reason:")
+    for reason, count in gr["by_reason"].items():
+        w(f"    {reason:<25} {count}")
+    if gr["statement_not_recorded_by_reason"]:
+        w(f"  {_STATEMENT_NOT_RECORDED} by reason:")
+        for reason, count in gr["statement_not_recorded_by_reason"].items():
+            w(f"    {reason:<25} {count}")
+    w("  subject counts by reason (the single keyword/column/table the "
+      "guard named):")
+    for reason, subjects in gr["subject_counts_by_reason"].items():
+        parts = ", ".join(
+            f"{_safe_display(subject)} ×{count}" for subject, count in subjects.items()
+        )
+        w(f"    {reason}: {parts}")
+    w("  refused statement shapes by reason (tables touched + join count; "
+      "REFUSED, NEVER EXECUTED):")
+    for reason, shapes in gr["refused_statement_shapes_by_reason"].items():
+        w(f"    reason={reason}")
+        for shape in shapes:
+            tables = ", ".join(shape["tables_touched"]) or "(no table)"
+            w(f"      [{shape['count']:>4}] joins={shape['join_count']:<3} tables={tables}")
+    w("")
+
+    cr = report["correction_rounds"]
+    w("Correction rounds")
+    w("-" * 60)
+    w(f"  distribution           : {cr['distribution']}")
+    w(f"  success rate by rounds : {cr['success_rate_by_rounds']}")
+    w(
+        f"  ever corrected         : {cr['records_with_any_correction']} "
+        f"(succeeded: {cr['records_with_any_correction_that_succeeded']})"
+    )
+    w("")
+
+    lm = report["llm_meta_summary"]
+    w("LLM meta summary")
+    w("-" * 60)
+    w(f"  llm_call_count                : {lm['llm_call_count']}")
+    w(f"  reasoning_detected             : {lm['reasoning_detected_count']} "
+      f"({lm['reasoning_detected_rate']})")
+    w(f"  provider_distribution          : {lm['provider_distribution']}")
+    w(f"  fallback_used                  : {lm['fallback_used_count']} "
+      f"({lm['fallback_used_rate']})")
+    w(f"  seed_requested                 : {lm['seed_requested_count']}")
+    w(f"  seed_honored (of requested)    : {lm['seed_honored_count']} "
+      f"({lm['seed_honored_rate_among_seed_requested']})")
+    w("")
+
+    # .get(): a report built by an older version of this script (a saved
+    # --json file fed back through render_text) has no such section.
+    ls = report.get("llm_latency_split")
+    if ls:
+        w("LLM stage split (needs LLM_STREAM_TIMINGS=true for the timings)")
+        w("-" * 60)
+        w(f"  streamed calls                 : {ls['streamed_call_count']} of {ls['llm_call_count']}")
+        w(f"  ttft (queue + prefill)         : {_fmt_p(ls['ttft_ms'], 'ms')}")
+        w(f"  generation (first token -> end): {_fmt_p(ls['generation_ms'], 'ms')}")
+        w(f"  ttft share of the call (median): {ls['ttft_share_of_total']}")
+        w(f"  reasoning tokens               : {_fmt_p(ls['reasoning_tokens'], 'tokens')}")
+        w(f"  reasoning tokens estimated     : {ls['reasoning_tokens_estimated_count']} "
+          f"of {ls['reasoning_tokens_count']}")
+        w(f"  reasoning share of completion  : {ls['reasoning_share_of_completion']}")
+    lc = report.get("latency_by_cache")
+    if lc:
+        w("")
+        w("LLM stage by real cache hit (server-reported cached_tokens)")
+        w("-" * 60)
+        for name in ("hit", "miss", "unreported"):
+            g = lc[name]
+            w(f"  {name:<10} n={g['count']:<5} stage: {_fmt_p(g['llm_ms'], 'ms')}")
+    w("=" * 60)
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Aggregate report over logs/audit_log.jsonl (and rotated backups), "
+            "including a guard-rejection section (counts by reason and by "
+            "subject, plus the shape of the most frequently refused "
+            "statements -- REFUSED, NEVER EXECUTED). Default output is "
+            "fully aggregated and safe to copy off the server; see "
+            "--include-examples for up to 3 verbatim refused statements "
+            "per reason."
+        ),
+    )
+    parser.add_argument(
+        "paths", nargs="*", default=[_DEFAULT_GLOB],
+        help=(
+            "Log file(s) and/or glob pattern(s) to read. Default: "
+            f"'{_DEFAULT_GLOB}' (the active audit log plus any rotated backups)."
+        ),
+    )
+    parser.add_argument(
+        "--include-examples", action="store_true",
+        help=(
+            "Opt-in: attach a small number of verbatim example questions "
+            "(and guard-rejection error messages) to the report. NOT the "
+            "default — read the module docstring's 'Two modes' section "
+            "before using this on a report that will leave the server."
+        ),
+    )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="Print the full report as JSON instead of the human-readable summary.",
+    )
+    parser.add_argument(
+        "--quality-days", type=int, default=7, metavar="N",
+        help=(
+            "Width in days of the windowed half of the real-use quality "
+            "section (default 7); the all-time half is always printed."
+        ),
+    )
+    args = parser.parse_args(argv)
+    if args.quality_days < 1:
+        parser.error("--quality-days must be at least 1")
+
+    paths = resolve_log_paths(args.paths)
+    if not paths:
+        print(f"No log files matched: {args.paths}", file=sys.stderr)
+        return 1
+
+    records = list(iter_records(paths))
+    report = build_report(records, include_examples=args.include_examples)
+
+    # Imported here, not at module level: observability.quality imports this
+    # module's aggregation functions, so a top-level import would be a cycle.
+    from observability.quality import build_quality_report, load_ratings, render_quality_text
+
+    ratings = load_ratings()
+    quality = build_quality_report(
+        records,
+        confirmations=ratings.confirmations,
+        flags=ratings.flags,
+        days=args.quality_days,
+    )
+
+    if args.json:
+        print(json.dumps({**report, "quality": quality}, ensure_ascii=False, indent=2))
+    else:
+        print(render_text(report))
+        print()
+        print(render_quality_text(quality))
+
+    return 0
+
+
+if __name__ == "__main__":
+    use_utf8_console()
+    sys.exit(main())

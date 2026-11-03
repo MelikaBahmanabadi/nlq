@@ -1,0 +1,416 @@
+# SPDX-License-Identifier: BUSL-1.1
+# Copyright (c) 2024-2026 Ali Sadeghi Aghili
+"""Thread-safe TTL query-result cache.
+
+Caches the full ``QueryResponse`` keyed on ``(prefix_version, question, mode)``,
+and — Phase 2 task 6 — a second time on ``(prefix_version, sql, mode)`` so a
+*different* question that happens to generate the same SQL can reuse the
+execution result without hitting the database again.
+
+Design
+------
+* **LRU + TTL**: entries are evicted when they exceed ``ttl_seconds`` OR
+  when the store exceeds ``max_size`` (oldest-inserted evicted first via
+  ``OrderedDict``).
+* **Thread-safe**: a single ``threading.Lock`` guards all mutations.
+* **Opt-out**: callers pass ``cache=False`` to ``run_query`` to skip the
+  cache entirely (e.g. ``mode='sql'`` where freshness matters).
+* **Metrics**: ``hits``, ``misses``, ``evictions`` counters for observability.
+* **Normalised keys**: the question half of the key is normalised first
+  (see :func:`_normalize_question`) so whitespace differences, Persian vs.
+  Arabic-Indic digits, ZWNJ, and ي/ك vs. ی/ک don't create separate cache
+  entries for what is, for every practical purpose, the same question.
+* **Prefix-versioned keys**: every key embeds
+  ``prompt_engine.static_prefix.prefix_version`` for the system prompt in
+  effect, so a knowledge-base change (a business rule edited, a table
+  added) invalidates old entries by construction — they simply become
+  unreachable under the new version's keys, rather than requiring an
+  explicit flush that's easy to forget. The question-keyed store's
+  prefix component additionally carries
+  ``core.persian.NORMALIZER_VERSION`` (see ``_QUESTION_KEY_NAMESPACE``)
+  for the same reason: a change to the Persian-folding rules must not
+  let an old entry collide with a new one that now normalises
+  differently.
+* **No data-source component in the key** (multiple warehouse sources,
+  see ``database.datasources``): a cache entry stores the *result rows*
+  a query already ran and returned, not a pending routing decision — a
+  hit never calls ``database.routing.resolve_datasource`` or
+  ``database.executor.execute_sql`` again, so which source a hit's SQL
+  *would* route to today cannot change what it serves. And which source
+  it routed to when the entry was written cannot itself change out from
+  under a live entry: a table's source (``schema.yaml``'s ``datasource:``)
+  needs a restart to change (``schema_data.registry``'s allowlist is
+  frozen for the process's life — see ``appdb/config_versions.py``'s
+  module docstring), and ``datasources.yaml`` is documented as
+  restart-required too — and this module-level ``query_cache`` singleton
+  starts empty on every restart regardless. See
+  ``docs/design/DATASOURCES.md``'s "Result cache" section for the full
+  argument.
+
+Usage::
+
+    from api.query_cache import query_cache
+
+    entry = query_cache.get("سوال", "full", prefix_version="a1b2c3")
+    if entry is None:
+        ...  # compute
+        query_cache.set("سوال", "full", response, prefix_version="a1b2c3")
+
+    query_cache.clear()          # flush all
+    query_cache.stats()          # {hits, misses, evictions, size}
+"""
+
+from __future__ import annotations
+
+import re
+import threading
+import time
+from collections import OrderedDict
+from typing import NamedTuple
+
+import config as cfg
+from api.models import QueryResponse
+from core.persian import NORMALIZER_VERSION, normalize_for_matching
+
+# ---------------------------------------------------------------------------
+# Question normalisation
+# ---------------------------------------------------------------------------
+
+_WHITESPACE_RE = re.compile(r"\s+")
+
+#: Folded into the question-keyed store's prefix_version component (see
+#: `_question_key`) so a normaliser upgrade that changes
+#: normalize_for_matching's output cannot let an entry written under the
+#: old folding rules collide with one written under the new rules.
+#: A version bump therefore causes a one-off mass cache miss for every
+#: in-flight entry the moment it deploys -- that is intended, not a bug:
+#: the alternative is silently serving an answer keyed on the wrong
+#: notion of "same question".
+_QUESTION_KEY_NAMESPACE = f"persian-norm-v{NORMALIZER_VERSION}"
+
+
+def _normalize_question(question: str) -> str:
+    """Fold a question to a canonical form for cache-key equality.
+
+    Delegates the actual folding to :func:`core.persian.normalize_for_matching`
+    -- the same function every other Persian-text-matching call site in this
+    codebase now uses, so two spellings of the same question can never hash
+    to different cache keys while also being treated as different questions
+    by, say, the value retriever's filter extraction. See that module's
+    docstring for exactly what folds.
+
+    Parameters
+    ----------
+    question:
+        Raw question text.
+
+    Returns
+    -------
+    str
+        Normalised form, safe to use as (part of) a cache key.
+
+    Examples
+    --------
+    >>> _normalize_question("  خرید   در ۱۴۰۲  ")
+    'خرید در 1402'
+    >>> _normalize_question("خرید در ١٤٠٢") == _normalize_question("خرید در 1402")
+    True
+    >>> _normalize_question("علي") == _normalize_question("علی")
+    True
+    >>> _normalize_question("می‌خواهم") == _normalize_question("میخواهم")
+    True
+
+    Disabled via ``Settings.cache_normalize_questions=False``, only
+    whitespace is stripped (the pre-Phase-2 behaviour) — kept as an
+    escape hatch in case aggressive folding ever proves wrong for a
+    specific deployment's data. This switch affects the cache's key
+    only -- it has no effect on :func:`core.persian.normalize_for_matching`
+    itself, which every other call site keeps using unconditionally:
+
+    >>> from config import override_settings
+    >>> with override_settings(cache_normalize_questions=False):
+    ...     _normalize_question("  خرید در ۱۴۰۲  ")
+    'خرید در ۱۴۰۲'
+    """
+    if not cfg.settings.cache_normalize_questions:
+        return question.strip()
+    return normalize_for_matching(question)
+
+
+class _CacheEntry(NamedTuple):
+    response: QueryResponse
+    expires_at: float  # monotonic time
+
+
+class QueryCache:
+    """LRU + TTL in-memory cache for query responses.
+
+    Parameters
+    ----------
+    ttl_seconds:
+        Time-to-live per entry in seconds.  ``0`` disables the cache.
+    max_size:
+        Maximum number of entries before LRU eviction kicks in. Applied
+        independently to the question-keyed store and the SQL-keyed store.
+    """
+
+    def __init__(self, ttl_seconds: int = 300, max_size: int = 256) -> None:
+        self._ttl = ttl_seconds
+        self._max_size = max_size
+        self._store: OrderedDict[tuple[str, str, str, str], _CacheEntry] = OrderedDict()
+        # Secondary index: (prefix_version, mode, normalised_sql, scope_key) -> entry.
+        # Populated alongside `_store` by set() when `sql` is supplied, so a
+        # DIFFERENT question that happens to generate the SAME SQL can reuse
+        # the execution result (see api/runner.py's sql_cache_lookup hook
+        # passed into SQLAgent.run) without hitting the database again.
+        self._sql_store: OrderedDict[tuple[str, str, str, str], _CacheEntry] = OrderedDict()
+        self._lock = threading.Lock()
+        self._hits = 0
+        self._misses = 0
+        self._evictions = 0
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    @property
+    def enabled(self) -> bool:
+        """False when TTL is 0 — callers may short-circuit."""
+        return self._ttl > 0
+
+    @staticmethod
+    def _question_key(
+        question: str, mode: str, prefix_version: str, scope_key: str = "",
+    ) -> tuple[str, str, str, str]:
+        # _QUESTION_KEY_NAMESPACE rides along with prefix_version (the
+        # existing invalidation channel) rather than becoming a fifth
+        # tuple element, so a normaliser-version change invalidates old
+        # entries the exact same way a knowledge-base change does.
+        versioned_prefix = f"{prefix_version}|{_QUESTION_KEY_NAMESPACE}"
+        return (versioned_prefix, _normalize_question(question), mode, scope_key)
+
+    @staticmethod
+    def _sql_key(
+        sql: str, mode: str, prefix_version: str, scope_key: str = "",
+    ) -> tuple[str, str, str, str]:
+        # SQL is not natural-language text, so only whitespace collapsing
+        # applies -- Persian-digit/letter folding would be meaningless (and
+        # potentially wrong: a literal N'١٤٠٢' string value should not be
+        # rewritten).
+        normalized = _WHITESPACE_RE.sub(" ", sql).strip()
+        return (prefix_version, normalized, mode, scope_key)
+
+    def get(
+        self, question: str, mode: str, *, prefix_version: str = "", scope_key: str = "",
+    ) -> QueryResponse | None:
+        """Return a copy of the cached response, or ``None`` (miss / expired / disabled).
+
+        A fresh ``model_copy()`` is returned on every call — never the
+        instance actually stored — so a caller mutating the returned
+        object (e.g. ``api/server.py`` setting ``elapsed_seconds`` after
+        every request) can never corrupt the cached entry, whether this
+        is the only reader or one of many concurrent cache hits sharing
+        the same key.
+
+        Parameters
+        ----------
+        question, mode:
+            As before.
+        prefix_version:
+            Fingerprint of the static prompt prefix in effect (see
+            ``prompt_engine.static_prefix.prefix_version``). Defaults to
+            ``""`` for callers that don't version their cache (e.g. tests
+            constructing a bare ``QueryCache``) — a knowledge-base change
+            then relies on an explicit ``clear()`` instead of automatic
+            invalidation.
+        scope_key:
+            The caller's cache-partition key (see
+            :func:`security.auth.scope_key`) — two callers with
+            identical scope keys share entries; different scope keys can
+            never collide, even for the same question/mode/prefix.
+            Defaults to ``""``, a single shared partition, for callers
+            that don't scope their cache (e.g. tests constructing a bare
+            ``QueryCache``, or any caller with no authenticated
+            principal at all).
+        """
+        if not self.enabled:
+            return None
+
+        key = self._question_key(question, mode, prefix_version, scope_key)
+        return self._get_from(self._store, key)
+
+    def get_by_sql(
+        self, sql: str, mode: str, *, prefix_version: str = "", scope_key: str = "",
+    ) -> QueryResponse | None:
+        """Look up a cached response by generated SQL text instead of question.
+
+        Lets two different questions that happen to generate the same SQL
+        share one execution result. Callers that only need the rows should
+        read ``.result`` off the returned :class:`~api.models.QueryResponse`
+        (e.g. to rebuild a ``pandas.DataFrame``) rather than returning this
+        object to the client directly — it reflects whichever question
+        generated it first, not the caller's own question.
+
+        See :meth:`get` for *scope_key*.
+        """
+        if not self.enabled:
+            return None
+
+        key = self._sql_key(sql, mode, prefix_version, scope_key)
+        return self._get_from(self._sql_store, key)
+
+    def _get_from(
+        self,
+        store: OrderedDict[tuple[str, str, str, str], _CacheEntry],
+        key: tuple[str, str, str, str],
+    ) -> QueryResponse | None:
+        now = time.monotonic()
+        with self._lock:
+            entry = store.get(key)
+            if entry is None:
+                self._misses += 1
+                return None
+
+            if now > entry.expires_at:
+                del store[key]
+                self._evictions += 1
+                self._misses += 1
+                return None
+
+            store.move_to_end(key)
+            self._hits += 1
+            return entry.response.model_copy()
+
+    def set(
+        self,
+        question: str,
+        mode: str,
+        response: QueryResponse,
+        *,
+        prefix_version: str = "",
+        sql: str | None = None,
+        scope_key: str = "",
+    ) -> None:
+        """Store a copy of *response* under ``(prefix_version, question, mode, scope_key)``.
+
+        Storing ``response.model_copy()`` rather than *response* itself
+        matters just as much as copying in :meth:`get`: the caller
+        (``api/runner.py``) hands the very same object it just passed
+        here straight back to ``api/server.py``, which then mutates
+        ``elapsed_seconds`` on it — that mutation must not reach the
+        object living inside the cache either.
+
+        Parameters
+        ----------
+        question, mode, response:
+            As before.
+        prefix_version:
+            See :meth:`get`.
+        sql:
+            The generated SQL text for this response, if known. When
+            given, the response is ALSO indexed under
+            ``(prefix_version, sql, mode, scope_key)`` so a different
+            question that later generates the same SQL can reuse it (see
+            :meth:`get_by_sql`). ``None`` (the default) skips SQL
+            indexing — e.g. there is nothing meaningful to index for an
+            empty/failed generation.
+        scope_key:
+            See :meth:`get`.
+        """
+        if not self.enabled:
+            return
+
+        stored = response.model_copy()
+        expires_at = time.monotonic() + self._ttl
+
+        with self._lock:
+            self._set_in(
+                self._store,
+                self._question_key(question, mode, prefix_version, scope_key),
+                stored, expires_at,
+            )
+            if sql:
+                self._set_in(
+                    self._sql_store,
+                    self._sql_key(sql, mode, prefix_version, scope_key),
+                    stored, expires_at,
+                )
+
+    def _set_in(
+        self,
+        store: OrderedDict[tuple[str, str, str, str], _CacheEntry],
+        key: tuple[str, str, str, str],
+        stored: QueryResponse,
+        expires_at: float,
+    ) -> None:
+        if key in store:
+            store.move_to_end(key)
+            store[key] = _CacheEntry(stored, expires_at)
+            return
+
+        while len(store) >= self._max_size:
+            store.popitem(last=False)
+            self._evictions += 1
+
+        store[key] = _CacheEntry(stored, expires_at)
+
+    def invalidate(
+        self, question: str, mode: str, *, prefix_version: str = "", scope_key: str = "",
+    ) -> bool:
+        """Remove a specific question-keyed entry.  Returns True if it was present.
+
+        Does not remove the corresponding SQL-keyed entry (if any) — that
+        entry may still legitimately serve a *different* question that
+        generated the same SQL, and this call has no way to know whether
+        the caller wants that shared entry gone too.
+        """
+        key = self._question_key(question, mode, prefix_version, scope_key)
+        with self._lock:
+            if key in self._store:
+                del self._store[key]
+                return True
+            return False
+
+    def clear(self) -> None:
+        """Flush the entire cache (both the question- and SQL-keyed stores)."""
+        with self._lock:
+            self._store.clear()
+            self._sql_store.clear()
+
+    def stats(self) -> dict:
+        """Return a snapshot of cache metrics."""
+        with self._lock:
+            return {
+                "hits": self._hits,
+                "misses": self._misses,
+                "evictions": self._evictions,
+                "size": len(self._store),
+                "sql_index_size": len(self._sql_store),
+                "max_size": self._max_size,
+                "ttl_seconds": self._ttl,
+                "enabled": self.enabled,
+            }
+
+    def reconfigure(self, ttl_seconds: int, max_size: int) -> None:
+        """Hot-reload config and wipe stale entries.
+
+        Clearing the store is mandatory: entries stored under the old TTL
+        carry an ``expires_at`` timestamp that is meaningless under a new
+        TTL.  Keeping them would allow expired data to be served (if the
+        new TTL is longer) or hide a test-isolation bug (if shorter).
+        """
+        with self._lock:
+            self._ttl = ttl_seconds
+            self._max_size = max_size
+            self._store.clear()   # ← key fix: wipe stale entries
+            self._sql_store.clear()
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton — import this everywhere
+# ---------------------------------------------------------------------------
+
+query_cache = QueryCache(
+    ttl_seconds=cfg.settings.cache_ttl_seconds,
+    max_size=cfg.settings.cache_max_size,
+)

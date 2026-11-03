@@ -1,0 +1,41 @@
+# entities.yaml — TEMPLATE (copy to project_config/entities.yaml and fill in real data)
+#
+# Each top-level key is the name of a table, EXACTLY as schema.yaml keys it
+# (a bare name such as `Customer`, or `Schema.Table` such as `sales.Customer`
+# when several schemas share the name). Retrieval reads the key as the table:
+# a key that is not a key of schema.yaml names no table, and its aliases match
+# nothing. Keep ONE entity per table. The preflight check
+# `Entities match schema keys` verifies all of this.
+# The three entries below name tables of this template's schema.yaml; replace
+# them with your own tables and keys when you copy the file.
+#
+# aliases: list of surface forms a user might use in a question
+#          (include both native language and English forms)
+# table:   the database table name this entity maps to (the key's last part)
+# schema_name: optional — the table's schema (e.g. "sales")
+# label:   optional — an analyst-facing display name for this entity (e.g.
+#          "تالار" for a Ring/trading-hall entity). Shown to an analyst in
+#          a message naming this dimension (e.g. "the <label> list is
+#          currently unavailable") when the vocabulary that would resolve
+#          it could not be checked this request. Leave unset for a generic
+#          phrasing instead.
+
+entities:
+  # Example 1: a dimension entity (replace with one of your tables)
+  Customer:
+    aliases: ["customer", "client", "buyer"]
+    table: "Customer"
+    schema_name: "sales"
+
+  # Example 2: another dimension entity with multilingual aliases
+  # (add the native-language forms next to the English ones)
+  Currency:
+    aliases: ["currency", "exchange currency", "native_word_for_currency"]
+    table: "Currency"
+    schema_name: "ref"
+
+  # Example 3: a lookup entity
+  OrderStatus:
+    aliases: ["order status", "status", "state of the order"]
+    table: "OrderStatus"
+    schema_name: "sales"

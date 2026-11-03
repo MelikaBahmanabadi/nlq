@@ -1,0 +1,4922 @@
+# SPDX-License-Identifier: BUSL-1.1
+# Copyright (c) 2024-2026 Ali Sadeghi Aghili
+"""One-time project setup wizard for local-sql-agent.
+
+Usage
+-----
+::
+
+    # every data source of project_config/datasources.yaml, through the
+    # application's own login
+    python setup_project.py
+    python setup_project.py --datasource sales --datasource reports
+
+    # a first install: one database, by URL
+    python setup_project.py \\
+        --db-url  "mssql+pyodbc://server/db?driver=ODBC+Driver+17+for+SQL+Server" \\
+        --llm-provider openai \\
+        --llm-model    gpt-oss-20b \\
+        --language     fa \\
+        --output       project_config_draft/ \\
+        --review       interactive
+
+Flags
+-----
+--db-url URL        One database, read with the login in the URL (a first
+                    install). Without it, and with a ``datasources.yaml``,
+                    every data source in that file is read; with neither, the
+                    wizard uses ``DB_CONNECTION_URL``, then ``DATABASE_URL``,
+                    else it asks.
+--datasource NAME   Read only this data source of ``datasources.yaml``
+                    (repeatable; default: all). Not with ``--db-url``.
+--output DIR        Where the draft files are written. Default:
+                    ``project_config_draft/`` (ignored by version control).
+                    The wizard refuses to write into the live configuration
+                    directory (``PROJECT_CONFIG_DIR``, by default
+                    ``project_config/``) or ``project_config.example/`` unless
+                    ``--overwrite-live`` is given; review the drafts and copy
+                    the files you accept into ``project_config/`` yourself.
+--overwrite-live    Allow ``--output`` to be a protected directory. Every file
+                    the wizard is about to replace is first copied to
+                    ``<name>.bak-<YYYYmmdd-HHMMSS>`` next to it, and the
+                    copies are listed. Files the wizard does not produce are
+                    never touched.
+--fresh             Start from scratch: ignore the files already in the
+                    output directory instead of merging into them.
+--include-schemas   Comma-separated schemas to read (default: all).
+--exclude-schemas   Comma-separated ``fnmatch`` patterns (case-insensitive) of
+                    schemas to leave out in this run, on top of the system
+                    schemas, ``EXCLUDE_SCHEMAS`` and each source's
+                    ``exclude_schemas:``; wins over ``--include-schemas``.
+--include-staging   Keep the staging and change-capture tables that
+                    ``STAGING_PATTERNS`` names; by default they are skipped.
+--non-interactive   Accept all LLM suggestions without prompting (CI mode).
+--dry-run           Print generated YAML to stdout; do not write files (the
+                    setup log included).
+--resume            Continue an interrupted run from the first step that
+                    ``.setup_log.json`` does not record as completed. Steps 1
+                    and 2 (connection, schema) run again, because the
+                    connection string is never stored; the aliases, rules and
+                    examples of completed LLM steps are reused rather than
+                    generated again, unless the schema or language changed; a
+                    file that already exists is not rewritten; when steps 1-6
+                    are all done and every file exists only the validation
+                    runs. Without ``--resume`` a new log is started.
+
+--value-synonyms    Also write ``aliases.yaml`` ``synonyms`` taken from the
+                    values of label columns (name, title, kind, status, type)
+                    with at most 50 distinct values. Off by default: values
+                    read from rows do not belong in a prompt or a versioned
+                    file. Dates, numbers and codes, phone numbers, e-mail and
+                    IP addresses, URLs, addresses, masked values, error text,
+                    values over 40 characters, and every column named like
+                    personal or contact data are never taken; at most 20 keys
+                    per table.
+
+--keep-existing-synonyms
+                    Keep, when merging, the synonym keys of an earlier
+                    ``aliases.yaml`` that are values read from rows. By
+                    default they are dropped (counted per shape, never listed).
+
+--allow-repeated-answers
+                    Do not stop a per-table step (3 aliases, 4 business rules)
+                    when 3 tables in a row get the identical answer. By
+                    default the wizard stops there, writes no file and leaves
+                    the run resumable, because identical answers for different
+                    tables mean a response cache in front of the model is
+                    returning one stored reply (see "Repeated answers" below).
+                    For a genuinely tiny schema whose tables really are alike.
+
+LLM endpoint
+------------
+The model that suggests aliases, rules and examples is chosen, for each of
+endpoint / model / key, from the command-line flag, then ``WIZARD_LLM_BASE_URL``
+/ ``WIZARD_LLM_MODEL``, then the application's own ``OPENAI_BASE_URL`` /
+``OPENAI_MODEL`` / ``OPENAI_API_KEY`` (an empty ``WIZARD_*`` value counts as
+unset). The wizard prints one line naming the provider, model and endpoint
+(never the key). It sends table and column names and sample column values to
+that endpoint, so it obeys the application's data-governance rule: an endpoint
+that is not local (see ``llm/trust.py``, ``LLM_TRUSTED``) is refused unless
+``LLM_ALLOW_REMOTE=true``. If the endpoint does not answer, the wizard says so
+loudly and continues with the mock LLM, which generates nothing.
+
+Repeated answers
+----------------
+Steps 3 and 4 ask the model one question per table. A gateway in front of the
+model server that keeps a *response cache* (semantic or prefix) can answer all
+of them with the reply to the first, and nothing in the reply says so. The
+wizard compares the model's parsed answers as they arrive (the alias list in
+step 3; the rule text, with the table names taken out, in step 4). When 3
+consecutive tables get the identical non-empty answer it stops that step, says
+what it suspects and how to confirm it
+(``python scripts/verify_deployment.py``, the check ``Model endpoint answers
+each prompt itself``), writes no file and exits with status 3; steps already
+completed stay recorded, so ``--resume`` continues after the endpoint is
+fixed. ``--allow-repeated-answers`` turns the stop into a warning. Each of
+these steps ends with a line giving the number of distinct answers against the
+number of tables. Step 5 asks one question for the whole schema, so there is
+nothing to compare.
+
+Merging
+-------
+Run once per database, the wizard merges into the files already in the output
+directory instead of replacing them. Entries are keyed like the schema
+inspector's (``Table`` when the name is unique, ``Schema.Table`` when several
+schemas share it); an entry for a table of this run replaces the old one with
+the same key (unless the model gave nothing for it and the old entry has
+aliases or a rule: that one is kept), every other old entry stays, examples are
+de-duplicated by question and relationships by their endpoints. An old entry whose bare name
+must now be qualified is re-keyed and reported. The summary says how many
+entries were kept, added and replaced per file. ``--fresh`` skips the merge.
+
+Data sources
+------------
+With a ``datasources.yaml`` and no ``--db-url`` each source is opened with
+``database.connection.get_engine`` (the engine the server uses, so the wizard
+sees what the application's login can query) and all of them are listed,
+planned, inspected and keyed together: a bare table name shared by several
+schemas or sources becomes ``Schema.Table``, a ``schema.table`` found in two
+sources is one entity, and with several sources configured each entity carries
+``datasource: [a, b]`` (``database.schema_draft.listed_datasources``). Per
+source the schemas left out are, in order: the system schemas,
+``EXCLUDE_SCHEMAS``, the source's ``exclude_schemas:``, ``--exclude-schemas``,
+the operator's answer; the summary counts them per rule as the inspector does.
+Tables named by ``EXCLUDE_TABLES`` or the source's ``exclude_tables:`` are left
+out too, and a schema in ``keep_staging_schemas:`` is exempt from the schema
+patterns of ``STAGING_PATTERNS``.
+Schemas left out interactively can be recorded: as that source's
+``exclude_schemas:`` in ``datasources.yaml`` (default No; a comment-preserving
+edit after a backup, validated before the file is replaced), or, without the
+file, as an ``EXCLUDE_SCHEMAS=`` line printed for ``.env``.
+
+Tables
+------
+The wizard first lists schema and table names (nothing else is read), applies
+``--include-schemas``, ``--exclude-schemas`` and, in interactive mode, the
+schemas the operator picks after seeing them with their table counts, and only
+then inspects what remains: a schema that is left out is never scanned for
+columns or sample values. Staging and change-capture tables
+(``STAGING_PATTERNS``) are left out too (a staging table whose name no other
+table shares is not read; one whose name is shared is read and dropped), so
+none of them reaches the model; the summary says how many were skipped and why. When the database declares few
+foreign keys, relationships are inferred from column names
+(``schema_data.relationship_proposals``) and marked ``REVIEW`` in
+``relationships.yaml``; the business-rules prompt sees them as join hints.
+
+The wizard writes ``.setup_log.json`` into the output directory recording
+every step that was executed and when (and the aliases, rules and examples the
+model produced), so it can be resumed safely. The connection string is stored
+only with its password masked.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import logging
+import os
+import subprocess
+import sys
+import textwrap
+from collections.abc import Iterable
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Mapping
+
+# ---------------------------------------------------------------------------
+# Rich / questionary — graceful fallback if not installed
+# ---------------------------------------------------------------------------
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.progress import Progress, SpinnerColumn, TextColumn
+    from rich import print as rprint
+    _RICH = True
+except ImportError:  # pragma: no cover
+    _RICH = False
+    class Console:  # type: ignore[no-redef]
+        def print(self, *a, **kw): print(*a)
+        def rule(self, *a, **kw): print("-" * 60)
+    rprint = print  # type: ignore[assignment]
+
+try:
+    import questionary
+    _QUESTIONARY = True
+except ImportError:  # pragma: no cover
+    _QUESTIONARY = False
+
+try:
+    import yaml
+except ImportError:
+    sys.exit("PyYAML is required: pip install pyyaml")
+
+from core.config_doctor import WIZARD_DRAFT_HEADER
+from core.console import use_utf8_console
+from core.value_shapes import data_shape, prompt_samples
+from core.wizard_drafts import (
+    ALIAS_LIMIT,
+    DEFAULT_DRAFT_DIR,
+    MergeStats,
+    back_up,
+    collapse_same_key,
+    drop_table_rings,
+    hold_back_empty,
+    merge_examples,
+    merge_mapping,
+    merge_relationships,
+    merge_synonyms,
+    protected_directory,
+    refusal_message,
+)
+from core.yaml_loading import safe_load_strict
+from database.schema_draft import (
+    RULE_CHOSEN,
+    RULE_STAGING,
+    Skipped,
+    describe_skipped,
+    listed_datasources,
+)
+from database.schema_filter import (
+    RULE_CLI,
+    RULE_CONFIGURED,
+    RULE_SYSTEM,
+    RULE_TABLES,
+    SchemaExclusion,
+)
+
+# Credential redaction lives in core/redaction.py (shared with the schema
+# inspector and the application-database messages). The wizard keeps its
+# historical underscore names for the two helpers it and its tests use.
+from core.redaction import redact_db_url as _redact_db_url
+from core.redaction import scrub_secrets as _scrub_secrets
+
+console = Console()
+logger  = logging.getLogger(__name__)
+
+_DEFAULT_OUTPUT = Path(DEFAULT_DRAFT_DIR)
+_SETUP_LOG      = _DEFAULT_OUTPUT / ".setup_log.json"
+
+# DB type help text shown on connection failure
+_DB_EXAMPLES = """
+  MSSQL  : mssql+pyodbc://user:pass@server/db?driver=ODBC+Driver+17+for+SQL+Server
+  PostgreSQL: postgresql+psycopg2://user:pass@host:5432/db
+  MySQL  : mysql+pymysql://user:pass@host:3306/db
+  SQLite : sqlite:///path/to/file.db
+"""
+
+
+# ===========================================================================
+# Helpers
+# ===========================================================================
+
+def _yn(question: str, default: bool = True, non_interactive: bool = False) -> bool:
+    """Ask a yes/no question; return default when non-interactive."""
+    if non_interactive:
+        return default
+    if _QUESTIONARY:
+        return questionary.confirm(question, default=default).ask()
+    ans = input(f"{question} [{'Y/n' if default else 'y/N'}]: ").strip().lower()
+    if not ans:
+        return default
+    return ans.startswith("y")
+
+
+def _ask(question: str, default: str = "", non_interactive: bool = False) -> str:
+    """Ask a text question; return default when non_interactive."""
+    if non_interactive:
+        return default
+    if _QUESTIONARY:
+        return questionary.text(question, default=default).ask() or default
+    ans = input(f"{question} [{default}]: ").strip()
+    return ans or default
+
+
+def _choose(
+    question: str,
+    choices: list[str],
+    default: str,
+    non_interactive: bool = False,
+) -> str:
+    if non_interactive:
+        return default
+    if _QUESTIONARY:
+        return questionary.select(question, choices=choices, default=default).ask()
+    for i, c in enumerate(choices, 1):
+        print(f"  {i}. {c}")
+    idx = input(f"{question} [default: {default}]: ").strip()
+    if not idx:
+        return default
+    try:
+        return choices[int(idx) - 1]
+    except (ValueError, IndexError):
+        return default
+
+
+def _edit_in_editor(content: str) -> str:
+    """Open *content* in $EDITOR and return the saved result."""
+    import tempfile
+    editor = os.environ.get("EDITOR", "nano")
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, encoding="utf-8") as fh:
+        fh.write(content)
+        tmp = fh.name
+    subprocess.call([editor, tmp])
+    result = Path(tmp).read_text(encoding="utf-8")
+    Path(tmp).unlink(missing_ok=True)
+    return result
+
+
+def _spinner(message: str):
+    """Context manager: show a spinner if rich is available, else a plain message."""
+    if _RICH:
+        return Progress(
+            SpinnerColumn(),
+            TextColumn(message),
+            transient=True,
+        )
+    class _NoOp:
+        def __enter__(self):
+            print(message)
+            return self
+        def __exit__(self, *_): pass
+        def add_task(self, *a, **kw): return None
+    return _NoOp()
+
+
+# ===========================================================================
+# Setup log
+# ===========================================================================
+
+def _load_log(log_path: Path) -> dict:
+    if log_path.exists():
+        try:
+            return json.loads(log_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return {}
+    return {}
+
+
+def _save_log(log_path: Path, log: dict) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        json.dumps(log, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _mark_done(log: dict, step: str, meta: dict | None = None) -> None:
+    log[step] = {
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        **(meta or {}),
+    }
+
+
+#: The wizard's steps in execution order, as keyed in ``.setup_log.json``.
+_STEP_KEYS = (
+    "step1_connection",
+    "step2_schema",
+    "step3_aliases",
+    "step4_rules",
+    "step5_examples",
+    "step6_write",
+    "step7_validate",
+)
+
+#: The files step 6 writes.
+_WIZARD_OUTPUT_FILES = (
+    "entities.yaml",
+    "aliases.yaml",
+    "business_rules.yaml",
+    "examples.yaml",
+    "relationships.yaml",
+)
+
+
+def _step_done(log: dict, step: str) -> bool:
+    """Whether *step* has a completion record in *log*.
+
+    Args:
+        log: The parsed ``.setup_log.json``.
+        step: A key from ``_STEP_KEYS``.
+
+    Returns:
+        True when the step's entry is a mapping with a ``completed_at``.
+
+    Raises:
+        Nothing. This function never raises.
+
+    Examples:
+        >>> _step_done({"step1_connection": {"completed_at": "2026-01-01T00:00:00+00:00"}}, "step1_connection")
+        True
+        >>> _step_done({}, "step1_connection")
+        False
+        >>> _step_done({"step1_connection": "garbage"}, "step1_connection")
+        False
+    """
+    entry = log.get(step)
+    return isinstance(entry, dict) and bool(entry.get("completed_at"))
+
+
+def _schema_fingerprint(snapshot, namer=None, sources=()) -> str:
+    """Return a digest of the tables and columns in *snapshot*.
+
+    Stored with step 2 so that a resumed run can tell whether the aliases,
+    rules and examples generated earlier still describe the schema it just
+    read. The snapshot is the one left after schemas and staging tables were
+    skipped, so a different exclusion gives a different digest.
+
+    Args:
+        snapshot: A schema snapshot with ``tables`` (each with ``full_name``
+            and ``columns``).
+        namer: When given, each table's key is part of the digest, so a run
+            whose keys differ (a name that became shared) does not reuse
+            results keyed the old way.
+        sources: The names of the data sources the run read; part of the
+            digest together with the sources each table was found in, so a run
+            over other sources does not reuse results made for these.
+
+    Returns:
+        A hex SHA-256 digest, independent of table and column order.
+
+    Raises:
+        Nothing for a well-formed snapshot.
+
+    Examples:
+        >>> from types import SimpleNamespace as NS
+        >>> t = NS(full_name="dbo.A", columns=[NS(name="x"), NS(name="y")])
+        >>> u = NS(full_name="dbo.A", columns=[NS(name="y"), NS(name="x")])
+        >>> _schema_fingerprint(NS(tables=[t])) == _schema_fingerprint(NS(tables=[u]))
+        True
+        >>> _schema_fingerprint(NS(tables=[t])) == _schema_fingerprint(NS(tables=[]))
+        False
+        >>> class Keys:
+        ...     key = staticmethod(lambda table: "A")
+        >>> _schema_fingerprint(NS(tables=[t])) == _schema_fingerprint(NS(tables=[t]), Keys())
+        False
+        >>> _schema_fingerprint(NS(tables=[t])) == _schema_fingerprint(NS(tables=[t]), sources=("sales",))
+        False
+    """
+    import hashlib
+
+    lines = sorted(
+        f"{t.full_name}{'@' + namer.key(t) if namer is not None else ''}"
+        f"{'#' + ','.join(getattr(t, 'datasources', ())) if getattr(t, 'datasources', ()) else ''}"
+        f":{','.join(sorted(c.name for c in t.columns))}"
+        for t in snapshot.tables
+    )
+    if sources:
+        lines.append("sources:" + ",".join(sources))
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def _stored_result(log: dict, step: str, *, language: str | None = None) -> Any:
+    """Return the result a previous run stored for *step*, or ``None``.
+
+    Args:
+        log: The parsed ``.setup_log.json``.
+        step: One of the LLM steps (``step3_aliases``, ``step4_rules``,
+            ``step5_examples``).
+        language: When given, the stored result is only returned if it was
+            generated for this language.
+
+    Returns:
+        The stored result, or ``None`` when the step did not complete, kept no
+        result (a log written by an older version), was generated for another
+        language, or was produced by the mock LLM.
+
+    Raises:
+        Nothing. This function never raises.
+
+    Examples:
+        >>> log = {"step5_examples": {"completed_at": "t", "language": "en", "result": [1]}}
+        >>> _stored_result(log, "step5_examples", language="en")
+        [1]
+        >>> _stored_result(log, "step5_examples", language="fa") is None
+        True
+        >>> _stored_result({}, "step5_examples") is None
+        True
+        >>> mocked = {"step5_examples": {"completed_at": "t", "provider": "mock", "result": []}}
+        >>> _stored_result(mocked, "step5_examples") is None
+        True
+    """
+    if not _step_done(log, step):
+        return None
+    entry = log[step]
+    if "result" not in entry:
+        return None
+    if language is not None and entry.get("language") != language:
+        return None
+    if entry.get("provider") == "mock":
+        # Generated by the stub, i.e. empty: a later run with a working
+        # model must not be handed that as if it were a result.
+        return None
+    return entry["result"]
+
+
+# ===========================================================================
+# YAML helpers — produce strings that pass config_loader validators
+# ===========================================================================
+
+class _FlowList(list):
+    """A list written on one line (``[sales, reports]``), as ``schema.yaml`` writes ``datasource:``."""
+
+
+yaml.add_representer(
+    _FlowList,
+    lambda dumper, data: dumper.represent_sequence("tag:yaml.org,2002:seq", data, flow_style=True),
+)
+
+
+def _source_names(value: Any) -> list[str]:
+    """The data source names of an entity's ``datasource:`` value, however it was written.
+
+    Examples:
+        >>> _source_names("sales"), _source_names(["sales", "reports"]), _source_names(None)
+        (['sales'], ['sales', 'reports'], [])
+    """
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value if v]
+    return []
+
+
+def _union_sources(old: list[str], new: list[str], order: Iterable[str] = ()) -> list[str]:
+    """*old* and *new* source names together, in the order of *order* (unknown names last).
+
+    A run over one source must not make an earlier run's entry forget the
+    other source its table is in.
+
+    Examples:
+        >>> _union_sources(["reports"], ["sales"], ["sales", "reports"])
+        ['sales', 'reports']
+        >>> _union_sources(["a"], ["a", "x"])
+        ['a', 'x']
+    """
+    names = list(dict.fromkeys([*old, *new]))
+    ranking = list(order)
+    return sorted(names, key=lambda n: ranking.index(n) if n in ranking else len(ranking))
+
+
+#: The first line of every file the wizard writes. The preflight
+#: (``core.config_doctor``) treats a file that still carries it as an
+#: unreviewed draft, so it is built from the constant the doctor looks for.
+_FILE_HEADER = f"# {WIZARD_DRAFT_HEADER} — review before use\n"
+
+
+def _entities_yaml(
+    entities: dict[str, dict],
+    source_url: str = "",
+    generated_at: str = "",
+) -> str:
+    """Serialise entities dict to YAML matching EntitiesConfig schema.
+
+    Expected structure per entity::
+
+        {"table": str, "schema": str|None, "aliases": list[str],
+         "datasource": list[str] (optional: only with several data sources)}
+    """
+    header = (
+        _FILE_HEADER
+        + f"# Generated: {generated_at or datetime.utcnow().isoformat(timespec='seconds')}\n"
+        f"# Source: {source_url}\n\n"
+    )
+    data: dict[str, Any] = {"entities": {}}
+    for name, info in entities.items():
+        entry: dict[str, Any] = {
+            "aliases": info.get("aliases", []),
+            "table": info["table"],
+        }
+        if info.get("schema"):
+            entry["schema_name"] = info["schema"]
+        if info.get("datasource"):
+            entry["datasource"] = _FlowList(_source_names(info["datasource"]))
+        if info.get("label"):
+            entry["label"] = info["label"]
+        data["entities"][name] = entry
+    return header + yaml.dump(data, allow_unicode=True, sort_keys=False)
+
+
+def _aliases_yaml(ring_aliases: dict, synonyms: dict, generated_at: str = "") -> str:
+    header = (
+        _FILE_HEADER
+        + f"# Generated: {generated_at or datetime.utcnow().isoformat(timespec='seconds')}\n\n"
+    )
+    data = {"ring_aliases": ring_aliases, "synonyms": synonyms}
+    return header + yaml.dump(data, allow_unicode=True, sort_keys=False)
+
+
+def _business_rules_yaml(rules: dict[str, str], generated_at: str = "") -> str:
+    header = (
+        _FILE_HEADER
+        + f"# Generated: {generated_at or datetime.utcnow().isoformat(timespec='seconds')}\n\n"
+    )
+    data: dict[str, Any] = {
+        "rules": {k: {"rule_text": v} for k, v in rules.items()}
+    }
+    return header + yaml.dump(data, allow_unicode=True, sort_keys=False)
+
+
+def _examples_yaml(examples: list[dict], generated_at: str = "") -> str:
+    header = (
+        _FILE_HEADER
+        + f"# Generated: {generated_at or datetime.utcnow().isoformat(timespec='seconds')}\n\n"
+    )
+    clean = [
+        {
+            "tags":     ex.get("tags", []),
+            "question": ex.get("question", ""),
+            "sql":      ex.get("sql", ""),
+        }
+        for ex in examples
+        if ex.get("question") and ex.get("sql")
+    ]
+    data: dict[str, Any] = {"examples": clean}
+    if not clean:
+        header += (
+            "# NO EXAMPLES: the model gave none that were usable (a question and a SELECT\n"
+            "# statement). Run the wizard again, or write a few pairs by hand.\n\n"
+        )
+    return header + yaml.dump(data, allow_unicode=True, sort_keys=False)
+
+
+def _relationships_yaml(relationships: list[dict], generated_at: str = "") -> str:
+    """Serialise relationship entries; an entry with a ``basis`` is marked for review.
+
+    Args:
+        relationships: Entries with ``from_table``, ``from_column``,
+            ``to_table``, ``to_column`` and ``join_hint``. One inferred from
+            column names also has ``basis`` (and ``confidence``) and gets a
+            ``# REVIEW`` comment line above it.
+        generated_at: Timestamp for the header.
+
+    Returns:
+        The file content.
+
+    Raises:
+        Nothing for well-formed entries.
+
+    Examples:
+        >>> text = _relationships_yaml([
+        ...     {"from_table": "A", "from_column": "b_id", "to_table": "B", "to_column": "id",
+        ...      "join_hint": "JOIN B ON A.b_id = B.id", "basis": "naming convention: b_id -> B.id"}], "t")
+        >>> "# REVIEW" in text and "- from_table: A" in text
+        True
+        >>> _relationships_yaml([], "t").endswith("relationships: []\\n")
+        True
+    """
+    inferred = sum(1 for r in relationships if r.get("basis"))
+    header = (
+        _FILE_HEADER
+        + f"# Generated: {generated_at or datetime.utcnow().isoformat(timespec='seconds')}\n"
+    )
+    if inferred:
+        header += (
+            f"# {inferred} entr{'y is' if inferred == 1 else 'ies are'} marked REVIEW: guessed from column "
+            "names (X_ID -> X.ID), not declared foreign keys. Check each, delete the wrong ones.\n"
+        )
+    header += "\n"
+    if not relationships:
+        return header + "relationships: []\n"
+    lines = ["relationships:"]
+    for entry in relationships:
+        if entry.get("basis"):
+            lines.append(f"  # REVIEW: inferred from column names ({entry['basis']}); not a declared foreign key")
+        block = yaml.dump([entry], allow_unicode=True, sort_keys=False, width=10_000)
+        lines.extend(f"  {line}" for line in block.splitlines())
+    return header + "\n".join(lines) + "\n"
+
+
+# ===========================================================================
+# Validation against Pydantic models
+# ===========================================================================
+
+_REPO_ROOT = Path(__file__).resolve().parent
+
+
+def _config_loader():
+    """Return the ``knowledge.config_loader`` module, importable on a fresh checkout.
+
+    ``knowledge/__init__.py`` re-exports its names lazily, so importing the
+    loaders reads no file of ``project_config/``: on a fresh checkout, or a
+    ``project_config/`` the wizard has only half filled, the import succeeds
+    and the wizard can validate and name what is missing. (It used to read
+    five files at import time, and the import was made once with the loaders
+    pointed at ``project_config.example/`` to survive that.)
+
+    Returns:
+        The imported ``knowledge.config_loader`` module.
+
+    Raises:
+        ImportError: When the module cannot be imported at all, e.g. the
+            wizard is run outside a full checkout.
+    """
+    try:
+        import knowledge.config_loader as module
+    except Exception as exc:  # noqa: BLE001 - ImportError, a broken install, ...
+        raise ImportError(
+            f"could not import knowledge.config_loader ({type(exc).__name__}: {exc}); "
+            "run the wizard from a complete checkout"
+        ) from exc
+    return module
+
+
+def _validate_yaml_str(yaml_str: str, filename: str) -> list[str]:
+    """Parse *yaml_str* and validate against the relevant Pydantic model.
+
+    Args:
+        yaml_str: The generated file content.
+        filename: Which project_config file it is (selects the model). Files
+            without a model here are not checked and count as valid.
+
+    Returns:
+        A list of error strings (empty list = valid).
+
+    Raises:
+        Nothing. Any failure, including an unimportable loader, is returned
+        as an error string.
+
+    Examples:
+        >>> _validate_yaml_str("entities: {}", "entities.yaml")
+        []
+        >>> _validate_yaml_str("anything", "relationships.yaml")
+        []
+        >>> bool(_validate_yaml_str("entities: [1, 2]", "entities.yaml"))
+        True
+    """
+    try:
+        loader = _config_loader()
+        model_map = {
+            "entities.yaml":       loader.EntitiesConfig,
+            "aliases.yaml":        loader.AliasesConfig,
+            "business_rules.yaml": loader.BusinessRulesConfig,
+            "examples.yaml":       loader.ExamplesConfig,
+        }
+        model = model_map.get(filename)
+        if model is None:
+            return []
+        raw = safe_load_strict(yaml_str) or {}
+        model.model_validate(raw)
+        return []
+    except Exception as exc:  # noqa: BLE001
+        return [str(exc)]
+
+
+# ===========================================================================
+# Interactive review for a single file
+# ===========================================================================
+
+def _review_file(
+    filename: str,
+    content: str,
+    non_interactive: bool,
+    dry_run: bool,
+    output_dir: Path,
+    llm_regenerate_fn: Callable[[], str] | None = None,
+) -> str | None:
+    """Show *content* to the user and return the accepted version (or None to skip).
+
+    Args:
+        filename: Name of the file under review (shown in the panel and used
+            to pick the validation model).
+        content: The generated file content.
+        non_interactive: Accept *content* as it is, without prompting.
+        dry_run: Print *content* and return ``None``; nothing is accepted.
+        output_dir: Directory the file will be written to (not used here).
+        llm_regenerate_fn: Produces a fresh version of the whole file by
+            asking the LLM again. When ``None`` the "Regenerate" choice is not
+            offered, because there is nothing it could do (e.g. the file is
+            built from the schema alone, or there is no LLM).
+
+    Returns:
+        The accepted content, or ``None`` when the file is skipped (or on a
+        dry run).
+
+    Raises:
+        Nothing from regeneration: a failing *llm_regenerate_fn* is reported
+        and the current content is kept.
+    """
+    if dry_run:
+        console.print(f"\n[bold cyan]--- DRY RUN: {filename} ---[/bold cyan]" if _RICH else f"\n--- {filename} ---")
+        console.print(content)
+        return None
+
+    if non_interactive:
+        return content
+
+    while True:
+        if _RICH:
+            console.print(Panel(content[:3000] + ("\n...(truncated)" if len(content) > 3000 else ""),
+                                title=f"[bold]{filename}[/bold]", border_style="blue"))
+        else:
+            print(f"\n--- {filename} ---")
+            print(content[:3000])
+
+        errs = _validate_yaml_str(content, filename)
+        if errs:
+            console.print(f"[red]Validation warnings: {errs}[/red]" if _RICH else f"Validation: {errs}")
+
+        choices = ["Accept", "Edit in $EDITOR"]
+        if llm_regenerate_fn is not None:
+            choices.append("Regenerate")
+        choices.append("Skip")
+        action = _choose("Action?", choices=choices, default="Accept")
+
+        if action == "Accept":
+            return content
+        if action == "Edit in $EDITOR":
+            content = _edit_in_editor(content)
+        elif action == "Regenerate" and llm_regenerate_fn is not None:
+            try:
+                content = llm_regenerate_fn()
+            except Exception as exc:  # noqa: BLE001
+                console.print(f"  Regeneration failed ({exc}); keeping the current version.", markup=False)
+        elif action == "Skip":
+            return None
+
+
+# ===========================================================================
+# LLM prompt builders + callers
+# ===========================================================================
+
+def _prompt_aliases(table_name: str, columns: list[str], samples: list[str], language: str) -> str:
+    samples_str = ", ".join(f'"{s}"' for s in samples[:10]) if samples else "(none)"
+    return textwrap.dedent(f"""\
+        You are a database labelling expert.
+        Table name: {table_name}
+        Columns: {', '.join(columns)}
+        Sample values: {samples_str}
+        User question language: {language}
+
+        Generate natural language aliases a business user might use when referring to this table.
+        Consider abbreviations, domain jargon, and {'Persian' if language == 'fa' else 'English'} terms.
+        Give at most {ALIAS_LIMIT} aliases, all different from each other: do not repeat a phrase
+        and do not list the same words in another order. Stop after the list and the description.
+
+        Return ONLY this JSON (no markdown):
+        {{"aliases": ["alias1", "alias2"], "description": "one-sentence description"}}
+    """)
+
+
+def _prompt_business_rules(
+    table_name: str,
+    columns: list[dict],
+    dim_tables: list[str],
+    fk_joins: list[str],
+    measures: list[str] | None = None,
+) -> str:
+    col_str = "\n".join(f"  {c['name']} ({c['type']})" for c in columns)
+    join_str = "\n".join(f"  {j}" for j in fk_joins) if fk_joins else "  (none)"
+    dims = ", ".join(dim_tables) if dim_tables else "(none)"
+    measure_str = (
+        f"Numeric measure columns (the only columns value_col and volume_col may name): {', '.join(measures)}"
+        if measures else ""
+    )
+    return textwrap.dedent(f"""\
+        You are a SQL business rules expert.
+        Fact table: {table_name}
+        Columns:
+        {col_str}
+        {measure_str}
+        Related dimension tables: {dims}
+        FK join hints:
+        {join_str}
+
+        Generate business rules for a natural-language-to-SQL agent.
+        Identify:
+        - Which column to use for value/amount queries (e.g. TotalPrice, Amount)
+        - Which column to use for volume/count queries (e.g. Quantity, Count)
+        - A plain-language rule text summarising query patterns
+        Never name a key or identifier column as a value or volume column; use "" when no column fits.
+
+        Return ONLY this JSON (no markdown):
+        {{"rules": {{"value_col": "ColumnName", "volume_col": "ColumnName", "rule_text": "..."}}}}
+    """)
+
+
+def _prompt_examples(schema_summary: str, language: str, source: str = "", count: int = 10) -> str:
+    where = f"These tables are in the data source {source}; write SQL for them only." if source else ""
+    return textwrap.dedent(f"""\
+        You are an expert at writing natural language database queries.
+        {where}
+        Database schema summary:
+        {schema_summary}
+        User question language: {'Persian (Farsi)' if language == 'fa' else 'English'}
+
+        Generate {count} diverse NLQ-to-SQL example pairs covering:
+        - Simple counts
+        - Aggregations (SUM, AVG)
+        - Top-N queries
+        - Date/time filtering
+        - Multi-table JOINs
+
+        Return ONLY this JSON array (no markdown):
+        [
+          {{"tags": ["count"], "question": "...", "sql": "SELECT ..."}},
+          ...
+        ]
+    """)
+
+
+# ===========================================================================
+# Repeated answers: a response cache in front of the model
+# ===========================================================================
+
+#: Consecutive tables with an identical non-empty answer that stop a step.
+_REPEATED_ANSWER_LIMIT = 3
+
+
+class CachedAnswersError(RuntimeError):
+    """Three tables in a row got the identical answer: a response cache is suspected."""
+
+
+def _normalize_rule_text(text: str, table_names: list[str]) -> str:
+    """*text* with the given table names replaced by ``<table>`` and spaces collapsed.
+
+    Two rules that differ only in the name of the table they are about are the
+    same answer.
+
+    Args:
+        text: The rule text the model returned.
+        table_names: Names to take out (the fact table and its dimension tables).
+
+    Returns:
+        The normalised text; ``""`` when *text* has no content.
+
+    Raises:
+        Nothing. This function never raises.
+
+    Examples:
+        >>> _normalize_rule_text("Use  Sales for totals; join Items.", ["Sales", "Items"])
+        'Use <table> for totals; join <table>.'
+        >>> _normalize_rule_text("   ", ["Sales"])
+        ''
+    """
+    import re
+
+    out = " ".join((text or "").split())
+    for name in sorted({n for n in table_names if n}, key=len, reverse=True):
+        out = re.sub(re.escape(name), "<table>", out, flags=re.IGNORECASE)
+    return out
+
+
+class _AnswerGuard:
+    """Watches the model's answers, table by table, for one repeated verbatim.
+
+    Args:
+        step: Label used in messages, such as ``"Step 3"``.
+        what: What an answer is, such as ``"alias list"``.
+        allow: When true the stop becomes a one-time warning.
+        limit: Consecutive identical non-empty answers that count as a repeat.
+
+    Examples:
+        >>> g = _AnswerGuard("Step 3", "alias list")
+        >>> g.observe("A", "x"); g.observe("B", "x")
+        >>> g.observe("C", "x")  # doctest: +IGNORE_EXCEPTION_DETAIL
+        Traceback (most recent call last):
+            ...
+        CachedAnswersError: Step 3 stopped: ...
+        >>> g = _AnswerGuard("Step 3", "alias list")
+        >>> for t, a in [("A", "x"), ("B", "y"), ("C", "x"), ("D", None)]:
+        ...     g.observe(t, a)
+        >>> g.summary()
+        '2 distinct alias lists for 4 tables (1 without an answer)'
+    """
+
+    def __init__(self, step: str, what: str, *, allow: bool = False,
+                 limit: int = _REPEATED_ANSWER_LIMIT) -> None:
+        self.step = step
+        self.what = what
+        self.allow = allow
+        self.limit = limit
+        self._tables = 0
+        self._answers: set[str] = set()
+        self._empty = 0
+        self._last: str | None = None
+        self._streak: list[str] = []
+        self._warned = False
+        self.repeated = False
+
+    def observe(self, table: str, answer: str | None) -> None:
+        """Record the model's answer for *table*; ``None`` or ``""`` means no answer.
+
+        Raises:
+            CachedAnswersError: When this is the *limit*-th table in a row with
+                the same non-empty answer and repeats are not allowed.
+        """
+        self._tables += 1
+        if not answer:
+            self._empty += 1
+            self._last, self._streak = None, []
+            return
+        self._answers.add(answer)
+        if answer == self._last:
+            self._streak.append(table)
+        else:
+            self._last, self._streak = answer, [table]
+        if len(self._streak) < self.limit:
+            return
+        self.repeated = True
+        if self.allow:
+            if not self._warned:
+                self._warned = True
+                console.print(
+                    f"  Warning: {self.limit} tables in a row got the identical {self.what} "
+                    f"({', '.join(self._streak)}); continuing because of --allow-repeated-answers.",
+                    markup=False,
+                )
+            return
+        raise CachedAnswersError(self._stop_message())
+
+    def _stop_message(self) -> str:
+        shown = ", ".join(self._streak[-self.limit:])
+        return (
+            f"{self.step} stopped: the model endpoint returned the identical {self.what} for "
+            f"{self.limit} different tables in a row ({shown}). That is not an answer per table: "
+            "a response cache in front of the model (a gateway with semantic or prefix caching) "
+            "is answering similar prompts with one stored reply. No file was written and the run "
+            "can be resumed.\n"
+            "  Check it: python scripts/verify_deployment.py "
+            "(the check 'Model endpoint answers each prompt itself').\n"
+            "  Fix it: disable response caching for this client at the gateway, or point "
+            "OPENAI_BASE_URL (or WIZARD_LLM_BASE_URL) at the model server directly; then run "
+            "again with --resume.\n"
+            "  A genuinely tiny schema whose tables really are alike: --allow-repeated-answers."
+        )
+
+    def summary(self) -> str:
+        """``"N distinct answers for M tables"``, plus how many got no answer."""
+        distinct = len(self._answers)
+        text = (
+            f"{distinct} distinct {self.what}{'' if distinct == 1 else 's'} "
+            f"for {self._tables} table{'' if self._tables == 1 else 's'}"
+        )
+        if self._empty:
+            text += f" ({self._empty} without an answer)"
+        return text
+
+
+# ===========================================================================
+# Schema summary helper
+# ===========================================================================
+
+#: Tables listed in the schema summary one example prompt carries (a longer
+#: summary is cut: the prompt must stay small enough for a local model).
+_EXAMPLE_SUMMARY_TABLES = 20
+
+#: Tables listed when an empty answer is asked again with a smaller request.
+_EXAMPLE_RETRY_TABLES = 8
+
+
+def _build_schema_summary(snapshot, source: str | None = None, limit: int = _EXAMPLE_SUMMARY_TABLES) -> str:
+    """The schema as the examples prompt sees it: fact tables first, then the rest, at most *limit*.
+
+    Args:
+        snapshot: A schema snapshot with ``tables``.
+        source: When given, only the tables found in this data source (a table
+            with no recorded source belongs to every source).
+        limit: The most tables listed.
+
+    Returns:
+        One ``schema.table (kind): columns`` line per table.
+
+    Raises:
+        Nothing for a well-formed snapshot.
+
+    Examples:
+        >>> from types import SimpleNamespace as NS
+        >>> col = NS(name="ID")
+        >>> snap = NS(tables=[
+        ...     NS(full_name="ref.Bank", classification="dim", columns=[col], datasources=("a",)),
+        ...     NS(full_name="sales.Trade", classification="fact", columns=[col], datasources=("a", "b")),
+        ...     NS(full_name="rep.Total", classification="fact", columns=[col], datasources=("b",))])
+        >>> print(_build_schema_summary(snap, "a"))
+        sales.Trade (fact): ID
+        ref.Bank (dim): ID
+        >>> _build_schema_summary(snap, "b", 1)
+        'sales.Trade (fact): ID'
+    """
+    tables = [
+        t for t in snapshot.tables
+        if source is None or not getattr(t, "datasources", ()) or source in t.datasources
+    ]
+    tables.sort(key=lambda t: t.classification != "fact")  # stable: facts first, each in listed order
+    lines = []
+    for t in tables[:limit]:
+        col_names = ", ".join(c.name for c in t.columns[:10])
+        lines.append(f"{t.full_name} ({t.classification}): {col_names}")
+    return "\n".join(lines)
+
+
+# ===========================================================================
+# Wizard LLM: which endpoint, and whether it may see the schema
+# ===========================================================================
+
+_WIZARD_PROVIDERS = ("openai", "mock")
+
+
+class RemoteLLMNotAllowedError(RuntimeError):
+    """The wizard's LLM endpoint is remote and ``LLM_ALLOW_REMOTE`` is not true."""
+
+
+class WizardLLMUnavailableError(RuntimeError):
+    """The wizard's LLM endpoint did not answer and the caller wants no mock in its place."""
+
+
+@dataclass(frozen=True)
+class WizardLLMConfig:
+    """The LLM endpoint the wizard will use, and where each value came from.
+
+    Attributes:
+        provider: ``"openai"`` (any OpenAI-compatible endpoint) or ``"mock"``.
+        model: Model tag sent to the endpoint.
+        base_url: Endpoint base URL. Empty for the mock provider.
+        api_key: Bearer token, possibly empty (many local servers need none).
+            Never printed or logged.
+        trusted: Whether the endpoint counts as local under the main
+            application's rule (see :func:`resolve_wizard_llm`).
+        sources: Where ``provider``, ``model`` and ``base_url`` were taken
+            from, e.g. ``{"model": "OPENAI_MODEL"}``.
+    """
+
+    provider: str
+    model: str
+    base_url: str
+    api_key: str
+    trusted: bool
+    sources: dict[str, str]
+
+    @property
+    def remote(self) -> bool:
+        """Whether this endpoint is outside the deployment's own infrastructure."""
+        return self.provider != "mock" and not self.trusted
+
+    def describe(self) -> str:
+        """One line naming the provider, model, endpoint and their origin.
+
+        The API key is never part of it.
+
+        Returns:
+            A single line of text.
+
+        Examples:
+            >>> WizardLLMConfig("openai", "m", "http://localhost:8000/v1", "k", True,
+            ...                 {"model": "OPENAI_MODEL", "base_url": "OPENAI_BASE_URL"}).describe()
+            'LLM: openai, model m (from OPENAI_MODEL), endpoint http://localhost:8000/v1 (from OPENAI_BASE_URL), local'
+            >>> WizardLLMConfig("mock", "mock", "", "", True, {}).describe()
+            'LLM: mock (no model is called; aliases, rules and examples will be empty)'
+        """
+        if self.provider == "mock":
+            return "LLM: mock (no model is called; aliases, rules and examples will be empty)"
+        where = "remote" if self.remote else "local"
+        return (
+            f"LLM: {self.provider}, model {self.model} (from {self.sources.get('model', '?')}), "
+            f"endpoint {_strip_url_userinfo(self.base_url)} (from {self.sources.get('base_url', '?')}), "
+            f"{where}"
+        )
+
+
+def _strip_url_userinfo(url: str) -> str:
+    """Return an HTTP(S) *url* without any ``user:password@`` part.
+
+    Args:
+        url: An endpoint URL.
+
+    Returns:
+        *url* with the userinfo removed; unchanged when there is none.
+
+    Raises:
+        Nothing. This function never raises.
+
+    Examples:
+        >>> _strip_url_userinfo("https://u:p@host:8000/v1")
+        'https://host:8000/v1'
+        >>> _strip_url_userinfo("http://localhost:8000/v1")
+        'http://localhost:8000/v1'
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(url)
+        if "@" not in parts.netloc:
+            return url
+        return urlunsplit(parts._replace(netloc=parts.netloc.rsplit("@", 1)[1]))
+    except ValueError:
+        return "<unparseable endpoint URL>"
+
+
+def resolve_wizard_llm(
+    args: argparse.Namespace,
+    environ: Mapping[str, str] | None = None,
+) -> WizardLLMConfig:
+    """Work out which LLM endpoint the wizard uses.
+
+    For the endpoint, the model and the key the order is: the command-line
+    flag, then the ``WIZARD_LLM_*`` variable, then the main application's own
+    ``OPENAI_BASE_URL`` / ``OPENAI_MODEL`` / ``OPENAI_API_KEY`` settings. An
+    empty ``WIZARD_*`` value counts as unset, so a copied ``.env.example``
+    with blank lines behaves as "use the application's endpoint". The key is
+    only ever the application's ``OPENAI_API_KEY``.
+
+    Whether the endpoint is *remote* follows the main application: its trust
+    is the explicit ``LLM_TRUSTED`` override when the endpoint is the
+    application's own ``OPENAI_BASE_URL``, otherwise
+    :func:`llm.trust.default_trust_for_url` (loopback, private-network and
+    ``*.local`` hosts are local, everything else is remote).
+
+    Args:
+        args: Parsed command line (``llm_provider``, ``llm_model``,
+            ``llm_base_url``).
+        environ: Environment to read ``WIZARD_*`` variables from. Defaults to
+            ``os.environ``.
+
+    Returns:
+        The resolved configuration.
+
+    Raises:
+        ValueError: When the provider is not ``openai`` or ``mock``.
+
+    Examples:
+        >>> import config as cfg
+        >>> ns = argparse.Namespace(llm_provider=None, llm_model=None, llm_base_url=None)
+        >>> with cfg.override_settings(openai_base_url="http://localhost:8000/v1",
+        ...                            openai_model="local-model", openai_api_key=""):
+        ...     resolved = resolve_wizard_llm(ns, {"WIZARD_LLM_MODEL": ""})
+        >>> resolved.model, resolved.sources["model"], resolved.remote
+        ('local-model', 'OPENAI_MODEL', False)
+    """
+    import config as cfg
+    from llm.trust import default_trust_for_url
+
+    env = os.environ if environ is None else environ
+
+    def pick(flag_value: str | None, flag: str, name: str, fallback: str, fallback_name: str) -> tuple[str, str]:
+        if flag_value and flag_value.strip():
+            return flag_value.strip(), flag
+        value = (env.get(name) or "").strip()
+        if value:
+            return value, name
+        return (fallback or "").strip(), fallback_name
+
+    provider, provider_src = pick(args.llm_provider, "--llm-provider", "WIZARD_LLM_PROVIDER", "openai", "default")
+    provider = provider.lower()
+    if provider not in _WIZARD_PROVIDERS:
+        raise ValueError(
+            f"Unsupported wizard LLM provider {provider!r} (from {provider_src}). "
+            f"Choose one of: {', '.join(_WIZARD_PROVIDERS)}."
+        )
+    if provider == "mock":
+        return WizardLLMConfig("mock", "mock", "", "", True, {"provider": provider_src})
+
+    model, model_src = pick(args.llm_model, "--llm-model", "WIZARD_LLM_MODEL",
+                            cfg.settings.openai_model, "OPENAI_MODEL")
+    base_url, url_src = pick(args.llm_base_url, "--llm-base-url", "WIZARD_LLM_BASE_URL",
+                             cfg.settings.openai_base_url, "OPENAI_BASE_URL")
+
+    app_url = (cfg.settings.openai_base_url or "").rstrip("/")
+    if cfg.settings.llm_trusted is not None and base_url.rstrip("/") == app_url:
+        trusted = cfg.settings.llm_trusted
+    else:
+        trusted = default_trust_for_url(base_url)
+
+    return WizardLLMConfig(
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        api_key=cfg.settings.openai_api_key or "",
+        trusted=trusted,
+        sources={"provider": provider_src, "model": model_src, "base_url": url_src},
+    )
+
+
+def enforce_remote_policy(llm_config: WizardLLMConfig) -> None:
+    """Refuse to use a remote endpoint unless ``LLM_ALLOW_REMOTE`` is true.
+
+    The wizard sends table and column names, sample column values and a
+    schema summary to the model, which is exactly the data the main
+    application's governance gate (``LLM_ALLOW_REMOTE``, see
+    ``llm/router.py``) keeps off hosted providers. Same rule here, same
+    definition of "remote" (see :func:`resolve_wizard_llm`).
+
+    Args:
+        llm_config: The resolved wizard LLM configuration.
+
+    Returns:
+        None. Returns normally for the mock provider, for a local endpoint, and
+        for a remote one when ``LLM_ALLOW_REMOTE`` is true.
+
+    Raises:
+        RemoteLLMNotAllowedError: When the endpoint is remote and
+            ``cfg.settings.llm_allow_remote`` is false.
+
+    Examples:
+        >>> import config as cfg
+        >>> remote = WizardLLMConfig("openai", "m", "https://api.openai.com/v1", "k", False, {})
+        >>> with cfg.override_settings(llm_allow_remote=False):
+        ...     enforce_remote_policy(remote)
+        Traceback (most recent call last):
+            ...
+        setup_project.RemoteLLMNotAllowedError: Refusing to send ...
+    """
+    import config as cfg
+
+    if not llm_config.remote or cfg.settings.llm_allow_remote:
+        return
+    raise RemoteLLMNotAllowedError(
+        f"Refusing to send schema data to the remote LLM endpoint "
+        f"{_strip_url_userinfo(llm_config.base_url)} (from {llm_config.sources.get('base_url', '?')}): "
+        "the wizard sends table and column names and sample column values to the model, "
+        "and LLM_ALLOW_REMOTE is not true. Either point WIZARD_LLM_BASE_URL (or OPENAI_BASE_URL) "
+        "at a local endpoint, set LLM_TRUSTED=true if this endpoint is on your own infrastructure, "
+        "set LLM_ALLOW_REMOTE=true to opt in deliberately, or run with --llm-provider mock."
+    )
+
+
+def _build_wizard_llm(llm_config: WizardLLMConfig):
+    """Return a ``WizardLLM`` talking to the endpoint in *llm_config*.
+
+    Built from the already-resolved values, so the endpoint, key and trust
+    flag are exactly the ones that were checked and announced, instead of
+    being re-read from the environment by ``WizardLLM`` (which would use its
+    own default endpoint and insist on a key even for a local server).
+
+    Args:
+        llm_config: The resolved wizard LLM configuration.
+
+    Returns:
+        A ``llm.wizard_llm.WizardLLM`` instance.
+
+    Raises:
+        ValueError: When the provider is unsupported.
+    """
+    from llm.providers import OpenAIBackend
+    from llm.wizard_llm import WizardLLM
+
+    class _ResolvedWizardLLM(WizardLLM):
+        def _build_backend(self, provider, model, base_url):  # type: ignore[override]
+            if provider == "openai":
+                return OpenAIBackend(
+                    model=model,
+                    api_key=llm_config.api_key,
+                    base_url=llm_config.base_url,
+                    trusted=llm_config.trusted,
+                )
+            return WizardLLM._build_backend(provider, model, base_url)
+
+    return _ResolvedWizardLLM(
+        provider=llm_config.provider, model=llm_config.model, base_url=llm_config.base_url or None
+    )
+
+
+def setup_wizard_llm(
+    args: argparse.Namespace,
+    *,
+    mock_fallback: bool = True,
+    sends: str = "Table and column names and sample column values",
+):
+    """Resolve, vet, announce and connect the wizard's LLM.
+
+    Prints one line saying which provider, model and endpoint is used (never
+    the key). A remote endpoint without ``LLM_ALLOW_REMOTE`` is refused
+    before anything is sent. An endpoint that does not answer falls back to
+    the mock LLM with a loud notice, because the generated files will then
+    hold no aliases, rules or examples.
+
+    ``scripts/draft_descriptions.py`` asks the same model under the same
+    rules; a mock would draft nothing for it, so it passes
+    ``mock_fallback=False`` and gets an error instead, and ``sends`` names
+    what it sends in the notice about a remote endpoint.
+
+    Args:
+        args: Parsed command line (``llm_provider``, ``llm_model``,
+            ``llm_base_url``).
+        mock_fallback: Fall back to the mock LLM when the endpoint does not
+            answer (the default); when false, raise instead.
+        sends: What the caller sends to the endpoint, for the notice printed
+            when the endpoint is remote and allowed.
+
+    Returns:
+        A ``WizardLLM`` ready for ``generate()``.
+
+    Raises:
+        ValueError: When the configured provider is unsupported.
+        RemoteLLMNotAllowedError: When the endpoint is remote and not allowed.
+        WizardLLMUnavailableError: When the endpoint does not answer and
+            *mock_fallback* is false.
+    """
+    from llm.wizard_llm import WizardLLM
+
+    llm_config = resolve_wizard_llm(args)
+    enforce_remote_policy(llm_config)
+    console.print(f"  {llm_config.describe()}")
+    if llm_config.provider == "mock":
+        return WizardLLM(provider="mock", model="mock")
+    if llm_config.remote:
+        console.print(
+            f"  NOTICE: LLM_ALLOW_REMOTE=true. {sends} are sent to the remote endpoint above."
+        )
+
+    reason = ""
+    try:
+        llm = _build_wizard_llm(llm_config)
+        if llm.test_connection():
+            return llm
+        reason = "the endpoint did not answer a model-list request"
+    except Exception as exc:  # noqa: BLE001
+        reason = str(exc)
+    if llm_config.api_key:
+        reason = reason.replace(llm_config.api_key, "***")
+    if not mock_fallback:
+        raise WizardLLMUnavailableError(
+            f"the LLM is unavailable ({reason}). Fix the endpoint (WIZARD_LLM_BASE_URL / OPENAI_BASE_URL) "
+            "and run the command again."
+        )
+    console.print(
+        f"\n  !!! WARNING: the LLM is unavailable ({reason}). FALLING BACK TO THE MOCK LLM. !!!\n"
+        "  !!! Aliases, business rules and examples will be EMPTY. Fix the endpoint "
+        "(WIZARD_LLM_BASE_URL / OPENAI_BASE_URL) and run the wizard again. !!!\n"
+    )
+    return WizardLLM(provider="mock", model="mock")
+
+
+# ===========================================================================
+# Table keys, skipped tables, relationships, files of an earlier run
+# ===========================================================================
+
+#: Relationships are inferred from column names when the database declares
+#: fewer foreign keys than one per this many tables (and always when it
+#: declares none).
+_FEW_FK_TABLES_PER_FK = 10
+
+
+def _identity(schema: str | None, name: str) -> tuple[str, str]:
+    """``(schema, table)`` lower-cased: what makes two tables the same table.
+
+    Args:
+        schema: The schema, or ``None``/``""`` when unknown.
+        name: The bare table name.
+
+    Returns:
+        The pair used to compare tables across runs and snapshots.
+
+    Raises:
+        Nothing. This function never raises.
+
+    Examples:
+        >>> _identity("Sales", "Trade")
+        ('sales', 'trade')
+        >>> _identity(None, "Trade")
+        ('', 'trade')
+    """
+    return ((schema or "").lower(), name.lower())
+
+
+def _key_qualifier(key: str) -> str:
+    """The schema a table key names (``Sales.Trade`` is ``Sales``), ``""`` for a bare key.
+
+    Examples:
+        >>> _key_qualifier("Sales.Trade"), _key_qualifier("Trade"), _key_qualifier("[a.b].[T]")
+        ('Sales', '', 'a.b')
+    """
+    from schema_data.registry import split_table_key
+
+    try:
+        qualifier = split_table_key(key).qualifier
+    except ValueError:
+        return ""
+    return qualifier[-1] if qualifier else ""
+
+
+def _bare_name(key: str) -> str:
+    """The table name a key names (``Sales.Trade`` is ``Trade``); the key itself if it does not parse.
+
+    Examples:
+        >>> _bare_name("Sales.Trade"), _bare_name("Trade"), _bare_name("sales.[Price List]")
+        ('Trade', 'Trade', 'Price List')
+    """
+    from schema_data.registry import split_table_key
+
+    try:
+        return split_table_key(key).name
+    except ValueError:
+        return key
+
+
+def _resolve_entity_schemas(
+    snapshot, existing: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Copies of an earlier run's entities with the schema filled in where it can be told.
+
+    An entity without a schema (the inspector's draft wrote it as ``schema:``
+    before the wizard read that spelling, a hand-written entry never had one)
+    is not "a table of no schema": it is the table its key and name say. Left
+    as it was, the bare entry of a table looks like a second schema of the
+    same name, every name looks shared, everything is keyed ``Schema.Table``
+    and the bare entry survives beside it. The schema comes from the key's
+    qualifier, else from the one table of *snapshot* that has that bare name.
+    A name several schemas share stays as it is: it cannot be told.
+
+    Args:
+        snapshot: A schema snapshot with ``tables``.
+        existing: Entities of an earlier run, ``{key: {"table", "schema", ...}}``.
+
+    Returns:
+        New entries, in the same order; the input is not changed.
+
+    Raises:
+        Nothing for well-formed entities.
+
+    Examples:
+        >>> from types import SimpleNamespace as NS
+        >>> snap = NS(tables=[NS(name="Trade", schema="sales"), NS(name="Item", schema="ref"), NS(name="Item", schema="sales")])
+        >>> old = {"Trade": {"table": "Trade"}, "ref.Item": {"table": "Item"}, "Item": {"table": "Item"}}
+        >>> {k: v.get("schema") for k, v in _resolve_entity_schemas(snap, old).items()}
+        {'Trade': 'sales', 'ref.Item': 'ref', 'Item': None}
+    """
+    schemas: dict[str, dict[str, str]] = {}
+    for table in snapshot.tables:
+        schemas.setdefault(table.name.lower(), {}).setdefault((table.schema or "").lower(), table.schema or "")
+    resolved: dict[str, dict[str, Any]] = {}
+    for key, entry in existing.items():
+        item = dict(entry)
+        name = item.get("table")
+        if name and not item.get("schema"):
+            found = schemas.get(str(name).lower(), {})
+            qualifier = _key_qualifier(key)
+            if qualifier:
+                item["schema"] = qualifier
+            elif len(found) == 1 and next(iter(found.values())):
+                item["schema"] = next(iter(found.values()))
+        resolved[key] = item
+    return resolved
+
+
+def _table_namer(snapshot, existing: Mapping[str, Mapping[str, Any]] | None = None):
+    """Return the inspector's ``_TableNamer`` for *snapshot* and an earlier run's entities.
+
+    A table is keyed by its bare name when no other table shares it and by
+    ``Schema.Table`` when several schemas do (``docs/design/TABLE-NAMES.md``).
+    The tables of *existing* (the ``entities.yaml`` of an earlier run, in the
+    wizard's internal form) take part, so a name that this run sees once but
+    the earlier run saw in another schema is qualified for both.
+
+    Args:
+        snapshot: A schema snapshot with ``tables``.
+        existing: Entities of an earlier run, ``{key: {"table", "schema", ...}}``.
+
+    Returns:
+        A ``database.schema_inspector._TableNamer``.
+
+    Raises:
+        Nothing for a well-formed snapshot.
+
+    Examples:
+        >>> from types import SimpleNamespace as NS
+        >>> snap = NS(tables=[NS(name="Trade", schema="sales"), NS(name="Customer", schema="sales")])
+        >>> namer = _table_namer(snap)
+        >>> [namer.key(t) for t in snap.tables]
+        ['Trade', 'Customer']
+        >>> namer = _table_namer(snap, {"Trade": {"table": "Trade", "schema": "ref"}})
+        >>> [namer.key(t) for t in snap.tables]
+        ['sales.Trade', 'Customer']
+    """
+    from database.schema_inspector import SchemaSnapshot, TableInfo, _TableNamer
+
+    tables = list(snapshot.tables)
+    known = {_identity(t.schema, t.name) for t in tables}
+    for entry in _resolve_entity_schemas(snapshot, existing or {}).values():
+        name = entry.get("table")
+        schema = entry.get("schema") or None
+        if name and _identity(schema, str(name)) not in known:
+            known.add(_identity(schema, str(name)))
+            tables.append(TableInfo(name=str(name), schema=schema))
+    return _TableNamer(SchemaSnapshot(tables=tables))
+
+
+def _rekey_map(
+    namer, existing: Mapping[str, Mapping[str, Any]], others: Iterable[str] = (),
+) -> dict[str, str]:
+    """``{old key: new key}`` for earlier entities whose default key changed.
+
+    Only a key that is the table's default spelling (the bare name, or
+    ``Schema.Table``) is renamed; an entity name an operator chose is left
+    alone.
+
+    Args:
+        namer: The namer from :func:`_table_namer`.
+        existing: Entities of an earlier run, ``{key: {"table", "schema", ...}}``.
+        others: Keys of an earlier file that has an entry for a table without
+            one in *existing* (the business rules). Such a key is renamed when
+            it names a table of this run by a spelling other than its key.
+
+    Returns:
+        The renames, empty when every key is still right.
+
+    Raises:
+        Nothing for well-formed entities.
+
+    Examples:
+        >>> from types import SimpleNamespace as NS
+        >>> snap = NS(tables=[NS(name="Trade", schema="sales")])
+        >>> old = {"Trade": {"table": "Trade", "schema": "sales"}, "Mine": {"table": "Trade", "schema": "sales"}}
+        >>> _rekey_map(_table_namer(snap, {**old, "x": {"table": "Trade", "schema": "ref"}}), old)
+        {'Trade': 'sales.Trade'}
+    """
+    from database.schema_inspector import TableInfo, _render_key
+
+    renames: dict[str, str] = {}
+    for key, entry in existing.items():
+        name = entry.get("table")
+        if not name:
+            continue
+        schema = entry.get("schema") or None
+        defaults = {_render_key((str(name),)).casefold()}
+        if schema:
+            defaults.add(_render_key((str(schema), str(name))).casefold())
+        new = namer.key(TableInfo(name=str(name), schema=schema))
+        if new.casefold() != key.casefold() and key.casefold() in defaults:
+            renames[key] = new
+    for key in others:
+        if key in existing or key in renames:
+            continue
+        new = namer.ref(_key_qualifier(key) or None, _bare_name(key))
+        if new.casefold() != key.casefold():
+            renames[key] = new
+    return renames
+
+
+def _union(first: Iterable[str], second: Iterable[str]) -> list[str]:
+    """*first* then what *second* adds, without repeats (case ignored).
+
+    Examples:
+        >>> _union(["a", "B"], ["b", "c"])
+        ['a', 'B', 'c']
+    """
+    seen: dict[str, str] = {}
+    for item in (*first, *second):
+        seen.setdefault(str(item).casefold(), str(item))
+    return list(seen.values())
+
+
+def _combine_entities(keep: Mapping[str, Any], other: Mapping[str, Any]) -> dict[str, Any]:
+    """One entity from two entries for the same table: the aliases of both, the first label and schema.
+
+    Examples:
+        >>> merged = _combine_entities({"table": "T", "aliases": []}, {"table": "T", "schema": "s", "aliases": ["x"], "label": "L"})
+        >>> merged["aliases"], merged["schema"], merged["label"]
+        (['x'], 's', 'L')
+    """
+    merged = dict(keep)
+    merged["aliases"] = _union(keep.get("aliases") or [], other.get("aliases") or [])
+    for field_name in ("schema", "label"):
+        merged[field_name] = keep.get(field_name) or other.get(field_name)
+    sources = _union(keep.get("datasource") or [], other.get("datasource") or [])
+    if sources:
+        merged["datasource"] = sources
+    return merged
+
+
+def _combine_rules(keep: str, other: str) -> str:
+    """The rule of two entries for one table: the first that is not the placeholder.
+
+    Examples:
+        >>> _combine_rules("Primary fact table: T. Columns: a.", "Use Amount.")
+        'Use Amount.'
+        >>> _combine_rules("Use Qty.", "Use Amount.")
+        'Use Qty.'
+    """
+    return other if not keep or keep.startswith(_FALLBACK_RULE_PREFIX) else keep
+
+
+def _collapse_existing(existing: "_ExistingDraft", rename: Mapping[str, str]) -> dict[str, list[tuple[str, str]]]:
+    """Fold earlier entries that *rename* puts on one key into one, in *existing*.
+
+    A table can reach the wizard twice: the inspector's draft keyed it by its
+    bare name, an earlier wizard run by ``Schema.Table``. Both are the same
+    entity (their key is the table's default spelling), so their aliases are
+    united under the key this run uses, instead of one overwriting the other
+    in the merge.
+
+    Args:
+        existing: What the output directory held; entities, ring aliases and
+            rules are changed in place.
+        rename: ``{old key: new key}`` from :func:`_rekey_map`.
+
+    Returns:
+        ``{file name: [(dropped key, kept key), ...]}`` for the files where
+        entries were folded together; empty when nothing was.
+
+    Raises:
+        Nothing for well-formed entries.
+
+    Examples:
+        >>> draft = _ExistingDraft(entities={
+        ...     "Trade": {"table": "Trade", "schema": "sales", "aliases": []},
+        ...     "sales.Trade": {"table": "Trade", "schema": "sales", "aliases": ["deal"]}})
+        >>> _collapse_existing(draft, {"sales.Trade": "Trade"})
+        {'entities.yaml': [('sales.Trade', 'Trade')]}
+        >>> draft.entities["Trade"]["aliases"]
+        ['deal']
+    """
+    folded: dict[str, list[tuple[str, str]]] = {}
+    existing.entities, dropped = collapse_same_key(existing.entities, rename, _combine_entities)
+    if dropped:
+        folded["entities.yaml"] = list(dropped)
+    existing.ring_aliases, dropped = collapse_same_key(existing.ring_aliases, rename, _union)
+    if dropped:
+        folded["aliases.yaml"] = list(dropped)
+    existing.rules, dropped = collapse_same_key(existing.rules, rename, _combine_rules)
+    if dropped:
+        folded["business_rules.yaml"] = list(dropped)
+    return folded
+
+
+def _value_synonyms(snapshot, fetch: Callable[[Any, Any], list[str]]) -> tuple[dict[str, list[str]], int]:
+    """Synonym keys from the values of low-cardinality label columns, and the tables they came from.
+
+    Only text columns named like a label (``Name``, ``Title``, ``Kind``,
+    ``Status``, ``Type``, ...) and not like personal or contact data are read
+    (:func:`core.value_shapes.is_categorical_column`), and only when they hold
+    at most 50 distinct values. A date, a number or code, a phone number, an
+    e-mail or IP address, a URL, an address, a masked value, error text or
+    anything over 40 characters is never a key
+    (:func:`core.value_shapes.unsuitable_value`). At most 20 keys per table.
+    A key maps to the lower-cased bare table name.
+
+    Args:
+        snapshot: A schema snapshot with ``tables``.
+        fetch: ``fetch(table, column)`` returns up to 51 distinct values of the column.
+
+    Returns:
+        ``(synonyms, tables)``: ``{value: [table]}`` and how many tables gave a key.
+
+    Raises:
+        Nothing of its own; *fetch* decides.
+
+    Examples:
+        >>> from types import SimpleNamespace as NS
+        >>> cols = [NS(name="Name", type="varchar"), NS(name="Phone", type="varchar"), NS(name="Rank", type="int")]
+        >>> snap = NS(tables=[NS(name="Bank", columns=cols)])
+        >>> values = {"Name": ["Open", "09120000000", "Closed"], "Phone": ["09120000000"], "Rank": ["1"]}
+        >>> _value_synonyms(snap, lambda table, column: values[column.name])
+        ({'open': ['bank'], 'closed': ['bank']}, 1)
+    """
+    from core.value_shapes import VALUES_PER_TABLE, label_values
+    from database.schema_inspector import _is_string_type
+
+    synonyms: dict[str, list[str]] = {}
+    tables = 0
+    for table in snapshot.tables:
+        taken = 0
+        for column in table.columns:
+            if taken >= VALUES_PER_TABLE:
+                break
+            if not _is_string_type(column.type):
+                continue
+            for value in label_values(table.name, column.name, lambda: fetch(table, column)):
+                key = value.lower().strip()
+                if key in synonyms or taken >= VALUES_PER_TABLE:
+                    continue
+                synonyms[key] = [table.name.lower()]
+                taken += 1
+        tables += 1 if taken else 0
+    return synonyms, tables
+
+
+class _ValueReader:
+    """Reads the distinct values of one column through the data source its table was found in.
+
+    Opens an engine on first use (the application's own for a configured
+    source, a private one for a bare URL) and disposes the private ones on
+    :meth:`close`. A column that cannot be read gives no values.
+    """
+
+    def __init__(self, sources: "_Sources") -> None:
+        self._items = {item.name: item for item in sources.items}
+        self._first = sources.items[0].name
+        self._engines: dict[str, Any] = {}
+        self._owned: list[Any] = []
+
+    def _engine(self, name: str):
+        if name not in self._engines:
+            item = self._items[name]
+            try:
+                if item.configured:
+                    engine = item.open_engine()
+                else:
+                    from database.schema_inspector import connect_url
+
+                    engine = connect_url(item.db_url)
+                    self._owned.append(engine)
+            except Exception as exc:  # noqa: BLE001 - any driver or connection error
+                logger.warning("Cannot read values from %s: %s", name, _scrub_secrets(str(exc), item.secret_url))
+                engine = None
+            self._engines[name] = engine
+        return self._engines[name]
+
+    def __call__(self, table, column) -> list[str]:
+        from core.value_shapes import MAX_DISTINCT_VALUES
+        from database.schema_inspector import _fetch_samples
+
+        name = next((n for n in getattr(table, "datasources", ()) if n in self._items), self._first)
+        engine = self._engine(name)
+        if engine is None:
+            return []
+        return _fetch_samples(engine, table.schema, table.name, column.name, MAX_DISTINCT_VALUES + 1)
+
+    def close(self) -> None:
+        """Dispose the engines this reader opened itself."""
+        for engine in self._owned:
+            engine.dispose()
+        self._owned.clear()
+
+
+def _collect_value_synonyms(snapshot, read_from, log: dict) -> dict[str, list[str]]:
+    """The ``--value-synonyms`` step: read the label columns' values and keep the safe ones.
+
+    Args:
+        snapshot: The schema snapshot.
+        read_from: The sources (:class:`_Sources`) or the connection string.
+        log: The setup log, updated in place; it records counts, never a value.
+
+    Returns:
+        ``{synonym key: [table]}``, possibly empty.
+
+    Raises:
+        Nothing for an unreadable column; it gives no values.
+    """
+    sources = read_from if isinstance(read_from, _Sources) else _url_sources(read_from)
+    reader = _ValueReader(sources)
+    try:
+        synonyms, tables = _value_synonyms(snapshot, reader)
+    finally:
+        reader.close()
+    console.print(
+        f"  --value-synonyms: {len(synonyms)} value(s) from {tables} table(s) become synonym keys "
+        "(label columns of at most 50 distinct values; dates, numbers, phones, addresses, masked values "
+        "and personal columns are never read).",
+        markup=False,
+    )
+    log["value_synonyms"] = {"enabled": True, "synonyms": len(synonyms), "tables": tables}
+    return synonyms
+
+
+def _data_shaped_count(synonyms: Mapping[str, Any]) -> dict[str, int]:
+    """How many synonym keys look like raw data values, by shape (never the keys).
+
+    Examples:
+        >>> _data_shaped_count({"1387/03/24": ["t"], "bank": ["t"], "09120000000": ["t"]})
+        {'date': 1, 'phone': 1}
+    """
+    counts: dict[str, int] = {}
+    for key in synonyms:
+        shape = data_shape(key)
+        if shape:
+            counts[shape] = counts.get(shape, 0) + 1
+    return counts
+
+
+def _without_value_synonyms(synonyms: Mapping[str, list[str]]) -> tuple[dict[str, list[str]], dict[str, int]]:
+    """The synonyms without the keys that are values read from rows, and the count per shape.
+
+    A date, phone number, IP address, masked value, long digit run, address, hash
+    or error message is never useful as a synonym and, copied from a row, leaks
+    data; an earlier wizard run (6.13, 6.14) wrote hundreds. Only the shapes are
+    counted, never the keys.
+
+    Examples:
+        >>> kept, dropped = _without_value_synonyms({"1387/03/24": ["t"], "bank": ["b"], "Login failed for user": ["t"]})
+        >>> kept, dropped
+        ({'bank': ['b']}, {'date': 1, 'error': 1})
+    """
+    kept = {key: tokens for key, tokens in synonyms.items() if data_shape(key) is None}
+    return kept, _data_shaped_count({k: v for k, v in synonyms.items() if k not in kept})
+
+
+def _split_csv(value: str | None) -> list[str]:
+    """Split a comma-separated option into trimmed, non-empty items.
+
+    Examples:
+        >>> _split_csv(" a, b,,c ")
+        ['a', 'b', 'c']
+        >>> _split_csv(None)
+        []
+    """
+    return [item.strip() for item in (value or "").split(",") if item.strip()]
+
+
+def _is_staging(table, patterns, keep_schemas=()) -> bool:
+    """Whether *table* matches a ``STAGING_PATTERNS`` pattern.
+
+    Same rule as ``core.config_doctor.staging_tables``: a bare pattern is
+    matched against the last part of the schema name, a ``table:`` pattern
+    against the table name, both case-insensitively. A schema matching one of
+    *keep_schemas* (the source's ``keep_staging_schemas:``) is exempt from the
+    bare patterns; the ``table:`` patterns still apply.
+
+    Args:
+        table: Anything with ``schema`` and ``name``.
+        patterns: The result of ``core.config_doctor.parse_staging_patterns``.
+        keep_schemas: Schema patterns the bare patterns do not apply to.
+
+    Returns:
+        True for a staging or change-capture table.
+
+    Raises:
+        Nothing. This function never raises.
+
+    Examples:
+        >>> from types import SimpleNamespace as NS
+        >>> from core.config_doctor import parse_staging_patterns
+        >>> pats = parse_staging_patterns("*_Stg,table:*_Inserts")
+        >>> _is_staging(NS(schema="Sales_Stg", name="Trade"), pats)
+        True
+        >>> _is_staging(NS(schema="sales", name="Trade_Inserts"), pats)
+        True
+        >>> _is_staging(NS(schema="sales", name="Trade"), pats)
+        False
+        >>> _is_staging(NS(schema="Sales_Stg", name="Trade"), pats, ["sales_stg"])
+        False
+        >>> _is_staging(NS(schema="Sales_Stg", name="Trade_Inserts"), pats, ["sales_stg"])
+        True
+    """
+    schema = (table.schema or "").rsplit(".", 1)[-1].lower()
+    name = table.name.lower()
+    kept = any(fnmatch.fnmatchcase(schema, k.lower()) for k in keep_schemas)
+    return any(
+        fnmatch.fnmatchcase(name if p.on_table else schema, p.pattern)
+        for p in patterns
+        if p.on_table or not kept
+    )
+
+
+@dataclass
+class SkipReport:
+    """Tables the wizard left out before any model call, and which rule left them out.
+
+    The rules are the inspector's (``database.schema_draft``): ``system``
+    schemas, ``configured`` exclusion (``EXCLUDE_SCHEMAS`` and a source's
+    ``exclude_schemas:``), ``cli`` (``--exclude-schemas``), ``staging``, plus
+    the wizard's own ``chosen`` (schemas and tables the operator left out when
+    asked). Tables are counted per data source.
+
+    Attributes:
+        found: Tables the listing returned (within ``--include-schemas``).
+        sources: ``{data source: Skipped}``, the tables and schemas each rule
+            skipped.
+    """
+
+    found: int = 0
+    sources: dict[str, Skipped] = field(default_factory=dict)
+
+    def add(self, source: str, rule: str, schema: str, tables: int = 1) -> None:
+        """Count *tables* tables of *schema* in *source* as skipped by *rule*."""
+        self.sources.setdefault(source, Skipped()).add(rule, schema, tables)
+
+    def _count(self, rule: str) -> int:
+        return sum(skipped.tables.get(rule, 0) for skipped in self.sources.values())
+
+    @property
+    def system(self) -> int:
+        """Tables in system schemas (``cdc``, ``guest``, the fixed ``db_*`` roles, ...)."""
+        return self._count(RULE_SYSTEM)
+
+    @property
+    def configured(self) -> int:
+        """Tables in schemas ``EXCLUDE_SCHEMAS`` or a source's ``exclude_schemas:`` names."""
+        return self._count(RULE_CONFIGURED)
+
+    @property
+    def excluded_schemas(self) -> int:
+        """Tables in schemas ``--exclude-schemas`` names."""
+        return self._count(RULE_CLI)
+
+    @property
+    def staging(self) -> int:
+        """Staging and change-capture tables (``STAGING_PATTERNS``)."""
+        return self._count(RULE_STAGING)
+
+    @property
+    def excluded_tables(self) -> int:
+        """Tables ``EXCLUDE_TABLES`` or a source's ``exclude_tables:`` names."""
+        return self._count(RULE_TABLES)
+
+    @property
+    def chosen(self) -> int:
+        """Tables in schemas, or single tables, the operator left out interactively."""
+        return self._count(RULE_CHOSEN)
+
+    @property
+    def total(self) -> int:
+        """All skipped tables."""
+        return (
+            self.system + self.configured + self.excluded_schemas + self.chosen + self.staging
+            + self.excluded_tables
+        )
+
+    @classmethod
+    def merged(cls, reports: Iterable["SkipReport"]) -> "SkipReport":
+        """One report for several, e.g. the per-source plans of a run.
+
+        Examples:
+            >>> a, b = SkipReport(found=3), SkipReport(found=4)
+            >>> a.add("sales", "staging", "x_Stg", 2); b.add("reports", "staging", "y_Stg")
+            >>> total = SkipReport.merged([a, b])
+            >>> total.found, total.staging, sorted(total.sources)
+            (7, 3, ['reports', 'sales'])
+        """
+        total = cls()
+        for report in reports:
+            total.found += report.found
+            for name, skipped in report.sources.items():
+                target = total.sources.setdefault(name, Skipped())
+                for rule, count in skipped.tables.items():
+                    target.tables[rule] = target.tables.get(rule, 0) + count
+                for rule, names in skipped.schemas.items():
+                    target.schemas.setdefault(rule, set()).update(names)
+        return total
+
+    def describe(self) -> str:
+        """One sentence: how many tables were skipped and for which reason.
+
+        Examples:
+            >>> report = SkipReport(found=278)
+            >>> report.add("", "cli", "ref", 40); report.add("", "staging", "x_Stg", 26)
+            >>> report.describe()
+            'Skipped 66 of 278 tables: 40 in excluded schemas, 26 staging or change-capture (STAGING_PATTERNS; --include-staging keeps them).'
+            >>> SkipReport(5).describe()
+            'Skipped none of 5 tables.'
+            >>> report = SkipReport(found=10)
+            >>> report.add("", "system", "cdc", 2); report.add("", "configured", "Scratch", 1)
+            >>> report.describe()
+            'Skipped 3 of 10 tables: 2 in system schemas, 1 in schemas excluded by configuration (EXCLUDE_SCHEMAS or exclude_schemas:).'
+        """
+        if not self.total:
+            return f"Skipped none of {self.found} tables."
+        parts = []
+        if self.system:
+            parts.append(f"{self.system} in system schemas")
+        if self.configured:
+            parts.append(
+                f"{self.configured} in schemas excluded by configuration "
+                "(EXCLUDE_SCHEMAS or exclude_schemas:)"
+            )
+        if self.excluded_schemas:
+            parts.append(f"{self.excluded_schemas} in excluded schemas")
+        if self.excluded_tables:
+            parts.append(
+                f"{self.excluded_tables} named by a table pattern (EXCLUDE_TABLES or exclude_tables:)"
+            )
+        if self.chosen:
+            parts.append(f"{self.chosen} left out interactively")
+        if self.staging:
+            parts.append(
+                f"{self.staging} staging or change-capture "
+                "(STAGING_PATTERNS; --include-staging keeps them)"
+            )
+        return f"Skipped {self.total} of {self.found} tables: {', '.join(parts)}."
+
+    def detail_lines(self) -> list[str]:
+        """The inspector's lines: per rule, the tables and schemas skipped (per source with several).
+
+        Examples:
+            >>> report = SkipReport(found=4)
+            >>> report.add("", "configured", "Scratch", 2)
+            >>> report.detail_lines()
+            ['  configured exclusion (EXCLUDE_SCHEMAS / exclude_schemas:): 2 table(s) in 1 schema(s)']
+        """
+        return describe_skipped(self.sources)
+
+    def to_log(self) -> dict[str, Any]:
+        """The record kept in ``.setup_log.json``: the totals, then the detail per source."""
+        return {
+            "found": self.found,
+            "system": self.system,
+            "configured": self.configured,
+            "excluded_schemas": self.excluded_schemas,
+            "staging": self.staging,
+            "chosen": self.chosen,
+            "excluded_tables": self.excluded_tables,
+            "by_source": {
+                name: {
+                    "tables": dict(skipped.tables),
+                    "schemas": {rule: sorted(names) for rule, names in skipped.schemas.items()},
+                }
+                for name, skipped in self.sources.items()
+            },
+        }
+
+    @classmethod
+    def from_log(cls, data: Mapping[str, Any]) -> "SkipReport":
+        """The report :meth:`to_log` recorded.
+
+        Examples:
+            >>> report = SkipReport(found=3)
+            >>> report.add("sales", "staging", "x_Stg", 2)
+            >>> SkipReport.from_log(report.to_log()).describe() == report.describe()
+            True
+        """
+        report = cls(found=int(data.get("found", 0)))
+        for name, entry in (data.get("by_source") or {}).items():
+            report.sources[name] = Skipped(
+                tables={rule: int(n) for rule, n in (entry.get("tables") or {}).items()},
+                schemas={rule: set(names) for rule, names in (entry.get("schemas") or {}).items()},
+            )
+        return report
+
+
+def _drop_tables(snapshot, drop: set[tuple[str, str]]) -> None:
+    """Remove the tables whose identity is in *drop*, and every relationship touching them.
+
+    Args:
+        snapshot: The schema snapshot, changed in place.
+        drop: ``_identity`` pairs to remove.
+
+    Returns:
+        None.
+
+    Raises:
+        Nothing for a well-formed snapshot.
+
+    Examples:
+        >>> from types import SimpleNamespace as NS
+        >>> t = [NS(name="A", schema="s"), NS(name="B", schema="s")]
+        >>> r = [NS(from_table="A", from_schema="s", to_table="B", to_schema=None)]
+        >>> snap = NS(tables=t, relationships=r)
+        >>> _drop_tables(snap, {("s", "b")})
+        >>> [x.name for x in snap.tables], snap.relationships
+        (['A'], [])
+    """
+    if not drop:
+        return
+    snapshot.tables = [t for t in snapshot.tables if _identity(t.schema, t.name) not in drop]
+    kept = []
+    for rel in snapshot.relationships:
+        from_schema = getattr(rel, "from_schema", None)
+        to_schema = getattr(rel, "to_schema", None) or from_schema
+        if (
+            _identity(from_schema, rel.from_table) in drop
+            or _identity(to_schema, rel.to_table) in drop
+        ):
+            continue
+        kept.append(rel)
+    snapshot.relationships = kept
+
+
+def _schema_counts(snapshot) -> dict[str, int]:
+    """``{schema: number of tables}`` in schema-name order; no schema is ``"(none)"``.
+
+    Examples:
+        >>> from types import SimpleNamespace as NS
+        >>> _schema_counts(NS(tables=[NS(schema="b"), NS(schema="a"), NS(schema="b"), NS(schema="")]))
+        {'(none)': 1, 'a': 1, 'b': 2}
+    """
+    counts: dict[str, int] = {}
+    for table in snapshot.tables:
+        name = table.schema or "(none)"
+        counts[name] = counts.get(name, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: item[0].lower()))
+
+
+def _skip_tables(
+    snapshot,
+    exclude_patterns: list[str],
+    staging_patterns,
+    report: SkipReport,
+    *,
+    chosen: bool = False,
+    source: str = "",
+    exclusion: SchemaExclusion | None = None,
+) -> None:
+    """Drop the tables in schemas matching *exclude_patterns*, named by table exclusion, or matching a staging pattern.
+
+    Args:
+        snapshot: The schema snapshot, changed in place.
+        exclude_patterns: ``fnmatch`` patterns for schema names (case-insensitive).
+        staging_patterns: Parsed ``STAGING_PATTERNS``; empty to keep staging tables.
+        report: Counts are added to it, under *source* (``chosen`` when *chosen*
+            is true, else ``--exclude-schemas``).
+        chosen: Whether the patterns come from the operator's interactive answer.
+        source: The data source *snapshot* was read from.
+        exclusion: The source's rule; its table patterns drop a table (counted as
+            ``configured-tables``) and its ``keep_staging_schemas:`` exempt a
+            schema from the bare staging patterns.
+
+    Returns:
+        None.
+
+    Raises:
+        Nothing for a well-formed snapshot.
+
+    Examples:
+        >>> from types import SimpleNamespace as NS
+        >>> from core.config_doctor import parse_staging_patterns
+        >>> snap = NS(tables=[NS(name="T", schema="sales"), NS(name="T", schema="ref"),
+        ...                   NS(name="T", schema="sales_Stg")], relationships=[])
+        >>> report = SkipReport(found=3)
+        >>> _skip_tables(snap, ["ref"], parse_staging_patterns("*_Stg"), report)
+        >>> [t.schema for t in snap.tables], report.excluded_schemas, report.staging
+        (['sales'], 1, 1)
+    """
+    from database.schema_inspector import schema_is_excluded
+
+    rule = RULE_CHOSEN if chosen else RULE_CLI
+    keep = exclusion.keep_staging if exclusion is not None else ()
+    dropped: set[tuple[str, str]] = set()
+    for table in snapshot.tables:
+        if exclude_patterns and schema_is_excluded(table.schema or "", exclude_patterns):
+            report.add(source, rule, table.schema or "")
+        elif exclusion is not None and exclusion.table_excluded(table.schema or "", table.name):
+            report.add(source, RULE_TABLES, table.schema or "")
+        elif staging_patterns and _is_staging(table, staging_patterns, keep):
+            report.add(source, RULE_STAGING, table.schema or "")
+        else:
+            continue
+        dropped.add(_identity(table.schema, table.name))
+    _drop_tables(snapshot, dropped)
+
+
+# ---- what to read, decided from names alone ---------------------------------
+
+#: Catalogue schemas the listing never shows: they hold the database's own
+#: views, not tables to describe. The rest of the system schemas (``cdc``,
+#: ``guest``, the fixed ``db_*`` roles) are listed and counted as skipped by the
+#: ``system`` rule (:mod:`database.schema_filter`), so the summary says so.
+_SYSTEM_SCHEMAS = ("information_schema", "sys", "pg_catalog", "pg_toast")
+
+
+def _list_engine_tables(engine) -> dict[str, list[str]]:
+    """``{schema: [table names]}`` read through *engine*: names only, no column, no row.
+
+    Uses SQLAlchemy's inspector. This is the first look at a database; what to
+    read is decided from it (see :func:`_plan_reading`).
+
+    Args:
+        engine: A SQLAlchemy engine (the application's, for a configured
+            source); it is left open.
+
+    Returns:
+        Schemas in the database's order, each with its table names; the
+        catalogue schemas (``sys``, ``INFORMATION_SCHEMA``, ``pg_*``) are not listed.
+
+    Raises:
+        Exception: Whatever SQLAlchemy raises when the database cannot be
+            listed; the caller reports it with the credentials scrubbed.
+
+    Examples:
+        >>> from sqlalchemy import create_engine, text
+        >>> engine = create_engine("sqlite://")
+        >>> with engine.begin() as conn:
+        ...     _ = conn.execute(text("CREATE TABLE Widget (ID INTEGER)"))
+        >>> _list_engine_tables(engine)
+        {'main': ['Widget']}
+    """
+    from sqlalchemy import inspect as sa_inspect
+
+    inspector = sa_inspect(engine)
+    listing: dict[str, list[str]] = {}
+    for schema in inspector.get_schema_names():
+        if schema.lower() in _SYSTEM_SCHEMAS or schema.lower().startswith("pg_"):
+            continue
+        listing[schema] = list(inspector.get_table_names(schema=schema))
+    return listing
+
+
+def _list_schema_tables(db_url: str) -> dict[str, list[str]]:
+    """``{schema: [table names]}`` from the database at *db_url* (see :func:`_list_engine_tables`).
+
+    Args:
+        db_url: The SQLAlchemy connection string.
+
+    Returns:
+        Schemas in the database's order, each with its table names.
+
+    Raises:
+        Exception: Whatever SQLAlchemy raises when the database cannot be
+            listed; the caller reports it with the credentials scrubbed.
+    """
+    from sqlalchemy import create_engine
+
+    engine = create_engine(db_url, pool_pre_ping=True, pool_size=1, max_overflow=0)
+    try:
+        return _list_engine_tables(engine)
+    finally:
+        engine.dispose()
+
+
+@dataclass
+class _ReadPlan:
+    """What the inspection of one source will read, and what was left out before it.
+
+    Attributes:
+        schemas: Schemas to inspect (their real spelling).
+        exclude_tables: Bare table names the inspection is told to skip: staging
+            tables whose name no other listed table shares.
+        report: The skip counts so far.
+        per_schema: ``{schema: tables to be read}`` for the interactive question.
+    """
+
+    schemas: list[str] = field(default_factory=list)
+    exclude_tables: list[str] = field(default_factory=list)
+    report: SkipReport = field(default_factory=SkipReport)
+    per_schema: dict[str, int] = field(default_factory=dict)
+
+
+def _plan_reading(
+    listing: Mapping[str, list[str]],
+    include_schemas: list[str] | None,
+    exclusion: SchemaExclusion,
+    staging_patterns,
+    chosen_patterns: list[str] | None = None,
+    *,
+    source: str = "",
+) -> _ReadPlan:
+    """Decide from table names alone which schemas and tables the inspection reads.
+
+    ``--include-schemas`` narrows the listing, then the *exclusion* (system
+    schemas, ``EXCLUDE_SCHEMAS``, the source's ``exclude_schemas:`` and
+    ``--exclude-schemas``) and the schemas the operator chose remove schemas,
+    so a schema matching both is not read. Each skipped table is counted under
+    the first rule that skips it. A table named by the exclusion's table
+    patterns (``EXCLUDE_TABLES``, ``exclude_tables:``) is left out, and so is a
+    staging table (a schema in ``keep_staging_schemas:`` is exempt from the bare
+    ``STAGING_PATTERNS`` patterns): a schema whose every table is left out this
+    way (a bare staging pattern matches the schema name) is not read at all; a
+    table match is passed as an excluded name when no other listed table shares
+    its bare name. One whose name is shared is read and dropped afterwards
+    (:func:`_skip_tables`), so a same-named table of another schema is not lost;
+    it is not counted here.
+
+    Args:
+        listing: ``{schema: [table names]}`` from :func:`_list_engine_tables`.
+        include_schemas: Schemas to read (case-insensitive), or ``None`` for all.
+        exclusion: The source's rule (``database.schema_filter.schema_exclusion``),
+            with its table patterns and ``keep_staging_schemas:``.
+        staging_patterns: Parsed ``STAGING_PATTERNS``; empty keeps staging tables.
+        chosen_patterns: Schema patterns the operator chose interactively.
+        source: The data source the listing belongs to, for the report.
+
+    Returns:
+        The plan. ``schemas`` is empty when nothing is left to read, in which
+        case the inspection must not run (an empty include list means "all").
+
+    Raises:
+        Nothing. This function never raises.
+
+    Examples:
+        >>> from core.config_doctor import parse_staging_patterns
+        >>> from database.schema_filter import SchemaExclusion
+        >>> listing = {"sales": ["Trade", "Trade_Inserts"], "sales_Stg": ["Trade"], "ref": ["Region"]}
+        >>> plan = _plan_reading(
+        ...     listing, None, SchemaExclusion(cli=("ref",)), parse_staging_patterns("*_Stg,table:*_Inserts"),
+        ... )
+        >>> plan.schemas, plan.exclude_tables
+        (['sales'], ['Trade_Inserts'])
+        >>> plan.report.describe()
+        'Skipped 3 of 4 tables: 1 in excluded schemas, 2 staging or change-capture (STAGING_PATTERNS; --include-staging keeps them).'
+        >>> _plan_reading(listing, ["REF"], SchemaExclusion(), []).schemas
+        ['ref']
+        >>> _plan_reading(listing, ["ref"], SchemaExclusion(cli=("r*",)), []).schemas
+        []
+        >>> plan = _plan_reading({"cdc": ["T"], "Scratch": ["T"], "ref": ["R"]}, None,
+        ...                      SchemaExclusion(configured=("scratch",)), [])
+        >>> plan.schemas, plan.report.system, plan.report.configured
+        (['ref'], 1, 1)
+    """
+    from database.schema_inspector import schema_is_excluded
+
+    wanted = {i.casefold() for i in include_schemas} if include_schemas else None
+    selected = {
+        schema: list(names) for schema, names in listing.items()
+        if wanted is None or schema.casefold() in wanted
+    }
+    plan = _ReadPlan(report=SkipReport(found=sum(len(n) for n in selected.values())))
+    plan.report.sources[source] = Skipped()   # a source that skipped nothing is still one of the run
+
+    # Bare names across everything that could be read, to tell a unique name from a shared one.
+    remaining: dict[str, list[str]] = {}
+    for schema, names in selected.items():
+        rule = exclusion.reason(schema)
+        if rule is None and chosen_patterns and schema_is_excluded(schema, chosen_patterns):
+            rule = RULE_CHOSEN
+        if rule is None:
+            remaining[schema] = names
+        else:
+            plan.report.add(source, rule, schema, len(names))
+    name_count: dict[str, int] = {}
+    for names in remaining.values():
+        for name in names:
+            name_count[name.casefold()] = name_count.get(name.casefold(), 0) + 1
+
+    def _table_rule(schema: str, name: str) -> str | None:
+        if exclusion.table_excluded(schema, name):
+            return RULE_TABLES
+        if staging_patterns and _is_staging(_Listed(schema, name), staging_patterns, exclusion.keep_staging):
+            return RULE_STAGING
+        return None
+
+    for schema, names in remaining.items():
+        staged = [(name, rule) for name in names if (rule := _table_rule(schema, name)) is not None]
+        if names and len(staged) == len(names):
+            for _, rule in staged:   # every table is left out by a rule: the schema is not read
+                plan.report.add(source, rule, schema)
+            continue
+        read = len(names)
+        for name, rule in staged:
+            if name_count[name.casefold()] == 1:
+                plan.exclude_tables.append(name)
+                plan.report.add(source, rule, schema)
+                read -= 1
+        plan.per_schema[schema] = read
+        plan.schemas.append(schema)
+    return plan
+
+
+class _Listed:
+    """A table known by name only: what :func:`_is_staging` needs."""
+
+    def __init__(self, schema: str, name: str) -> None:
+        self.schema = schema
+        self.name = name
+
+
+# ---- relationships ---------------------------------------------------------
+
+@dataclass(frozen=True)
+class _Link:
+    """One relationship between two tables, keyed like the entities.
+
+    Attributes:
+        from_key, to_key: The tables' keys (``Table`` or ``Schema.Table``).
+        from_column, to_column: The joined columns.
+        join_hint: The ``JOIN ... ON ...`` clause.
+        basis: Empty for a declared foreign key; for an inferred one, why it
+            was guessed (``naming convention: ...``).
+        confidence: ``high`` or ``medium`` for an inferred one, else empty.
+    """
+
+    from_key: str
+    from_column: str
+    to_key: str
+    to_column: str
+    join_hint: str
+    basis: str = ""
+    confidence: str = ""
+
+    @property
+    def inferred(self) -> bool:
+        """Whether this was guessed from column names rather than declared."""
+        return bool(self.basis)
+
+    def as_entry(self) -> dict[str, str]:
+        """The ``relationships.yaml`` entry; ``basis`` and ``confidence`` only for an inferred one."""
+        entry = {
+            "from_table": self.from_key,
+            "from_column": self.from_column,
+            "to_table": self.to_key,
+            "to_column": self.to_column,
+            "join_hint": self.join_hint,
+        }
+        if self.inferred:
+            entry["basis"] = self.basis
+            entry["confidence"] = self.confidence
+        return entry
+
+    def endpoints(self) -> frozenset[tuple[str, str]]:
+        """The two ``(table key, column)`` ends, lower-cased, direction ignored."""
+        return frozenset({
+            (self.from_key.casefold(), self.from_column.casefold()),
+            (self.to_key.casefold(), self.to_column.casefold()),
+        })
+
+
+def _declared_links(snapshot, namer) -> list[_Link]:
+    """The snapshot's foreign keys as links, with keyed table names.
+
+    Args:
+        snapshot: A schema snapshot with ``relationships``.
+        namer: The key rule from :func:`_table_namer`.
+
+    Returns:
+        One link per relationship, in snapshot order.
+
+    Raises:
+        Nothing for a well-formed snapshot.
+    """
+    links = []
+    for rel in snapshot.relationships:
+        from_schema = getattr(rel, "from_schema", None)
+        links.append(_Link(
+            from_key=namer.ref(from_schema, rel.from_table),
+            from_column=rel.from_column,
+            to_key=namer.ref(getattr(rel, "to_schema", None), rel.to_table, default_schema=from_schema),
+            to_column=rel.to_column,
+            join_hint=rel.join_hint,
+        ))
+    return links
+
+
+def _inferred_links(snapshot, namer, declared: list[_Link]) -> tuple[list[_Link], str]:
+    """Relationships guessed from column names, for tables the foreign keys do not explain.
+
+    Builds the ``schema.yaml`` model and catalogue that
+    ``schema_data.relationship_proposals.propose_relationships`` reads from
+    the snapshot, and keeps what it infers (``<Name>_ID`` or ``<Name>ID``
+    pointing at the table ``Name``'s key). Declared foreign keys are given to
+    it too, so a column a constraint already explains is not guessed again.
+
+    Args:
+        snapshot: A schema snapshot with ``tables``.
+        namer: The key rule from :func:`_table_namer`.
+        declared: The links from :func:`_declared_links`; a guess with the
+            same ends is dropped.
+
+    Returns:
+        ``(links, problem)``: the inferred links, and a sentence saying why
+        none could be inferred (``""`` when nothing went wrong).
+
+    Raises:
+        Nothing. A snapshot the proposal code cannot model yields no links
+        and a *problem*.
+    """
+    try:
+        from database.catalogue import ColumnInfo, ForeignKey, TableInfo, table_location
+        from schema_data.registry import SchemaConfig, TableDefinition
+        from schema_data.relationship_proposals import propose_relationships
+
+        located = {}
+        definitions = {}
+        for table in snapshot.tables:
+            key = namer.key(table)
+            schema = table.schema or ""
+            db_schema = schema if schema and "." not in schema else ""
+            columns = {c.name: "" for c in table.columns}
+            definitions[key] = TableDefinition(columns=columns or None, db_schema=db_schema)
+            located[_identity(table.schema, table.name)] = table_location(key, db_schema, "dbo")
+        catalogue = {}
+        for table in snapshot.tables:
+            key = namer.key(table)
+            own = located[_identity(table.schema, table.name)]
+            foreign_keys = []
+            for fk in getattr(table, "foreign_keys", []):
+                ref = located.get(
+                    _identity(getattr(fk, "referred_schema", None) or table.schema, fk.referred_table),
+                    ((getattr(fk, "referred_schema", None) or table.schema or "dbo").lower(),
+                     fk.referred_table.lower()),
+                )
+                foreign_keys.append(ForeignKey("", (fk.column,), ref, (fk.referred_column,)))
+            catalogue[own] = TableInfo(
+                schema=table.schema or "",
+                name=table.name,
+                is_view=False,
+                columns=tuple(ColumnInfo(c.name, c.type, True) for c in table.columns),
+                primary_key=tuple(getattr(table, "pk_columns", ())),
+                foreign_keys=tuple(foreign_keys),
+            )
+        schema_config = SchemaConfig(tables=definitions)
+        result = propose_relationships(schema_config, ["wizard"], {"wizard": catalogue})
+    except Exception as exc:  # noqa: BLE001 - a snapshot the proposal code cannot model
+        return [], f"Relationships were not inferred from column names ({type(exc).__name__}: {exc})."
+
+    taken = {link.endpoints() for link in declared}
+    links: list[_Link] = []
+    for proposal in result.proposals:
+        if proposal.confidence == "declared":
+            continue
+        link = _Link(
+            from_key=namer.ref(proposal.from_schema or None, proposal.from_table),
+            from_column=proposal.from_column,
+            to_key=namer.ref(proposal.to_schema or None, proposal.to_table),
+            to_column=proposal.to_column,
+            join_hint=proposal.join_hint,
+            basis=proposal.basis,
+            confidence=proposal.confidence,
+        )
+        if link.endpoints() not in taken:
+            taken.add(link.endpoints())
+            links.append(link)
+    return links, ""
+
+
+def _collect_links(snapshot, namer) -> tuple[list[_Link], str]:
+    """The declared foreign keys, plus inferred relationships when there are few of them.
+
+    Args:
+        snapshot: A schema snapshot with ``tables`` and ``relationships``.
+        namer: The key rule from :func:`_table_namer`.
+
+    Returns:
+        ``(links, problem)``: declared links first, then inferred ones (only
+        when the database declares fewer than one foreign key per
+        ``_FEW_FK_TABLES_PER_FK`` tables); *problem* is a sentence when
+        inference was wanted but failed, else ``""``.
+
+    Raises:
+        Nothing for a well-formed snapshot.
+
+    Examples:
+        >>> from types import SimpleNamespace as NS
+        >>> snap = NS(tables=[], relationships=[])
+        >>> _collect_links(snap, _table_namer(snap))
+        ([], '')
+    """
+    declared = _declared_links(snapshot, namer)
+    tables = len(snapshot.tables)
+    if not tables or len(declared) >= max(1, tables // _FEW_FK_TABLES_PER_FK):
+        return declared, ""
+    inferred, problem = _inferred_links(snapshot, namer, declared)
+    return declared + inferred, problem
+
+
+# ---- files of an earlier run -----------------------------------------------
+
+@dataclass
+class _ExistingDraft:
+    """What the output directory already holds, in the wizard's internal shapes.
+
+    ``entities`` is ``{key: {"table", "schema", "aliases", "label"}}`` and
+    ``rules`` is ``{key: rule text}``; the rest is as in the YAML files.
+    """
+
+    entities: dict[str, dict[str, Any]] = field(default_factory=dict)
+    ring_aliases: dict[str, list[str]] = field(default_factory=dict)
+    synonyms: dict[str, list[str]] = field(default_factory=dict)
+    rules: dict[str, str] = field(default_factory=dict)
+    examples: list[dict[str, Any]] = field(default_factory=list)
+    relationships: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _section(doc: Any, name: str, kind: type, filename: str) -> Any:
+    """``doc[name]`` checked to be a *kind*; a missing or null section is empty.
+
+    Raises:
+        ValueError: When the file is not a mapping or the section has another type.
+
+    Examples:
+        >>> _section({"a": None}, "a", dict, "f.yaml")
+        {}
+        >>> _section({"a": [1]}, "a", list, "f.yaml")
+        [1]
+    """
+    if not isinstance(doc, dict):
+        raise ValueError(f"{filename}: the top level is not a mapping")
+    value = doc.get(name)
+    if value is None:
+        return kind()
+    if not isinstance(value, kind):
+        raise ValueError(f"{filename}: `{name}` is not a {'mapping' if kind is dict else 'list'}")
+    return value
+
+
+def _parse_existing(filename: str, text: str, into: _ExistingDraft) -> None:
+    """Parse one wizard file's *text* into *into*.
+
+    Raises:
+        ValueError: When the text is not a file of the shape the wizard writes.
+        yaml.YAMLError: When it is not YAML (or repeats a key).
+    """
+    doc = safe_load_strict(text) or {}
+    if filename == "entities.yaml":
+        for key, entry in _section(doc, "entities", dict, filename).items():
+            if not isinstance(entry, dict) or not entry.get("table"):
+                raise ValueError(f"{filename}: entity {key!r} has no `table`")
+            into.entities[str(key)] = {
+                "table": str(entry["table"]),
+                # The wizard writes `schema_name:`; the inspector's draft and the
+                # template's comment say `schema:`. Both are the entity's schema.
+                "schema": entry.get("schema_name") or entry.get("schema"),
+                "aliases": list(entry.get("aliases") or []),
+                "datasource": _source_names(entry.get("datasource")),
+                "label": entry.get("label"),
+            }
+    elif filename == "aliases.yaml":
+        for name, target in (("ring_aliases", into.ring_aliases), ("synonyms", into.synonyms)):
+            for key, value in _section(doc, name, dict, filename).items():
+                if not isinstance(value, list):
+                    raise ValueError(f"{filename}: `{name}` entry {key!r} is not a list")
+                target[str(key)] = [str(v) for v in value]
+    elif filename == "business_rules.yaml":
+        for key, entry in _section(doc, "rules", dict, filename).items():
+            text_value = entry.get("rule_text") if isinstance(entry, dict) else entry
+            if not isinstance(text_value, str):
+                raise ValueError(f"{filename}: rule {key!r} has no `rule_text`")
+            into.rules[str(key)] = text_value
+    elif filename == "examples.yaml":
+        items = _section(doc, "examples", list, filename)
+        if not all(isinstance(e, dict) for e in items):
+            raise ValueError(f"{filename}: an example is not a mapping")
+        into.examples = [dict(e) for e in items]
+    elif filename == "relationships.yaml":
+        items = _section(doc, "relationships", list, filename)
+        if not all(isinstance(e, dict) for e in items):
+            raise ValueError(f"{filename}: a relationship is not a mapping")
+        into.relationships = [dict(e) for e in items]
+
+
+def _read_existing(
+    output_dir: Path,
+    filenames: tuple[str, ...] = (),
+) -> tuple[_ExistingDraft, dict[str, str]]:
+    """Read the wizard files that *output_dir* already holds.
+
+    Args:
+        output_dir: The output directory; it need not exist.
+        filenames: Which files to read; those that are absent are skipped.
+
+    Returns:
+        ``(existing, problems)``: what could be read, and ``{filename: why}``
+        for each file that exists but is not a valid wizard file.
+
+    Raises:
+        Nothing. Unreadable files are returned as problems.
+
+    Examples:
+        >>> import tempfile
+        >>> with tempfile.TemporaryDirectory() as tmp:
+        ...     _ = Path(tmp, "entities.yaml").write_text("entities:\\n  A: {table: A, aliases: [x]}\\n")
+        ...     _ = Path(tmp, "examples.yaml").write_text("examples: [1]\\n")
+        ...     found, problems = _read_existing(Path(tmp), ("entities.yaml", "examples.yaml", "aliases.yaml"))
+        >>> list(found.entities), list(problems)
+        (['A'], ['examples.yaml'])
+    """
+    existing = _ExistingDraft()
+    problems: dict[str, str] = {}
+    for filename in filenames:
+        path = output_dir / filename
+        if not path.is_file():
+            continue
+        try:
+            _parse_existing(filename, path.read_text(encoding="utf-8"), existing)
+        except Exception as exc:  # noqa: BLE001 - YAMLError, ValueError, OSError, ...
+            problems[filename] = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+    return existing, problems
+
+
+def _known_tables(snapshot, namer, existing: _ExistingDraft, output_dir: Path):
+    """The tables the wizard can name, as a view: this run's, the earlier entities', ``schema.yaml``'s.
+
+    Used to tell a ``ring_aliases`` key that names a table from the value of a
+    ring (:func:`core.wizard_drafts.drop_table_rings`). A table is listed by
+    every key it is known by, so an earlier file's spelling of a key still finds it.
+
+    Args:
+        snapshot: The schema snapshot of this run.
+        namer: The key rule from :func:`_table_namer`.
+        existing: What the output directory held.
+        output_dir: The output directory; its ``schema.yaml`` is read if it has one.
+
+    Returns:
+        A :class:`core.config_doctor.SchemaView`.
+
+    Raises:
+        Nothing. A ``schema.yaml`` that cannot be read adds no table.
+
+    Examples:
+        >>> from types import SimpleNamespace as NS
+        >>> snap = NS(tables=[NS(name="Hall", schema="ref")])
+        >>> draft = _ExistingDraft(entities={"Bank": {"table": "Bank", "schema": "ref", "aliases": []}})
+        >>> view = _known_tables(snap, NS(key=lambda t: t.name), draft, Path("no such directory"))
+        >>> [t.key for t in view.tables]
+        ['Hall', 'Bank']
+    """
+    from core import config_doctor as doctor
+    from core.ring_names import table_view
+
+    rows = [(namer.key(t), t.schema or "", t.name) for t in snapshot.tables]
+    rows += [(key, entry.get("schema") or "", entry["table"]) for key, entry in existing.entities.items()]
+    rows += [(t.key, t.schema, t.name) for t in doctor.read_schema(output_dir).tables]
+    return table_view(rows)
+
+
+def _live_config_dir() -> Path:
+    """The directory the application reads its configuration from.
+
+    ``PROJECT_CONFIG_DIR`` (``Settings.project_config_dir``); a relative value
+    is resolved against the repository root, as every loader does.
+    """
+    import config as cfg
+
+    configured = Path(cfg.settings.project_config_dir)
+    return configured if configured.is_absolute() else _REPO_ROOT / configured
+
+
+# ===========================================================================
+# Step implementations
+# ===========================================================================
+
+def step1_connection(args, log: dict) -> str:
+    """Return a validated DB URL."""
+    console.rule("[bold blue]Step 1: Database Connection[/bold blue]" if _RICH else "Step 1: Database Connection")
+
+    db_url = (
+        args.db_url
+        or os.getenv("DB_CONNECTION_URL")
+        or os.getenv("DATABASE_URL")
+    )
+
+    if not db_url:
+        if args.non_interactive:
+            sys.exit("ERROR: --db-url is required in non-interactive mode.")
+        db_url = _ask(
+            "Enter SQLAlchemy connection string",
+            default="mssql+pyodbc://server/db?driver=ODBC+Driver+17+for+SQL+Server",
+        )
+
+    console.print("  Testing connection...", end=" ")
+    try:
+        from sqlalchemy import create_engine, text
+        engine = create_engine(db_url, pool_pre_ping=True, pool_size=1, max_overflow=0)
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        engine.dispose()
+        console.print("[green]OK[/green]" if _RICH else "OK")
+    except Exception as exc:  # noqa: BLE001
+        console.print("[red]FAILED[/red]" if _RICH else "FAILED")
+        console.print(f"  Error: {_scrub_secrets(str(exc), db_url)}")
+        console.print("  Connection string formats:" + _DB_EXAMPLES)
+        if not args.non_interactive and _yn("Retry with a different URL?", non_interactive=False):
+            return step1_connection(args, log)
+        sys.exit(1)
+
+    _mark_done(log, "step1_connection", {"db_url_redacted": _redact_db_url(db_url)})
+    return db_url
+
+
+@dataclass(frozen=True)
+class _Source:
+    """One database the wizard reads.
+
+    Attributes:
+        name: The data source name (``default`` for a bare URL).
+        label: How it is shown: the name and the redacted URL.
+        secret_url: The connection string with its password, only to scrub driver messages.
+        configured: True for a data source of ``datasources.yaml``, read through the
+            application's own engine; False for a URL the wizard opens itself.
+        db_url: The URL, when *configured* is false.
+        open_engine: The application's engine for the source, when *configured* is true.
+    """
+
+    name: str
+    label: str
+    secret_url: str
+    configured: bool = False
+    db_url: str = ""
+    open_engine: Callable[[], Any] | None = None
+
+
+@dataclass(frozen=True)
+class _Sources:
+    """What step 1 settled: the databases to read.
+
+    Attributes:
+        items: The sources to read, default first.
+        names: Every source the deployment configures (a run narrowed with
+            ``--datasource`` reads fewer); decides whether ``datasource:`` lines are written.
+        from_file: Whether they come from ``datasources.yaml``.
+    """
+
+    items: tuple[_Source, ...]
+    names: tuple[str, ...]
+    from_file: bool = False
+
+    @property
+    def selected(self) -> tuple[str, ...]:
+        """The names of the sources to read."""
+        return tuple(item.name for item in self.items)
+
+    @property
+    def label(self) -> str:
+        """The sources, for the ``# Source:`` header of ``entities.yaml``."""
+        return ", ".join(item.label for item in self.items)
+
+
+def _url_sources(db_url: str) -> _Sources:
+    """The single source of a bare connection string (``--db-url``, ``DB_CONNECTION_URL``)."""
+    from database.datasources import DEFAULT_DATASOURCE
+
+    item = _Source(DEFAULT_DATASOURCE, _redact_db_url(db_url), db_url, False, db_url)
+    return _Sources((item,), (DEFAULT_DATASOURCE,), False)
+
+
+def _source_listing(source: _Source) -> dict[str, list[str]]:
+    """The names-only listing of *source* (see :func:`_list_engine_tables`)."""
+    if source.configured:
+        return _list_engine_tables(source.open_engine())
+    return _list_schema_tables(source.db_url)
+
+
+def _source_inspector(source: _Source):
+    """The ``SchemaInspector`` that reads *source*.
+
+    A configured source is read through the application's engine
+    (``SchemaInspector.for_engine``, which leaves the engine open); a bare URL
+    gets an inspector of its own, as before.
+    """
+    from database.schema_inspector import SchemaInspector
+
+    if source.configured:
+        return SchemaInspector.for_engine(source.open_engine(), sample_rows=5, label=source.label)
+    return SchemaInspector(source.db_url, sample_rows=5)
+
+
+def _combine_snapshots(parts, names: tuple[str, ...]):
+    """One snapshot from the snapshots of several sources.
+
+    A table present with the same ``schema.table`` in several sources is one
+    table (the first source's columns and sample values), and carries the
+    sources it was found in as ``datasources``, written the way the inspector's
+    drafts write them (:func:`database.schema_draft.listed_datasources`).
+
+    Args:
+        parts: ``[(source name, snapshot)]``, default source first.
+        names: Every configured source name.
+
+    Returns:
+        A ``SchemaSnapshot`` of the distinct tables and relationships.
+
+    Raises:
+        Nothing for well-formed snapshots.
+
+    Examples:
+        >>> from types import SimpleNamespace as NS
+        >>> from database.schema_inspector import SchemaSnapshot, TableInfo
+        >>> a = SchemaSnapshot(tables=[TableInfo("T", "s"), TableInfo("U", "s")])
+        >>> b = SchemaSnapshot(tables=[TableInfo("t", "S")])
+        >>> merged = _combine_snapshots([("a", a), ("b", b)], ("a", "b"))
+        >>> [(t.name, t.datasources) for t in merged.tables]
+        [('T', ('a', 'b')), ('U', ('a',))]
+    """
+    from database.schema_inspector import SchemaSnapshot
+
+    found: dict[tuple[str, str], Any] = {}
+    where: dict[tuple[str, str], list[str]] = {}
+    relationships: dict[tuple, Any] = {}
+    for name, snapshot in parts:
+        for table in snapshot.tables:
+            identity = _identity(table.schema, table.name)
+            found.setdefault(identity, table)
+            if name not in where.setdefault(identity, []):
+                where[identity].append(name)
+        for rel in snapshot.relationships:
+            from_schema = getattr(rel, "from_schema", None)
+            ends = (
+                _identity(from_schema, rel.from_table), rel.from_column.casefold(),
+                _identity(getattr(rel, "to_schema", None) or from_schema, rel.to_table),
+                rel.to_column.casefold(),
+            )
+            relationships.setdefault(ends, rel)
+    tables = []
+    for identity, table in found.items():
+        table.datasources = listed_datasources(names, where[identity])
+        tables.append(table)
+    return SchemaSnapshot(
+        tables=tables, relationships=list(relationships.values()),
+        source_url=", ".join(name for name, _ in parts),
+    )
+
+
+def step1_sources(args, log: dict, configured) -> _Sources:
+    """Open the configured data sources and prove each connects.
+
+    The sources are read through the application's own engines
+    (``database.connection.get_engine``), so the wizard sees exactly what the
+    application's login can query.
+
+    Args:
+        args: Parsed command line.
+        log: The setup log, updated in place.
+        configured: ``database.setup_sources.configured_sources``'s result.
+
+    Returns:
+        The sources to read.
+
+    Raises:
+        SystemExit: When a source cannot be reached.
+    """
+    chosen, everything, _default = configured
+    console.rule("[bold blue]Step 1: Database Connection[/bold blue]" if _RICH else "Step 1: Database Connection")
+    console.print(
+        "  Data sources of datasources.yaml, read through the application's own login "
+        f"(it sees what the application can query): {', '.join(c.name for c in chosen)}",
+        markup=False,
+    )
+    from sqlalchemy import text
+
+    items = []
+    for source in chosen:
+        console.print(f"  Testing connection to {source.name}...", end=" ")
+        try:
+            with source.open_engine().connect() as conn:
+                conn.execute(text("SELECT 1"))
+        except Exception as exc:  # noqa: BLE001
+            console.print("[red]FAILED[/red]" if _RICH else "FAILED")
+            console.print(f"  Error: {_scrub_secrets(str(exc), source.secret_url)}", markup=False)
+            sys.exit(1)
+        console.print("[green]OK[/green]" if _RICH else "OK")
+        items.append(_Source(
+            source.name, source.label, source.secret_url, True, "", source.open_engine,
+        ))
+    _mark_done(log, "step1_connection", {
+        "datasources": {c.name: _redact_db_url(c.secret_url) for c in chosen},
+    })
+    return _Sources(tuple(items), tuple(everything), True)
+
+
+def _record_choice(args, sources: _Sources, plans, chosen_patterns: list[str]) -> dict[str, Any] | None:
+    """Offer to keep the schemas the operator just left out, so no later run asks again.
+
+    With ``datasources.yaml`` the patterns that matched a schema of a source are
+    offered as that source's ``exclude_schemas:`` (default answer No), written
+    with a comment-preserving text edit after a backup
+    (:func:`database.datasources_edit.record_exclude_schemas`). Anything that
+    goes wrong leaves the file as it was and prints the lines to add by hand.
+    Without it, the ``EXCLUDE_SCHEMAS=`` line for ``.env`` is printed; ``.env``
+    is never edited. With ``--dry-run`` nothing is written either way.
+
+    Args:
+        args: Parsed command line.
+        sources: The sources of the run.
+        plans: ``{source: _ReadPlan}`` made before the answer, whose
+            ``per_schema`` is what the operator was shown.
+        chosen_patterns: The operator's answer.
+
+    Returns:
+        A record for the setup log, or ``None`` when nothing matched.
+
+    Raises:
+        Nothing. A failed edit is reported.
+    """
+    from database.datasources import datasources_path
+    from database.datasources_edit import DatasourcesEditError, exclude_schemas_snippet, record_exclude_schemas
+    from database.schema_filter import exclude_schemas_env_line, schema_is_excluded
+
+    additions: dict[str, list[str]] = {}
+    for item in sources.items:
+        shown = plans[item.name].per_schema
+        matching = [
+            pattern for pattern in chosen_patterns
+            if any(schema_is_excluded(schema, [pattern]) for schema in shown)
+        ]
+        if matching:
+            additions[item.name] = matching
+    if not additions:
+        return None
+
+    console.print("  You left these schemas out:", markup=False)
+    for name, patterns in additions.items():
+        console.print(f"    {name}: {', '.join(patterns)}" if sources.from_file else f"    {', '.join(patterns)}", markup=False)
+
+    if not sources.from_file:
+        everything = [p for patterns in additions.values() for p in patterns]
+        console.print(
+            "  To leave them out of every later run, set this line in .env (the wizard does not edit .env):",
+            markup=False,
+        )
+        console.print(f"    {exclude_schemas_env_line(everything)}", markup=False)
+        return {"env_line": exclude_schemas_env_line(everything)}
+
+    path = datasources_path()
+    snippet = exclude_schemas_snippet(additions)
+    if args.dry_run:
+        console.print(
+            f"  Dry run: {path.name} is not changed. To leave them out of every later run, add:",
+            markup=False,
+        )
+        console.print(textwrap.indent(snippet, "    "), markup=False)
+        return {"recorded": False}
+    if not _yn(
+        f"Record them as exclude_schemas in {path.name}? (a backup is made first; the comments stay)",
+        default=False, non_interactive=args.non_interactive,
+    ):
+        console.print(f"  Not recorded. To leave them out of every later run, add to {path.name}:", markup=False)
+        console.print(textwrap.indent(snippet, "    "), markup=False)
+        return {"recorded": False}
+    try:
+        done = record_exclude_schemas(path, additions, stamp=datetime.now().strftime("%Y%m%d-%H%M%S"))
+    except DatasourcesEditError as exc:
+        console.print(f"  Not recorded: {exc}", markup=False)
+        console.print(f"  {path} was not changed. Add this by hand:", markup=False)
+        console.print(textwrap.indent(snippet, "    "), markup=False)
+        return {"recorded": False, "error": str(exc).splitlines()[0]}
+    if done.backup is not None:
+        console.print(f"  Backed up: {path.name} -> {done.backup.name}", markup=False)
+    console.print(f"  Recorded exclude_schemas in {path}.", markup=False)
+    return {
+        "recorded": True,
+        "backup": str(done.backup) if done.backup else None,
+        "added": {name: list(patterns) for name, patterns in done.added.items()},
+    }
+
+
+def step2_schema(args, source, log: dict):
+    """Run schema inspection over every selected source and return one SchemaSnapshot.
+
+    Two phases. First the table names of each source are listed (nothing else
+    is read), the schemas to leave out are applied (the system schemas,
+    ``EXCLUDE_SCHEMAS``, the source's own ``exclude_schemas:``,
+    ``--include-schemas``, ``--exclude-schemas``, staging tables, and in
+    interactive mode the operator's answer) and only the remaining schemas are
+    inspected, so a schema that is left out is never scanned for columns or
+    sample values. The sources are listed, planned and inspected together; the
+    tables are then merged into one snapshot (a ``schema.table`` found in
+    several sources is one table).
+
+    Args:
+        args: Parsed command line.
+        source: The sources from :func:`step1_sources`, or a connection string
+            (one source, read with the login in it).
+        log: The setup log, updated in place.
+
+    Returns:
+        The snapshot of the tables that remain.
+
+    Raises:
+        SystemExit: When a database cannot be listed or inspected.
+    """
+    from database.schema_filter import schema_exclusion
+
+    console.rule("[bold blue]Step 2: Schema Discovery[/bold blue]" if _RICH else "Step 2: Schema Discovery")
+    sources = source if isinstance(source, _Sources) else _url_sources(source)
+
+    include_schemas = (
+        [s.strip() for s in args.include_schemas.split(",") if s.strip()]
+        if getattr(args, "include_schemas", None)
+        else None
+    )
+
+    import config as cfg
+    from core.config_doctor import parse_staging_patterns
+
+    cli_patterns = _split_csv(getattr(args, "exclude_schemas", None))
+    # A bare URL is not one of the configured sources, so no source's own
+    # exclude_schemas: is assumed for it; the system schemas, EXCLUDE_SCHEMAS
+    # and --exclude-schemas apply to it as they always did.
+    rules = {
+        item.name: schema_exclusion(item.name if sources.from_file else None, cli_patterns)
+        for item in sources.items
+    }
+
+    # Phase 1: names only. Which schemas are read is decided here, before any
+    # column or sample value is fetched, so a schema that is left out is
+    # never scanned.
+    listings: dict[str, dict[str, list[str]]] = {}
+    for item in sources.items:
+        try:
+            listings[item.name] = _source_listing(item)
+        except Exception as exc:  # noqa: BLE001 - any driver or connection error
+            reason = _scrub_secrets(str(exc), item.secret_url)
+            where = f" for data source {item.name}" if sources.from_file else ""
+            console.print(
+                f"[red]Schema listing failed{where}: {reason}[/red]" if _RICH
+                else f"Schema listing failed{where}: {reason}"
+            )
+            sys.exit(1)
+
+    staging_patterns = (
+        [] if getattr(args, "include_staging", False)
+        else parse_staging_patterns(cfg.settings.staging_patterns)
+    )
+
+    def plan_all(chosen: list[str] | None = None) -> dict[str, _ReadPlan]:
+        return {
+            item.name: _plan_reading(
+                listings[item.name], include_schemas, rules[item.name], staging_patterns, chosen,
+                source=item.name,
+            )
+            for item in sources.items
+        }
+
+    plans = plan_all()
+    for item in sources.items:
+        listing = listings[item.name]
+        count = f"{sum(len(n) for n in listing.values())} tables in {len(listing)} schemas"
+        console.print(
+            f"  Data source {item.name}: {count}." if sources.from_file else f"  The database has {count}.",
+            markup=False,
+        )
+    report = SkipReport.merged(plan.report for plan in plans.values())
+    if report.total:
+        console.print(f"  {report.describe()}", markup=False)
+
+    chosen_patterns: list[str] = []
+    recorded: dict[str, Any] | None = None
+    if not args.non_interactive:
+        console.print("  Schemas and the tables that would be read:", markup=False)
+        for item in sources.items:
+            if sources.from_file:
+                console.print(f"  Data source {item.name}:", markup=False)
+            for schema, count in sorted(plans[item.name].per_schema.items(), key=lambda entry: entry[0].lower()):
+                console.print(f"    {schema}: {count}", markup=False)
+        answer = _ask(
+            "Schemas to leave out (names or patterns such as *_Stg, comma-separated, blank=none)",
+            default="",
+        )
+        chosen_patterns = _split_csv(answer)
+        if chosen_patterns:
+            before_answer = plans
+            plans = plan_all(chosen_patterns)
+            report = SkipReport.merged(plan.report for plan in plans.values())
+            console.print(f"  {report.describe()}", markup=False)
+            recorded = _record_choice(args, sources, before_answer, chosen_patterns)
+
+    # Phase 2: read the schemas that remain. An empty include list would mean
+    # "every schema" to the inspector, so with nothing left it does not run.
+    staging_before = report.staging
+    parts = []
+    for item in sources.items:
+        plan = plans[item.name]
+        if not plan.schemas:
+            continue
+        inspector = _source_inspector(item)
+        configured_patterns = list(rules[item.name].configured) if sources.from_file else []
+        with _spinner(f"Inspecting {item.name}..."):
+            try:
+                found = inspector.inspect(
+                    include_schemas=plan.schemas,
+                    exclude_schemas=[*configured_patterns, *cli_patterns, *chosen_patterns] or None,
+                    exclude_tables=plan.exclude_tables or None,
+                    fetch_row_counts=False,
+                )
+            except ConnectionError as exc:
+                reason = _scrub_secrets(str(exc), item.secret_url)
+                console.print(f"[red]Schema inspection failed: {reason}[/red]" if _RICH else reason)
+                sys.exit(1)
+            finally:
+                inspector.close()
+        # A staging table whose name another table shares was read; drop it now.
+        _skip_tables(found, [], staging_patterns, plan.report, source=item.name, exclusion=rules[item.name])
+        parts.append((item.name, found))
+    report = SkipReport.merged(plan.report for plan in plans.values())
+    snapshot = _combine_snapshots(parts, sources.names)
+    if not parts:
+        snapshot.source_url = _redact_db_url(sources.items[0].secret_url) if not sources.from_file else sources.label
+
+    console.print(
+        f"  Read [bold]{len(snapshot.tables)}[/bold] tables: "
+        f"[cyan]{len(snapshot.fact_tables)}[/cyan] fact, "
+        f"[green]{len(snapshot.dim_tables)}[/green] dim"
+        if _RICH else
+        f"  Read {len(snapshot.tables)} tables: {len(snapshot.fact_tables)} fact, {len(snapshot.dim_tables)} dim"
+    )
+    if report.staging != staging_before:
+        console.print(f"  {report.describe()}", markup=False)
+
+    # Show table list in a table widget
+    if _RICH:
+        tbl = Table(title="Discovered Tables", show_lines=False)
+        tbl.add_column("Table", style="cyan")
+        tbl.add_column("Schema")
+        if sources.from_file:
+            tbl.add_column("Source")
+        tbl.add_column("Class", style="yellow")
+        tbl.add_column("Cols", justify="right")
+        tbl.add_column("FKs", justify="right")
+        for t in snapshot.tables:
+            cells = [t.name, t.schema or ""]
+            if sources.from_file:
+                cells.append(", ".join(t.datasources))
+            tbl.add_row(*cells, t.classification, str(len(t.columns)), str(len(t.foreign_keys)))
+        console.print(tbl)
+    else:
+        for t in snapshot.tables:
+            where = f" [{', '.join(t.datasources)}]" if t.datasources else ""
+            print(f"  {t.full_name:40s} {t.classification:10s} cols={len(t.columns)} fks={len(t.foreign_keys)}{where}")
+
+    # Ask to exclude single tables (a bare name or Schema.Table)
+    if not args.non_interactive:
+        excl = _ask("Tables to exclude (comma-separated names or Schema.Table, blank=none)", default="")
+        if excl.strip():
+            wanted = {e.casefold() for e in _split_csv(excl)}
+            drop = {
+                _identity(t.schema, t.name) for t in snapshot.tables
+                if {t.name.casefold(), t.full_name.casefold()} & wanted
+            }
+            for t in snapshot.tables:
+                if _identity(t.schema, t.name) in drop:
+                    report.add((t.datasources or sources.selected)[0], RULE_CHOSEN, t.schema or "")
+            _drop_tables(snapshot, drop)
+            console.print(f"  Excluded {len(drop)} table(s).")
+
+    _mark_done(log, "step2_schema", {
+        "schema_fingerprint": _schema_fingerprint(snapshot, sources=sources.selected),
+        "sources": list(sources.selected),
+        "skipped": report.to_log(),
+        "exclusion_recorded": recorded,
+        "table_count": len(snapshot.tables),
+        "fact_count": len(snapshot.fact_tables),
+        "dim_count": len(snapshot.dim_tables),
+    })
+    return snapshot
+
+
+def step3_aliases(args, snapshot, llm, log: dict, language: str, namer=None) -> dict:
+    """Generate entity aliases via LLM and return entities dict.
+
+    Entities and aliases are keyed by the table's key (``Table`` when the name
+    is unique, ``Schema.Table`` when several schemas share it), so tables of
+    the same name in different schemas stay separate entries. The model is
+    told the schema-qualified name.
+
+    Args:
+        args: Parsed command line.
+        snapshot: The schema snapshot (skipped tables already removed).
+        llm: The wizard LLM.
+        log: The setup log, updated in place.
+        language: Language the aliases are generated in.
+        namer: The key rule; built from *snapshot* when ``None``.
+
+    Returns:
+        ``{"entities": {key: {...}}, "ring_aliases": {}}``. The aliases of a
+        table belong to its entity; ``ring_aliases`` is the map of a ring's
+        stored name to its forms and the wizard does not know the rings, so
+        it stays empty (the key is kept for the shape of the log).
+
+    Raises:
+        CachedAnswersError: When 3 tables in a row get the identical answer.
+    """
+    namer = namer or _table_namer(snapshot)
+    console.rule("[bold blue]Step 3: LLM Alias Generation[/bold blue]" if _RICH else "Step 3: Alias Generation")
+
+    entities: dict[str, dict] = {}
+    total = len(snapshot.tables)
+    guard = _AnswerGuard(
+        "Step 3", "alias list", allow=getattr(args, "allow_repeated_answers", False),
+    )
+    trimmed = 0  # tables whose alias list had repeats or too many entries
+    salvaged: list[str] = []  # tables whose list was recovered from a cut-off answer
+    failed: list[str] = []    # tables whose answer held no alias at all
+
+    for idx, table in enumerate(snapshot.tables, 1):
+        console.print(f"  [{idx}/{total}] {table.full_name} ...", end=" ")
+
+        col_names   = [c.name for c in table.columns]
+        # Sample values help the model name a table, but a phone number, an address, a
+        # national id or a masked name must not reach it: personal columns and
+        # value-shaped samples are left out (core.value_shapes.prompt_samples).
+        all_samples = [
+            s for c in table.columns for s in prompt_samples(table.name, c.name, c.sample_values)
+        ]
+
+        note = ""  # what the operator should know about how this list came about
+        try:
+            prompt = _prompt_aliases(table.full_name, col_names, all_samples, language)
+            reply = llm.generate_aliases(prompt, limit=ALIAS_LIMIT)
+            # The model's own answer, before it is cleaned and before the operator edits it below.
+            answered, aliases, description = reply.answered, reply.aliases, reply.description
+            if reply.salvaged:
+                salvaged.append(table.full_name)
+                note = f" (salvaged {len(aliases)} from a truncated answer)"
+            elif reply.retried:
+                note = " (the first answer was unusable; answered on the second try)"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Alias generation failed for %s: %s", table.name, exc)
+            answered, aliases, description = [], [], ""
+            failed.append(table.full_name)
+            note = f" ({getattr(exc, 'reason', None) or f'the model call failed: {type(exc).__name__}'})"
+
+        if len(aliases) < len(answered):
+            trimmed += 1
+        text = f"{len(aliases)} aliases{note}"
+        if note:
+            console.print(text, markup=False)
+        else:
+            console.print(f"[green]{text}[/green]" if _RICH else text)
+        guard.observe(table.full_name, "\n".join(str(a) for a in answered) if answered else None)
+
+        if not args.non_interactive and not args.dry_run:
+            aliases_str = ", ".join(f'"{a}"' for a in aliases) or "(none)"
+            console.print(f"    Aliases: {aliases_str}")
+            if description:
+                console.print(f"    Desc   : {description}")
+            action = _choose(
+                f"  Accept aliases for {table.full_name}?",
+                choices=["Accept", "Edit", "Clear"],
+                default="Accept",
+            )
+            if action == "Edit":
+                edited = _ask("Enter aliases (comma-separated)", default=", ".join(aliases))
+                aliases = [a.strip().strip('"') for a in edited.split(",") if a.strip()]
+            elif action == "Clear":
+                aliases = []
+
+        key = namer.key(table)
+        entities[key] = {
+            "table":   table.name,
+            "schema":  table.schema,
+            "aliases": aliases,
+        }
+        if getattr(table, "datasources", ()):
+            entities[key]["datasource"] = list(table.datasources)
+
+    console.print(f"  {guard.summary()}.", markup=False)
+    if trimmed:
+        console.print(
+            f"  {trimmed} alias list(s) had repeats or more than {ALIAS_LIMIT} entries and were cleaned.",
+            markup=False,
+        )
+    if salvaged:
+        console.print(
+            f"  {len(salvaged)} alias list(s) were salvaged from a truncated answer (the model repeated itself "
+            "or was cut off at the token limit); read them before you use them.",
+            markup=False,
+        )
+    if failed:
+        console.print(
+            f"  {len(failed)} table(s) got no aliases because the model call failed or its answer was unusable: "
+            f"{', '.join(failed[:10])}{' ...' if len(failed) > 10 else ''}.",
+            markup=False,
+        )
+    _mark_done(log, "step3_aliases", {
+        "entity_count": len(entities),
+        "aliases_cleaned": trimmed,
+        "aliases_salvaged": salvaged,
+        "aliases_failed": failed,
+        "language": language,
+        "provider": llm.provider,
+        "result": {"entities": entities, "ring_aliases": {}},
+    })
+    return {"entities": entities, "ring_aliases": {}}
+
+
+#: Start of the placeholder rule written for a fact table the model gave no
+#: rule for. A merge treats it as "no answer" and never lets it replace an
+#: earlier rule.
+_FALLBACK_RULE_PREFIX = "Primary fact table: "
+
+#: Column types (as the inspector normalises them) a value or volume can be.
+_NUMERIC_TYPES = frozenset({"int", "bigint", "smallint", "tinyint", "decimal", "float"})
+
+#: Last word of a column name that makes it a key or a code, not a measure.
+_KEY_WORDS = frozenset({"id", "key", "sk", "pk", "fk", "guid", "uuid", "code", "no"})
+
+
+def _measure_columns(table, link_columns: Iterable[str] = ()) -> list[str]:
+    """The columns of *table* a value or volume rule can name: numeric and not a key.
+
+    A primary-key column, a column that is the local end of a foreign key or
+    of a relationship (*link_columns*), a column named like a key (``ID``,
+    ``Customer_ID``, ``TradeKey``, ``ProductCode``) and a column of a
+    non-numeric type are not measures. A fact table with none has nothing a
+    "value column" or "volume column" could be.
+
+    Args:
+        table: A table with ``columns`` and ``foreign_keys``.
+        link_columns: Column names that join this table to another.
+
+    Returns:
+        The measure column names, in table order.
+
+    Raises:
+        Nothing for a well-formed table.
+
+    Examples:
+        >>> from types import SimpleNamespace as NS
+        >>> cols = [NS(name="ID", type="int", is_pk=True), NS(name="Customer_ID", type="int", is_pk=False),
+        ...         NS(name="Amount", type="decimal", is_pk=False), NS(name="Qty", type="int", is_pk=False),
+        ...         NS(name="Note", type="varchar", is_pk=False), NS(name="Dept", type="int", is_pk=False)]
+        >>> _measure_columns(NS(columns=cols, foreign_keys=[NS(column="Dept")]))
+        ['Amount', 'Qty']
+        >>> _measure_columns(NS(columns=cols[:2], foreign_keys=[]))
+        []
+    """
+    import re
+
+    linked = {c.casefold() for c in link_columns} | {
+        str(getattr(fk, "column", "")).casefold() for fk in getattr(table, "foreign_keys", ())
+    }
+    measures = []
+    for column in table.columns:
+        if column.type not in _NUMERIC_TYPES or getattr(column, "is_pk", False) or column.name.casefold() in linked:
+            continue
+        words = re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z0-9]+", column.name)
+        if words and words[-1].casefold() in _KEY_WORDS:
+            continue
+        measures.append(column.name)
+    return measures
+
+
+#: Words of a schema name that make it a dimension schema (``ref_Dim``, ``Sales_Dims``).
+_DIMENSION_SCHEMA_WORDS = frozenset({"dim", "dims", "dimension", "dimensions", "lookup", "lookups"})
+
+
+def _name_words(name: str) -> list[str]:
+    """The lower-case words of an identifier, split at ``_``, digits and capitals.
+
+    Examples:
+        >>> _name_words("ref_Dim"), _name_words("TradeKey"), _name_words("Customer_ID")
+        (['ref', 'dim'], ['trade', 'key'], ['customer', 'id'])
+    """
+    import re
+
+    return [word.casefold() for word in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z0-9]+", name)]
+
+
+def _looks_like_dimension(table, has_links_out: bool = False) -> bool:
+    """Whether *table* reads as a dimension or lookup, whatever the name heuristic classed it as.
+
+    The inspector classes a table by its name first, so ``ContractType`` is a
+    fact table (``contract``) and so is a lookup in a ``Reports_Dim`` schema. A
+    value or volume rule for such a table is noise, and listing it as a fact
+    table without a measure is wrong. It is a dimension when the inspector said
+    so, when its schema is named like one (``ref_Dim``, ``Lookups``; not
+    ``Dim_Fact``), or when it is a lookup in shape: one key column and one or
+    two non-numeric descriptive columns, and nothing it points to.
+
+    Args:
+        table: A table with ``classification``, ``schema``, ``columns`` and ``foreign_keys``.
+        has_links_out: Whether a relationship (declared or inferred) starts at the table.
+
+    Returns:
+        ``True`` for a dimension.
+
+    Raises:
+        Nothing for a well-formed table.
+
+    Examples:
+        >>> from types import SimpleNamespace as NS
+        >>> def col(name, kind="int", pk=False): return NS(name=name, type=kind, is_pk=pk)
+        >>> lookup = NS(classification="fact", schema="ref", foreign_keys=[],
+        ...             columns=[col("ID", pk=True), col("Title", "varchar")])
+        >>> _looks_like_dimension(lookup), _looks_like_dimension(lookup, has_links_out=True)
+        (True, False)
+        >>> trade = NS(classification="fact", schema="sales", foreign_keys=[],
+        ...            columns=[col("ID", pk=True), col("Amount", "decimal")])
+        >>> _looks_like_dimension(trade)
+        False
+        >>> _looks_like_dimension(NS(classification="fact", schema="ref_Dim", foreign_keys=[], columns=trade.columns))
+        True
+        >>> _looks_like_dimension(NS(classification="fact", schema="Dim_Fact", foreign_keys=[], columns=trade.columns))
+        False
+    """
+    if table.classification == "dim":
+        return True
+    words = set(_name_words(table.schema or ""))
+    if words & _DIMENSION_SCHEMA_WORDS and not words & {"fact", "facts"}:
+        return True
+    if has_links_out or table.foreign_keys:
+        return False
+    keys = [
+        c for c in table.columns
+        if getattr(c, "is_pk", False) or (_name_words(c.name) or [""])[-1] in _KEY_WORDS
+    ]
+    text = [c for c in table.columns if c not in keys]
+    return len(keys) == 1 and 1 <= len(text) <= 2 and all(c.type not in _NUMERIC_TYPES for c in text)
+
+
+def _pick_measure(name: object, measures: list[str]) -> str:
+    """*name* spelled as it is in *measures*, or ``""`` when the table has no such measure column.
+
+    Examples:
+        >>> _pick_measure("amount", ["Amount", "Qty"]), _pick_measure("ID", ["Amount"]), _pick_measure(None, ["Amount"])
+        ('Amount', '', '')
+    """
+    if not isinstance(name, str):
+        return ""
+    return next((m for m in measures if m.casefold() == name.strip().casefold()), "")
+
+
+def step4_business_rules(args, snapshot, llm, log: dict, namer=None, links=None) -> dict:
+    """Generate business rules for fact tables.
+
+    Rules are keyed like the entities. The join hints the model sees are the
+    relationships of the table: declared foreign keys, and, when the database
+    declares few, those inferred from column names.
+
+    Args:
+        args: Parsed command line.
+        snapshot: The schema snapshot (skipped tables already removed).
+        llm: The wizard LLM.
+        log: The setup log, updated in place.
+        namer: The key rule; built from *snapshot* when ``None``.
+        links: The relationships (``_collect_links``); collected from
+            *snapshot* when ``None``.
+
+    Returns:
+        ``{key: rule text}``.
+
+    Raises:
+        CachedAnswersError: When 3 tables in a row get the identical answer.
+    """
+    namer = namer or _table_namer(snapshot)
+    if links is None:
+        links, _ = _collect_links(snapshot, namer)
+    console.rule("[bold blue]Step 4: Business Rules[/bold blue]" if _RICH else "Step 4: Business Rules")
+
+    rules: dict[str, str] = {}
+    fact_tables = snapshot.fact_tables
+    if not fact_tables:
+        console.print("  No fact tables detected — skipping.")
+        _mark_done(log, "step4_rules", {
+            "rule_count": 0, "skipped_no_measure": [], "skipped_dimension": [],
+            "provider": llm.provider, "result": {},
+        })
+        return rules
+
+    # Relationship hints and related dimension tables, per fact table key.
+    dims_of: dict[str, list[str]] = {}
+    joins_of: dict[str, list[str]] = {}
+    joined_by: dict[str, set[str]] = {}
+    for link in links:
+        if link.to_key not in dims_of.setdefault(link.from_key, []):
+            dims_of[link.from_key].append(link.to_key)
+        joins_of.setdefault(link.from_key, []).append(link.join_hint)
+        joined_by.setdefault(link.from_key, set()).add(link.from_column)
+        joined_by.setdefault(link.to_key, set()).add(link.to_column)
+
+    guard = _AnswerGuard(
+        "Step 4", "rule text", allow=getattr(args, "allow_repeated_answers", False),
+    )
+
+    # A table the name heuristic called a fact table but that is a dimension or a lookup
+    # gets no value or volume rule, and is not counted among the fact tables without a measure.
+    dimension_like = [
+        t.full_name for t in fact_tables if _looks_like_dimension(t, bool(dims_of.get(namer.key(t))))
+    ]
+    fact_tables = [t for t in fact_tables if t.full_name not in dimension_like]
+    if dimension_like:
+        console.print(
+            f"  {len(dimension_like)} table(s) classed as fact by name look like dimensions (their schema is a "
+            f"dimension schema, or they hold a key and descriptive text only) and get no rule: "
+            f"{', '.join(dimension_like[:10])}{' ...' if len(dimension_like) > 10 else ''}.",
+            markup=False,
+        )
+
+    no_measure: list[str] = []
+    for table in fact_tables:
+        key = namer.key(table)
+        console.print(f"  {table.full_name} ...", end=" ")
+        col_dicts = [{"name": c.name, "type": c.type} for c in table.columns]
+        dim_tables = dims_of.get(key, [])
+        fk_joins   = joins_of.get(key, [])
+        measures   = _measure_columns(table, joined_by.get(key, ()))
+        if not measures:
+            # A "value column" and a "volume column" need a numeric column that is not a key.
+            console.print("skipped (no numeric column that is not a key)", markup=False)
+            no_measure.append(table.full_name)
+            continue
+
+        try:
+            prompt = _prompt_business_rules(table.full_name, col_dicts, dim_tables, fk_joins, measures)
+            result = llm.generate(prompt, expect_json=True)
+            rule_data = result.get("rules", {}) if isinstance(result, dict) else {}
+            rule_text = rule_data.get("rule_text", "") if isinstance(rule_data, dict) else ""
+            if not isinstance(rule_text, str):
+                rule_text = ""
+            # Only a measure of this table can be a value or volume column: a key the
+            # model names ("Value column: ID. Volume column: ID.") is dropped.
+            named = [
+                (label, _pick_measure(rule_data.get(field_name), measures) if isinstance(rule_data, dict) else "")
+                for label, field_name in (("Value column", "value_col"), ("Volume column", "volume_col"))
+            ]
+            prefix = " ".join(f"{label}: {column}." for label, column in named if column)
+            if prefix:
+                rule_text = f"{prefix} {rule_text}".strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Rule generation failed for %s: %s", table.name, exc)
+            rule_text = ""
+
+        # The model's own answer (the fallback below is ours), table names taken out.
+        model_answer = _normalize_rule_text(rule_text, [table.name, table.full_name, key, *dim_tables])
+        if not rule_text:
+            rule_text = (
+                f"{_FALLBACK_RULE_PREFIX}{table.name}. "
+                f"Columns: {', '.join(c.name for c in table.columns[:8])}."
+            )
+
+        console.print("[green]done[/green]" if _RICH else "done")
+        guard.observe(table.full_name, model_answer or None)
+        rules[key] = rule_text
+
+    console.print(f"  {guard.summary()}.", markup=False)
+    if no_measure:
+        console.print(
+            f"  {len(no_measure)} fact table(s) got no rule: no numeric column that is not a key "
+            f"to name as value or volume ({', '.join(no_measure[:10])}{' ...' if len(no_measure) > 10 else ''}).",
+            markup=False,
+        )
+    _mark_done(log, "step4_rules", {
+        "rule_count": len(rules),
+        "skipped_no_measure": no_measure,
+        "skipped_dimension": dimension_like,
+        "provider": llm.provider,
+        "result": rules,
+    })
+    return rules
+
+
+#: Keys under which a model may nest its list of pairs, and the names it may give
+#: the question and the SQL of a pair.
+_EXAMPLE_LIST_KEYS = ("examples", "pairs", "queries", "data", "items", "results")
+_EXAMPLE_QUESTION_KEYS = ("question", "nlq", "natural_language", "natural_language_question", "prompt", "q")
+_EXAMPLE_SQL_KEYS = ("sql", "query", "sql_query", "answer")
+
+
+def _first_text(item: Mapping[str, Any], keys: tuple[str, ...]) -> str:
+    """The first non-empty string among *item*'s *keys*, trimmed; ``""`` if none."""
+    for key in keys:
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _example_pairs(result: Any) -> tuple[list[dict[str, Any]], int]:
+    """The usable question and SQL pairs in a model's answer, and how many items it held.
+
+    The answer may be the list itself, or an object that nests it (under
+    ``examples`` or one of a few other names, else under its only list). An
+    item is usable when it has a question and a read-only statement (it starts
+    with ``SELECT`` or ``WITH``); the question may be called ``nlq`` and the
+    statement ``query`` or ``sql_query``. ``tags`` becomes a list of strings.
+
+    Args:
+        result: What ``WizardLLM.generate`` returned.
+
+    Returns:
+        ``(pairs, items)``: ``{"tags", "question", "sql"}`` per usable item,
+        and the number of items in the answer, usable or not.
+
+    Raises:
+        Nothing. This function never raises.
+
+    Examples:
+        >>> pairs, items = _example_pairs({"examples": [
+        ...     {"question": "How many?", "sql": "SELECT COUNT(*) FROM T", "tags": ["count"]},
+        ...     {"nlq": "Top 5", "query": "with x as (select 1 a) select * from x"},
+        ...     {"question": "Drop it", "sql": "DROP TABLE T"}, {"question": "No SQL"}, "text"]})
+        >>> items, [p["question"] for p in pairs], pairs[0]["tags"]
+        (5, ['How many?', 'Top 5'], ['count'])
+        >>> _example_pairs([]), _example_pairs({"examples": []}), _example_pairs("nothing")
+        (([], 0), ([], 0), ([], 0))
+    """
+    import re
+
+    items = result
+    if isinstance(result, dict):
+        items = next((result[k] for k in _EXAMPLE_LIST_KEYS if isinstance(result.get(k), list)), None)
+        if items is None:
+            lists = [v for v in result.values() if isinstance(v, list)]
+            items = lists[0] if len(lists) == 1 else []
+    if not isinstance(items, list):
+        return [], 0
+    pairs: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        question = _first_text(item, _EXAMPLE_QUESTION_KEYS)
+        sql = _first_text(item, _EXAMPLE_SQL_KEYS)
+        if not (question and sql) or not re.match(r"(?is)\s*(?:--[^\n]*\n\s*)*\(?\s*(select|with)\b", sql):
+            continue
+        tags = item.get("tags")
+        if isinstance(tags, str):
+            tags = [tags]
+        pairs.append({
+            "tags": [str(t) for t in tags if isinstance(t, (str, int))] if isinstance(tags, list) else [],
+            "question": question,
+            "sql": sql,
+        })
+    return pairs, len(items)
+
+
+def _example_groups(snapshot) -> list[tuple[str | None, str]]:
+    """``[(source, label)]``: one entry per data source the tables were found in, else one for all.
+
+    Examples:
+        >>> from types import SimpleNamespace as NS
+        >>> _example_groups(NS(tables=[NS(datasources=("a",)), NS(datasources=("a", "b")), NS(datasources=())]))
+        [('a', 'a'), ('b', 'b')]
+        >>> _example_groups(NS(tables=[NS(datasources=())]))
+        [(None, 'all tables')]
+    """
+    names: list[str] = []
+    for table in snapshot.tables:
+        for name in getattr(table, "datasources", ()):
+            if name not in names:
+                names.append(name)
+    return [(name, name) for name in names] or [(None, "all tables")]
+
+
+def step5_examples(args, snapshot, llm, log: dict, language: str) -> list:
+    """Generate NLQ→SQL example pairs, one model call for each data source.
+
+    The tables of each data source are summarised for the model apart (fact
+    tables first, up to 20), because a question and its SQL belong to one
+    database: with one summary for the whole snapshot, the first 20 tables in
+    listed order decided which source the examples were about. An answer with
+    no usable pair is asked once more, with a smaller request. Nothing the
+    model returns is dropped silently: the step reports how many items it got,
+    how many were usable and, when none were, says so.
+
+    Args:
+        args: Parsed command line.
+        snapshot: The schema snapshot (skipped tables already removed).
+        llm: The wizard LLM.
+        log: The setup log, updated in place.
+        language: Language the questions are generated in.
+
+    Returns:
+        The usable pairs, ``{"tags", "question", "sql"}`` each; empty when the
+        model gave none.
+
+    Raises:
+        Nothing for a model failure; it is reported and counted as no answer.
+    """
+    console.rule("[bold blue]Step 5: Example Generation[/bold blue]" if _RICH else "Step 5: Examples")
+
+    examples: list[dict[str, Any]] = []
+    discarded = 0
+    problems: list[str] = []
+    per_source: dict[str, int] = {}
+    for source, label in _example_groups(snapshot):
+        usable: list[dict[str, Any]] = []
+        for tables, count in ((_EXAMPLE_SUMMARY_TABLES, 10), (_EXAMPLE_RETRY_TABLES, 5)):
+            summary = _build_schema_summary(snapshot, source, tables)
+            try:
+                result = llm.generate(_prompt_examples(summary, language, source or "", count), expect_json=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Example generation failed for %s: %s", label, exc)
+                problems.append(f"{label}: the model call failed ({type(exc).__name__})")
+                continue
+            usable, items = _example_pairs(result)
+            discarded += items - len(usable)
+            if usable:
+                break
+            problems.append(
+                f"{label}: the model returned {items} item(s), none with a question and a SELECT statement"
+                if items else f"{label}: the model returned no examples"
+            )
+        per_source[label] = len(usable)
+        examples.extend(usable)
+
+    note = f" ({discarded} item(s) of the answers discarded: no question, or not a SELECT)" if discarded else ""
+    console.print(
+        f"  Generated [bold]{len(examples)}[/bold] examples{note}." if _RICH
+        else f"  Generated {len(examples)} examples{note}.",
+    )
+    if not examples:
+        console.print(
+            "  WARNING: the model gave no usable example"
+            + (f" ({'; '.join(problems[:4])})" if problems else "")
+            + ". examples.yaml will have no examples from this run; run again, or write them by hand.",
+            markup=False,
+        )
+    _mark_done(log, "step5_examples", {
+        "example_count": len(examples),
+        "discarded": discarded,
+        "per_source": per_source,
+        "problems": problems,
+        "language": language,
+        "provider": llm.provider,
+        "result": examples,
+    })
+    return examples
+
+
+def _quiet(args: argparse.Namespace) -> argparse.Namespace:
+    """Return a copy of *args* that never prompts.
+
+    Used to re-run an LLM step from the review screen without asking the
+    per-table questions again.
+
+    Args:
+        args: Parsed command line.
+
+    Returns:
+        A new namespace equal to *args* except ``non_interactive`` is true.
+
+    Raises:
+        Nothing. This function never raises.
+
+    Examples:
+        >>> ns = argparse.Namespace(non_interactive=False, dry_run=False)
+        >>> _quiet(ns).non_interactive, ns.non_interactive
+        (True, False)
+    """
+    return argparse.Namespace(**{**vars(args), "non_interactive": True})
+
+
+def step6_review_and_write(
+    args,
+    output_dir: Path,
+    generated_at: str,
+    source_url: str,
+    entities_data: dict,
+    ring_aliases: dict,
+    rules: dict,
+    examples: list,
+    snapshot,
+    log: dict,
+    llm=None,
+    language: str = "en",
+    *,
+    namer=None,
+    links: list[_Link] | None = None,
+    existing: _ExistingDraft | None = None,
+    rename: Mapping[str, str] | None = None,
+    backup_stamp: str | None = None,
+    backups: list[Path] | None = None,
+    source_order: Iterable[str] = (),
+    synonyms: Mapping[str, list[str]] | None = None,
+    collapsed: Mapping[str, Iterable[tuple[str, str]]] | None = None,
+) -> None:
+    """Review generated files and write to disk.
+
+    Each file is shown for review (accept, edit, regenerate, skip). With
+    ``--resume``, a file that already exists is left alone.
+
+    What is shown and written is the merge of this run into *existing* (the
+    files the output directory already held): see ``core.wizard_drafts``. The
+    counts are printed per file and recorded in the log. A ``ring_aliases``
+    entry of *existing* whose key names a table (written by 6.13 to 6.16.2,
+    one per table) is dropped first, its aliases kept in the table's entity,
+    and the keys are listed in the summary and in the log.
+
+    "Regenerate" asks the LLM again and shows the new version: for
+    ``business_rules.yaml`` and ``examples.yaml`` that re-runs step 4 or 5;
+    for ``entities.yaml`` and ``aliases.yaml``, which are both built from the
+    step 3 aliases, it re-runs step 3 for every table without the per-table
+    questions and re-renders both files (one already written earlier in this
+    run is not rewritten, and the screen says so). ``relationships.yaml`` comes
+    from the schema, not the model, so it has no "Regenerate". Without *llm*
+    (or on a dry run) the choice is not offered at all.
+
+    Args:
+        args: Parsed command line.
+        output_dir: Directory the files are written to.
+        generated_at: Timestamp for the file headers.
+        source_url: Redacted connection string for the ``entities.yaml`` header.
+        entities_data: Step 3 entities.
+        ring_aliases: Step 3 ring aliases (the wizard does not know the rings, so
+            none; the aliases of a table are in *entities_data*).
+        rules: Step 4 business rules.
+        examples: Step 5 examples.
+        snapshot: The schema snapshot.
+        log: The setup log, updated in place.
+        llm: The wizard LLM used to regenerate a file, or ``None``.
+        language: Language the examples and aliases are generated in.
+        namer: The key rule; built from *snapshot* when ``None``.
+        links: The relationships to write; collected from *snapshot* when ``None``.
+        existing: What the output directory held before this run; nothing
+            (no merge) when ``None``.
+        rename: ``{old key: new key}`` for entries of *existing* to re-key.
+        backup_stamp: When set, each existing file is copied to
+            ``<name>.bak-<stamp>`` just before it is replaced.
+        backups: Receives the backup files made.
+        source_order: The configured data sources in order; the ``datasource:``
+            of a merged entity lists the earlier and the new sources in it.
+        synonyms: The ``aliases.yaml`` ``synonyms`` of this run. Empty by default:
+            no synonym is built from a value read from a row unless the
+            operator asked for it (``--value-synonyms``, ``_collect_value_synonyms``).
+        collapsed: ``{file: [(dropped key, kept key)]}`` for earlier entries that
+            were folded into one entry before the merge (``_collapse_existing``);
+            recorded in the log and printed in the summary.
+
+    Returns:
+        None. Marks ``step6_write`` in *log* with the files written, the files
+        not written, the merge counts per file and the backups made.
+
+    Raises:
+        Nothing for an LLM failure while regenerating; it is reported and the
+        current version is kept.
+    """
+    console.rule("[bold blue]Step 6: Review & Write[/bold blue]" if _RICH else "Step 6: Review")
+
+    namer = namer or _table_namer(snapshot)
+    if links is None:
+        links, _ = _collect_links(snapshot, namer)
+    existing = existing or _ExistingDraft()
+    rename = dict(rename or {})
+    dropped_values: dict[str, int] = {}
+    if not getattr(args, "keep_existing_synonyms", False):
+        kept_synonyms, dropped_values = _without_value_synonyms(existing.synonyms)
+        existing = replace(existing, synonyms=kept_synonyms)
+    # An earlier run wrote one `ring_aliases` entry per table; a key there is the value of a ring.
+    cleanup = drop_table_rings(
+        existing.ring_aliases, existing.entities, _known_tables(snapshot, namer, existing, output_dir),
+    )
+    existing = replace(existing, ring_aliases=cleanup.ring_aliases, entities=cleanup.entities)
+    stats: dict[str, MergeStats] = {}
+    made: list[Path] = backups if backups is not None else []
+
+    synonyms = {key: list(tokens) for key, tokens in (synonyms or {}).items()}
+
+    # The generated data, which a regeneration replaces.
+    state: dict[str, Any] = {
+        "entities_data": entities_data,
+        "ring_aliases": ring_aliases,
+        "rules": rules,
+        "examples": examples,
+    }
+    written: list[str] = []
+
+    def render(filename: str) -> str:
+        """The file as it would be written: this run merged into the earlier files."""
+        if filename == "entities.yaml":
+            # A label is curated by hand; the replacement keeps it.
+            old_labels = {
+                rename.get(k, k).casefold(): v.get("label") for k, v in existing.entities.items()
+            }
+            fresh = {
+                k: ({**v, "label": old_labels[k.casefold()]}
+                    if old_labels.get(k.casefold()) and not v.get("label") else dict(v))
+                for k, v in state["entities_data"].items()
+            }
+            # A table already known keeps the data sources of the earlier run and gains this run's.
+            earlier = {k: dict(v) for k, v in existing.entities.items()}
+            earlier_key = {rename.get(k, k).casefold(): k for k in earlier}
+            for key, entry in fresh.items():
+                old = earlier.get(earlier_key.get(key.casefold(), ""))
+                if old is None or _identity(old.get("schema"), old["table"]) != _identity(
+                    entry.get("schema"), entry["table"],
+                ):
+                    continue
+                names = _union_sources(old.get("datasource") or [], entry.get("datasource") or [], source_order)
+                if names:
+                    entry["datasource"] = old["datasource"] = names
+            # No aliases from the model for a table that has some: keep what is there.
+            fresh, held = hold_back_empty(
+                earlier, fresh, lambda entry: not entry.get("aliases"), rename,
+            )
+            merged, merge_stats = merge_mapping(earlier, fresh, rename)
+            stats[filename] = replace(merge_stats, held=held)
+            return _entities_yaml(merged, source_url, generated_at)
+        if filename == "aliases.yaml":
+            ring, ring_stats = merge_mapping(existing.ring_aliases, state["ring_aliases"], rename)
+            merged_synonyms, synonym_stats = merge_synonyms(existing.synonyms, synonyms)
+            stats[filename] = ring_stats + synonym_stats
+            return _aliases_yaml(ring, merged_synonyms, generated_at)
+        if filename == "business_rules.yaml":
+            # The placeholder written when the model gave no rule never replaces a rule.
+            fresh_rules, held = hold_back_empty(
+                existing.rules, state["rules"],
+                lambda text: not text or text.startswith(_FALLBACK_RULE_PREFIX), rename,
+            )
+            merged, merge_stats = merge_mapping(existing.rules, fresh_rules, rename)
+            stats[filename] = replace(merge_stats, held=held)
+            return _business_rules_yaml(merged, generated_at)
+        if filename == "examples.yaml":
+            merged_examples, stats[filename] = merge_examples(existing.examples, state["examples"])
+            return _examples_yaml(merged_examples, generated_at)
+        merged_links, stats[filename] = merge_relationships(
+            existing.relationships, [link.as_entry() for link in links], rename,
+        )
+        return _relationships_yaml(merged_links, generated_at)
+
+    def regenerate(filename: str) -> str:
+        quiet = _quiet(args)
+        if filename in ("entities.yaml", "aliases.yaml"):
+            result = step3_aliases(quiet, snapshot, llm, log, language, namer)
+            state["entities_data"], state["ring_aliases"] = result["entities"], result["ring_aliases"]
+            other = "aliases.yaml" if filename == "entities.yaml" else "entities.yaml"
+            if other in written:
+                console.print(
+                    f"  Note: {other} was written earlier in this run from the previous aliases "
+                    "and is not rewritten; review it again or run the wizard again.",
+                    markup=False,
+                )
+        elif filename == "business_rules.yaml":
+            state["rules"] = step4_business_rules(quiet, snapshot, llm, log, namer, links)
+        else:
+            state["examples"] = step5_examples(quiet, snapshot, llm, log, language)
+        return render(filename)
+
+    can_regenerate = llm is not None and not args.dry_run
+    regenerable = ("entities.yaml", "aliases.yaml", "business_rules.yaml", "examples.yaml")
+
+    not_written: list[str] = []
+    for filename in _WIZARD_OUTPUT_FILES:
+        target = output_dir / filename
+
+        # Resume: skip a file that already stands (an examples file with no example does not)
+        if args.resume and _file_stands(target):
+            console.print(f"  [yellow]Skipped (exists): {filename}[/yellow]" if _RICH else f"  Skipped: {filename}")
+            continue
+
+        fn = (lambda name=filename: regenerate(name)) if can_regenerate and filename in regenerable else None
+        accepted = _review_file(
+            filename=filename,
+            content=render(filename),
+            non_interactive=args.non_interactive,
+            dry_run=args.dry_run,
+            output_dir=output_dir,
+            llm_regenerate_fn=fn,
+        )
+
+        if accepted is not None and not args.dry_run:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if backup_stamp:
+                for copy in back_up([target], backup_stamp):
+                    made.append(copy)
+                    console.print(f"  Backed up: {target} -> {copy.name}", markup=False)
+            target.write_text(accepted, encoding="utf-8")
+            console.print(f"  [green]Written:[/green] {target}" if _RICH else f"  Written: {target}")
+            written.append(filename)
+        elif not args.dry_run:
+            not_written.append(filename)
+
+    _mark_done(log, "step6_write", {
+        "files_written": written,
+        "files_not_written": not_written,
+        "merge": {
+            name: {"kept": st.kept, "added": st.added, "replaced": st.replaced, "held": len(st.held)}
+            for name, st in stats.items()
+        },
+        "rekeyed": {name: [list(pair) for pair in st.rekeyed] for name, st in stats.items() if st.rekeyed},
+        "held": {name: list(st.held) for name, st in stats.items() if st.held},
+        "merged_duplicates": {name: [list(pair) for pair in pairs] for name, pairs in (collapsed or {}).items() if pairs},
+        "dropped_value_synonyms": dropped_values,
+        "dropped_table_rings": {
+            "count": len(cleanup.dropped),
+            "keys": list(cleanup.dropped),
+            "aliases_added_to_entities": cleanup.carried,
+            "entities_created": cleanup.created,
+            "unplaced": list(cleanup.unplaced),
+        },
+        "earlier_value_synonyms": _data_shaped_count(existing.synonyms),
+        "backups": [str(b) for b in made],
+        "inferred_relationships": sum(1 for link in links if link.inferred),
+    })
+
+
+def _copy_hints(missing: list[str], output_dir: Path) -> list[str]:
+    """Return one shell command per missing file that copies its template.
+
+    Args:
+        missing: Names from ``core.project_config_files.REQUIRED_PROJECT_CONFIG_FILES``.
+        output_dir: Directory the files belong in.
+
+    Returns:
+        Commands in the syntax of the current platform (``cp`` or ``copy``).
+
+    Raises:
+        Nothing. This function never raises.
+
+    Examples:
+        >>> hints = _copy_hints(["metrics.yaml"], Path("project_config"))
+        >>> len(hints), "metrics.yaml" in hints[0]
+        (1, True)
+    """
+    verb = "copy" if os.name == "nt" else "cp"
+    return [
+        f'{verb} "{Path("project_config.example") / name}" "{output_dir / name}"'
+        for name in missing
+    ]
+
+
+def step7_validate(output_dir: Path, log: dict) -> list[str]:
+    """Check the files the wizard wrote, and name the required ones still missing.
+
+    The wizard writes five files. A working ``project_config/`` needs ten
+    (``core.project_config_files.REQUIRED_PROJECT_CONFIG_FILES``); the rest
+    come from ``project_config.example/``. They are never copied in
+    automatically: running the application on sample aliases and business
+    rules against a real warehouse would give confidently wrong SQL, which is
+    why the application has no such fall-back either (see
+    ``config.Settings.project_config_dir``). Instead this step lists what is
+    missing, with the command that copies each template, and does not claim
+    that setup is complete. It never raises for a missing file.
+
+    Args:
+        output_dir: The directory the wizard wrote to.
+        log: The setup log, updated in place.
+
+    Returns:
+        The names of required files that are still missing (empty when the
+        directory is complete).
+
+    Raises:
+        Nothing for missing or invalid configuration files; each is reported.
+    """
+    from core.project_config_files import (
+        REQUIRED_PROJECT_CONFIG_FILES,
+        missing_project_config_files,
+    )
+
+    console.rule("[bold blue]Step 7: Validation[/bold blue]" if _RICH else "Step 7: Validation")
+
+    results: dict[str, str] = {}
+    entity_count = rule_count = example_count = 0
+
+    try:
+        cl = _config_loader()
+    except ImportError as exc:
+        cl = None
+        results["(config loader)"] = f"FAILED: {exc}"
+
+    if cl is not None:
+        from config import override_settings
+
+        loaders = [
+            ("entities.yaml",       cl.load_entities),
+            ("aliases.yaml",        cl.load_aliases),
+            ("business_rules.yaml", cl.load_business_rules),
+            ("examples.yaml",       cl.load_examples),
+        ]
+        loaded: dict[str, Any] = {}
+        # Point the knowledge layer at our output dir for the duration of this
+        # step, via the same Settings.project_config_dir seam every other
+        # consumer reads through (config.override_settings). Absolute, because
+        # the loaders resolve a relative path against the repository root,
+        # not against the directory the wizard was started from.
+        with override_settings(project_config_dir=str(output_dir.resolve())):
+            for fname, loader_fn in loaders:
+                if not (output_dir / fname).exists():
+                    results[fname] = "skipped (file not written)"
+                    continue
+                try:
+                    loaded[fname] = loader_fn()
+                    results[fname] = "OK"
+                except Exception as exc:  # noqa: BLE001
+                    results[fname] = f"FAILED: {exc}"
+        if "entities.yaml" in loaded:
+            entity_count = len(loaded["entities.yaml"].entities)
+        if "business_rules.yaml" in loaded:
+            rule_count = len(loaded["business_rules.yaml"].rules)
+        if "examples.yaml" in loaded:
+            example_count = len(loaded["examples.yaml"].examples)
+
+    for fname, status in results.items():
+        colour = "green" if status == "OK" else "yellow" if "skipped" in status else "red"
+        if _RICH:
+            console.print(f"  {fname}: {status}", style=colour, markup=False)
+        else:
+            print(f"  {fname}: {status}")
+
+    missing = missing_project_config_files(output_dir)
+    failed = [f for f, status in results.items() if status.startswith("FAILED")]
+    if missing:
+        console.print(
+            f"\n  The wizard wrote the files above, but {len(missing)} of the "
+            f"{len(REQUIRED_PROJECT_CONFIG_FILES)} files a deployment needs are still "
+            f"missing from {output_dir}:"
+        )
+        for name in missing:
+            console.print(f"    - {name}")
+        console.print(
+            "  They are not generated: copy each template from project_config.example/ "
+            "and edit it for your data, e.g.:"
+        )
+        for hint in _copy_hints(missing, output_dir):
+            console.print(f"    {hint}")
+        console.print(
+            "  Then run python scripts/verify_deployment.py. Setup is NOT complete until "
+            "those files exist."
+        )
+    elif failed:
+        console.print("\n  Setup is NOT complete: fix the files reported FAILED above.")
+    else:
+        console.print(
+            f"\n  Setup complete. Registry: {entity_count} entities, "
+            f"{rule_count} rules, {example_count} examples."
+        )
+
+    _mark_done(log, "step7_validate", {
+        "entity_count": entity_count,
+        "rule_count": rule_count,
+        "example_count": example_count,
+        "missing_files": missing,
+    })
+    return missing
+
+
+def _print_summary(log: dict, output_dir: Path, protected: str | None, args) -> None:
+    """Print what the run did: skipped tables, merge counts, backups, where to go next.
+
+    Args:
+        log: The setup log of this run.
+        output_dir: The directory written to.
+        protected: What ``protected_directory`` said about it (``None`` for a draft directory).
+        args: Parsed command line.
+
+    Returns:
+        None.
+
+    Raises:
+        Nothing. Missing log entries are left out.
+    """
+    console.rule("[bold blue]Summary[/bold blue]" if _RICH else "Summary")
+    read = log.get("step2_schema", {}).get("sources")
+    if isinstance(read, list) and log.get("step1_connection", {}).get("datasources"):
+        console.print(f"  Data sources read: {', '.join(read)}.", markup=False)
+    skipped = log.get("step2_schema", {}).get("skipped")
+    if isinstance(skipped, dict):
+        report = SkipReport.from_log(skipped)
+        console.print(f"  {report.describe()}", markup=False)
+        detail = report.detail_lines()
+        if detail:
+            console.print("  Skipped, by rule:", markup=False)
+            for line in detail:
+                console.print(line, markup=False)
+    rules_done = log.get("step4_rules", {})
+    no_measure = rules_done.get("skipped_no_measure") or []
+    dimension_like = rules_done.get("skipped_dimension") or []
+    if dimension_like:
+        console.print(
+            f"  Business rules: {len(dimension_like)} table(s) classed as fact by name were left out because they "
+            f"look like dimensions: {', '.join(dimension_like[:10])}{' ...' if len(dimension_like) > 10 else ''}.",
+            markup=False,
+        )
+    if no_measure:
+        console.print(
+            f"  Business rules: {len(no_measure)} fact table(s) got no rule because they have no numeric column "
+            f"that is not a key: {', '.join(no_measure[:10])}{' ...' if len(no_measure) > 10 else ''}.",
+            markup=False,
+        )
+    aliases_done = log.get("step3_aliases", {})
+    salvaged = aliases_done.get("aliases_salvaged") or []
+    if salvaged:
+        console.print(
+            f"  Aliases: {len(salvaged)} table(s) got a list salvaged from a truncated answer "
+            f"({', '.join(salvaged[:10])}{' ...' if len(salvaged) > 10 else ''}); read it before you use it.",
+            markup=False,
+        )
+    failed = aliases_done.get("aliases_failed") or []
+    if failed:
+        console.print(
+            f"  Aliases: {len(failed)} table(s) got none because the model call failed or its answer was unusable "
+            f"({', '.join(failed[:10])}{' ...' if len(failed) > 10 else ''}).",
+            markup=False,
+        )
+    cleaned = aliases_done.get("aliases_cleaned")
+    if cleaned:
+        console.print(
+            f"  Aliases: {cleaned} table(s) had repeated or too many aliases; at most {ALIAS_LIMIT} are kept.",
+            markup=False,
+        )
+    asked = log.get("step5_examples", {})
+    if asked and not asked.get("example_count"):
+        console.print(
+            "  WARNING: examples.yaml has no example from this run"
+            + (": the mock provider generates none." if asked.get("provider") == "mock"
+               else ": the model gave nothing usable"
+               + (f" ({'; '.join(asked['problems'][:3])})" if asked.get("problems") else "")
+               + ". Run the wizard again (--resume repeats only this step) or write a few pairs by hand."),
+            markup=False,
+        )
+    values = log.get("value_synonyms")
+    if isinstance(values, dict) and values.get("enabled"):
+        console.print(
+            f"  Synonyms: {values.get('synonyms', 0)} key(s) taken from the values of {values.get('tables', 0)} "
+            "table(s) (--value-synonyms); review them before use.",
+            markup=False,
+        )
+    else:
+        console.print("  Synonyms: none built from row values (the default; see --value-synonyms).", markup=False)
+    done = log.get("step6_write", {})
+    for name, pairs in done.get("merged_duplicates", {}).items():
+        shown = ", ".join(f"{dropped} -> {kept}" for dropped, kept in pairs[:10])
+        console.print(
+            f"  Merged {len(pairs)} duplicate entr{'y' if len(pairs) == 1 else 'ies'} of one table in {name}: "
+            f"{shown}{' ...' if len(pairs) > 10 else ''}",
+            markup=False,
+        )
+    dropped = done.get("dropped_value_synonyms") or {}
+    if dropped:
+        kinds = ", ".join(f"<{shape}>: {n}" for shape, n in sorted(dropped.items()))
+        console.print(
+            f"  aliases.yaml: {sum(dropped.values())} synonym key(s) from an earlier run were values read "
+            f"from rows ({kinds}) and were dropped; --keep-existing-synonyms keeps them.",
+            markup=False,
+        )
+    table_rings = done.get("dropped_table_rings") or {}
+    if table_rings.get("count"):
+        keys = table_rings.get("keys") or []
+        many = table_rings["count"] != 1
+        console.print(
+            f"  aliases.yaml: {table_rings['count']} ring_aliases entr{'ies' if many else 'y'} from an earlier run "
+            f"{'were' if many else 'was'} keyed by a table, not by the value of a ring, and {'were' if many else 'was'} "
+            f"dropped: {', '.join(keys[:10])}{' ...' if len(keys) > 10 else ''}. The aliases of a table belong in "
+            f"entities.yaml: {table_rings.get('aliases_added_to_entities', 0)} entities gained aliases from them and "
+            f"{table_rings.get('entities_created', 0)} had to be made. Entries that are ring names were not touched.",
+            markup=False,
+        )
+        if table_rings.get("unplaced"):
+            console.print(
+                f"  aliases.yaml: the aliases of {len(table_rings['unplaced'])} of them named no single table and "
+                f"went nowhere: {', '.join(table_rings['unplaced'][:10])}. Check .setup_log.json and entities.yaml.",
+                markup=False,
+            )
+    earlier = done.get("earlier_value_synonyms") or {}
+    if earlier:
+        kinds = ", ".join(f"<{shape}>: {n}" for shape, n in sorted(earlier.items()))
+        console.print(
+            f"  aliases.yaml: {sum(earlier.values())} synonym key(s) from an earlier run look like raw data "
+            f"values ({kinds}) and were kept (--keep-existing-synonyms). Remove them (the preflight check "
+            "`Aliases hold no raw data values` counts them).",
+            markup=False,
+        )
+    verb = "would be" if args.dry_run else "are"
+    merge = done.get("merge", {})
+    if merge:
+        what = "no merge (--fresh)" if args.fresh else "merged into the files already there"
+        console.print(f"  Entries ({what}; counts {verb} per file):", markup=False)
+        for name, counts in merge.items():
+            held = counts.get("held", 0)
+            console.print(
+                f"    {name}: kept {counts['kept']}, added {counts['added']}, "
+                f"replaced {counts['replaced']}"
+                + (f" ({held} of the kept have no new answer from the model)" if held else ""),
+                markup=False,
+            )
+    for name, keys in done.get("held", {}).items():
+        shown = ", ".join(keys[:10])
+        console.print(
+            f"  {name}: {len(keys)} earlier entr{'y' if len(keys) == 1 else 'ies'} kept because this run "
+            f"gave no answer for {'it' if len(keys) == 1 else 'them'}: {shown}{' ...' if len(keys) > 10 else ''}",
+            markup=False,
+        )
+    for name, pairs in done.get("rekeyed", {}).items():
+        shown = ", ".join(f"{old} -> {new}" for old, new in pairs[:10])
+        console.print(
+            f"  Re-keyed in {name} ({len(pairs)}): a bare name is now shared by several "
+            f"schemas: {shown}{' ...' if len(pairs) > 10 else ''}",
+            markup=False,
+        )
+    inferred = done.get("inferred_relationships", 0)
+    if inferred:
+        console.print(
+            f"  {inferred} relationship(s) in relationships.yaml are inferred from column "
+            "names and marked REVIEW.",
+            markup=False,
+        )
+    if done.get("backups"):
+        console.print("  Backups made:", markup=False)
+        for name in done["backups"]:
+            console.print(f"    {name}", markup=False)
+    if args.dry_run:
+        console.print("  Dry run: nothing was written.", markup=False)
+    elif protected:
+        console.print(
+            f"  Written into {output_dir}, a protected directory (--overwrite-live); "
+            "the previous files are in the .bak-* copies.",
+            markup=False,
+        )
+    else:
+        console.print(
+            f"  These are DRAFTS in {output_dir}. Review them, then copy the files you accept "
+            f"into {_live_config_dir().name}/ yourself; nothing there was changed.",
+            markup=False,
+        )
+
+
+# ===========================================================================
+# CLI
+# ===========================================================================
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="python setup_project.py",
+        description="One-time project setup wizard for local-sql-agent.",
+    )
+    p.add_argument("--db-url",       metavar="URL",  default=None,
+                   help="Connection string of one database, for a first install. Without it "
+                        "the wizard reads every data source of datasources.yaml through the "
+                        "application's own login; with no datasources.yaml, DB_CONNECTION_URL, "
+                        "then DATABASE_URL, else it asks.")
+    p.add_argument("--datasource",   metavar="NAME", action="append", default=None,
+                   help="Read only this data source of datasources.yaml (repeatable; default: "
+                        "all). Cannot be combined with --db-url.")
+    p.add_argument("--llm-provider", metavar="NAME", default=None,
+                   choices=["openai", "mock"],
+                   help="openai (any OpenAI-compatible endpoint) or mock. "
+                        "Default: WIZARD_LLM_PROVIDER, else openai.")
+    p.add_argument("--llm-model",    metavar="NAME", default=None,
+                   help="Model tag. Default: WIZARD_LLM_MODEL, else OPENAI_MODEL.")
+    p.add_argument("--llm-base-url", metavar="URL",  default=None,
+                   help="Endpoint base URL. Default: WIZARD_LLM_BASE_URL, else "
+                        "OPENAI_BASE_URL. A remote endpoint is refused unless "
+                        "LLM_ALLOW_REMOTE=true, as in the application itself.")
+    p.add_argument("--language",     metavar="LANG", default=None,
+                   choices=["fa", "en", "both"])
+    p.add_argument("--output",       metavar="DIR",  default=str(_DEFAULT_OUTPUT),
+                   help="Directory the draft files are written to. Default: "
+                        f"{DEFAULT_DRAFT_DIR}/. The live configuration directory and "
+                        "project_config.example/ are refused unless --overwrite-live is given.")
+    p.add_argument("--overwrite-live", action="store_true", default=False,
+                   help="Allow --output to be the live configuration directory or "
+                        "project_config.example/. Each file the wizard replaces is first "
+                        "copied to <name>.bak-<YYYYmmdd-HHMMSS> next to it.")
+    p.add_argument("--fresh", action="store_true", default=False,
+                   help="Start from scratch: do not merge into the files already in the "
+                        "output directory.")
+    p.add_argument("--review",       metavar="MODE", default="interactive",
+                   choices=["interactive", "auto"])
+    p.add_argument("--include-schemas", metavar="SCHEMAS", default=None,
+                   help="Comma-separated schemas to read (default: all).")
+    p.add_argument("--exclude-schemas", metavar="PATTERNS", default=None,
+                   help="Comma-separated fnmatch patterns of schemas to leave out, "
+                        "case-insensitive (for example '*_Stg,Replay'). Wins over "
+                        "--include-schemas.")
+    p.add_argument("--include-staging", action="store_true", default=False,
+                   help="Keep the staging and change-capture tables STAGING_PATTERNS "
+                        "names; by default they are skipped and never reach the model.")
+    p.add_argument("--value-synonyms", action="store_true", default=False,
+                   help="Also write aliases.yaml synonyms taken from the values of label columns "
+                        "(name, title, kind, status, type) that have at most 50 distinct values. "
+                        "Off by default: values read from rows (dates, phone numbers, names, "
+                        "addresses) do not belong in a prompt or a versioned file. Even with it, "
+                        "dates, numbers and codes, phones, e-mail and IP addresses, URLs, addresses, "
+                        "masked values, error text, values over 40 characters and any column named "
+                        "like personal or contact data are never taken; at most 20 per table. Reads "
+                        "up to 51 distinct values of each such column from the database.")
+    p.add_argument("--keep-existing-synonyms", action="store_true", default=False,
+                   help="When merging into an aliases.yaml that already holds synonyms, keep the keys "
+                        "that are values read from rows (dates, phone numbers, IP addresses, masked "
+                        "values, long digit strings, addresses, hashes, error messages). By default "
+                        "they are dropped and counted per shape in the summary and the setup log.")
+    p.add_argument("--non-interactive", action="store_true", default=False)
+    p.add_argument("--allow-repeated-answers", action="store_true", default=False,
+                   help="Do not stop step 3 or 4 when 3 tables in a row get the identical "
+                        "answer from the model (a sign that a response cache in front of the "
+                        "model is answering for it). For a genuinely tiny schema.")
+    p.add_argument("--dry-run",         action="store_true", default=False,
+                   help="Print the generated files; write nothing, the setup log included.")
+    p.add_argument("--resume",          action="store_true", default=False,
+                   help="Continue an interrupted run from the first step "
+                        ".setup_log.json does not record as completed. The "
+                        "connection and schema steps run again (the connection "
+                        "string is not stored); aliases, rules and examples of "
+                        "completed steps are reused if the schema and language "
+                        "are unchanged; existing files are not rewritten; when "
+                        "steps 1-6 are all done only the validation runs.")
+    return p
+
+
+def _file_stands(path: Path) -> bool:
+    """Whether a file of an earlier run is final: it exists and, for the examples, holds some.
+
+    ``--resume`` leaves a wizard file alone. An ``examples.yaml`` with no
+    examples is not a result to keep: it is the file written when the model
+    gave nothing, and the run that wrote it is what ``--resume`` is for.
+
+    Args:
+        path: A file of the output directory.
+
+    Returns:
+        False for a missing file and for an examples file with no example.
+
+    Raises:
+        Nothing. A file that cannot be read stands (it is left for the merge to report).
+
+    Examples:
+        >>> import tempfile
+        >>> with tempfile.TemporaryDirectory() as tmp:
+        ...     _ = Path(tmp, "examples.yaml").write_text("examples: []\\n")
+        ...     _ = Path(tmp, "entities.yaml").write_text("entities: {}\\n")
+        ...     [_file_stands(Path(tmp, n)) for n in ("examples.yaml", "entities.yaml", "rules.yaml")]
+        [False, True, False]
+    """
+    if not path.is_file():
+        return False
+    if path.name != "examples.yaml":
+        return True
+    try:
+        document = safe_load_strict(path.read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001 - unreadable: not ours to judge here
+        return True
+    return bool(isinstance(document, dict) and document.get("examples"))
+
+
+def _restorable_results(
+    log: dict,
+    language: str,
+) -> tuple[dict | None, dict | None, list | None]:
+    """Return the step 3, 4 and 5 results a previous run stored, as far as usable.
+
+    Args:
+        log: The parsed ``.setup_log.json`` of the previous run.
+        language: The language of this run; results generated for another
+            language are not reused.
+
+    Returns:
+        ``(aliases, rules, examples)``. Each is ``None`` when it was not
+        stored, has the wrong shape, or was generated for another language.
+        *aliases* is ``{"entities": ..., "ring_aliases": {}}``; the stored
+        ``ring_aliases`` (a table-keyed copy of the entities' aliases in a log
+        of 6.13 to 6.16.2) is not reused.
+
+    Raises:
+        Nothing. This function never raises.
+
+    Examples:
+        >>> _restorable_results({}, "en")
+        (None, None, None)
+        >>> empty = {"step5_examples": {"completed_at": "t", "language": "en", "provider": "x", "result": []}}
+        >>> _restorable_results(empty, "en")[2] is None
+        True
+    """
+    aliases = _stored_result(log, "step3_aliases", language=language)
+    if not (isinstance(aliases, dict) and isinstance(aliases.get("entities"), dict)
+            and isinstance(aliases.get("ring_aliases"), dict)):
+        aliases = None
+    else:
+        # A log of 6.13 to 6.16.2 holds one `ring_aliases` entry per table, the aliases the
+        # entities already have; a key there is the value of a ring, so none is reused.
+        aliases = {**aliases, "ring_aliases": {}}
+    rules = _stored_result(log, "step4_rules")
+    if not isinstance(rules, dict):
+        rules = None
+    examples = _stored_result(log, "step5_examples", language=language)
+    if not isinstance(examples, list) or not examples:
+        # An empty result is a model that gave nothing, not an answer to reuse.
+        examples = None
+    return aliases, rules, examples
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the wizard.
+
+    With ``--resume`` the run continues from the first step that
+    ``.setup_log.json`` does not record as completed: when steps 1 to 6 are
+    all recorded and every file exists it goes straight to validation, without
+    touching the database or the LLM; otherwise it reconnects and re-reads the
+    schema (the connection string is never stored), reuses the stored aliases,
+    rules and examples of every completed LLM step (so the model is not asked
+    again) as long as the schema and language are unchanged, and writes only
+    the files that do not exist yet. Without ``--resume`` a fresh log is
+    started.
+
+    Args:
+        argv: Command-line arguments; ``sys.argv[1:]`` when ``None``.
+
+    Returns:
+        0 on success, 2 when the LLM configuration is refused or invalid,
+        3 when step 3 or 4 stopped because 3 tables in a row got the identical
+        answer (nothing is written; ``--resume`` continues; see
+        ``--allow-repeated-answers``). A failed database connection exits the
+        process with status 1.
+
+    Raises:
+        SystemExit: On a bad command line or a failed database connection.
+    """
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    parser = _build_parser()
+    args   = parser.parse_args(argv)
+
+    if args.review == "auto":
+        args.non_interactive = True
+
+    output_dir = Path(args.output)
+    log_path   = output_dir / ".setup_log.json"
+    generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    # The live configuration directory and the committed template are not
+    # places for drafts: refused before anything is read or asked, unless the
+    # operator says so, and then every file replaced is copied aside first.
+    protected = protected_directory(output_dir, _live_config_dir(), _REPO_ROOT)
+    backup_stamp: str | None = None
+    if protected and not args.dry_run:
+        if not args.overwrite_live:
+            console.print(f"ERROR: {refusal_message(output_dir, protected)}", markup=False)
+            return 2
+        backup_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backups: list[Path] = []
+
+    if args.dry_run and args.resume:
+        console.print("  Note: --resume is ignored with --dry-run (nothing is written).", markup=False)
+        args.resume = False
+    # A fresh run starts a fresh log: leftover entries of an earlier run would
+    # otherwise look like completed steps to a later --resume.
+    log: dict = _load_log(log_path) if args.resume else {}
+    if backup_stamp:
+        # The setup log is replaced too.
+        for copy in back_up([log_path], backup_stamp):
+            backups.append(copy)
+            console.print(f"  Backed up: {log_path} -> {copy.name}", markup=False)
+
+    def save() -> None:
+        # A dry run writes no files, the log included.
+        if not args.dry_run:
+            _save_log(log_path, log)
+
+    if _RICH:
+        console.print(Panel(
+            "[bold]local-sql-agent[/bold] — Project Setup Wizard",
+            subtitle=f"output: {output_dir}",
+            border_style="bold blue",
+        ))
+    else:
+        print("=" * 60)
+        print("local-sql-agent — Project Setup Wizard")
+        print(f"Output: {output_dir}")
+        print("=" * 60)
+
+    # ---- Resume: everything through step 6 is already done ----
+    if (
+        args.resume
+        and all(_step_done(log, step) for step in _STEP_KEYS[:6])
+        and not [n for n in _WIZARD_OUTPUT_FILES if not _file_stands(output_dir / n)]
+    ):
+        console.print(
+            "  Resuming: steps 1-6 are recorded as completed in "
+            f"{log_path.name} and every file exists. Running validation only.",
+            markup=False,
+        )
+        step7_validate(output_dir, log)
+        save()
+        return 0
+    if args.resume and log:
+        done = [step for step in _STEP_KEYS if _step_done(log, step)]
+        console.print(f"  Resuming: recorded as completed: {', '.join(done) or 'nothing'}.", markup=False)
+
+    # ---- What the output directory already holds, to merge into ----
+    existing = _ExistingDraft()
+    if not args.fresh:
+        # With --resume a file that exists is not rewritten, so it is not read.
+        to_read = tuple(
+            n for n in _WIZARD_OUTPUT_FILES if not (args.resume and _file_stands(output_dir / n))
+        )
+        existing, problems = _read_existing(output_dir, to_read)
+        if problems:
+            for name, why in problems.items():
+                console.print(f"ERROR: {output_dir / name} cannot be merged into: {why}", markup=False)
+            console.print(
+                "  Fix or move the file, or run with --fresh to start from scratch.", markup=False,
+            )
+            return 2
+
+    # ---- Determine language ----
+    language = (
+        args.language
+        or os.getenv("WIZARD_LANGUAGE", "")
+        or _choose(
+            "Primary language for user questions?",
+            choices=["en", "fa", "both"],
+            default="en",
+            non_interactive=args.non_interactive,
+        )
+    )
+
+    # What an earlier run stored, taken before the steps below overwrite it.
+    stored_aliases, stored_rules, stored_examples = (
+        _restorable_results(log, language) if args.resume else (None, None, None)
+    )
+    stored_fingerprint = log.get("step2_schema", {}).get("schema_fingerprint") if args.resume else None
+    everything_stored = None not in (stored_aliases, stored_rules, stored_examples)
+
+    # ---- Which databases: the data sources of datasources.yaml, or one URL ----
+    configured = None
+    if args.db_url and args.datasource:
+        parser.error("--datasource cannot be combined with --db-url")
+    if not args.db_url:
+        from database.setup_sources import SourceSelectionError, configured_sources, datasources_file_in_use
+
+        try:
+            if datasources_file_in_use():
+                configured = configured_sources(args.datasource)
+            elif args.datasource:
+                raise SourceSelectionError(
+                    "--datasource names a data source of datasources.yaml, and there is none in "
+                    f"{_live_config_dir()}"
+                )
+        except SourceSelectionError as exc:
+            console.print(f"ERROR: {exc}", markup=False)
+            return 2
+
+    # ---- LLM: resolved and vetted before any step touches the database ----
+    llm = None
+    if not everything_stored:
+        try:
+            llm = setup_wizard_llm(args)
+        except (ValueError, RemoteLLMNotAllowedError) as exc:
+            console.print(f"ERROR: {exc}", markup=False)
+            return 2
+
+    # ---- Step 1: Connection ----
+    if configured is not None:
+        sources = step1_sources(args, log, configured)
+        read_from: Any = sources
+        source_url = sources.label
+        selected = sources.selected
+        source_order = sources.names
+    else:
+        db_url = step1_connection(args, log)
+        read_from = db_url
+        source_url = _redact_db_url(db_url)
+        selected = ()
+        source_order = ()
+    save()
+
+    # ---- Step 2: Schema ----
+    snapshot = step2_schema(args, read_from, log)
+    save()
+
+    # Keys: the inspector's rule, over this run's tables and those of the
+    # earlier run, so a bare name that is now shared is qualified for both.
+    existing.entities = _resolve_entity_schemas(snapshot, existing.entities)
+    namer = _table_namer(snapshot, existing.entities)
+    rename = _rekey_map(namer, existing.entities, existing.rules)
+    collapsed = _collapse_existing(existing, rename)
+    links, links_problem = _collect_links(snapshot, namer)
+    if links_problem:
+        console.print(f"  {links_problem}", markup=False)
+    fingerprint = _schema_fingerprint(snapshot, namer, selected)
+    log.setdefault("step2_schema", {})["schema_fingerprint"] = fingerprint
+    save()
+
+    reuse = args.resume and stored_fingerprint == fingerprint
+    if args.resume and not reuse and any(x is not None for x in (stored_aliases, stored_rules, stored_examples)):
+        console.print(
+            "  The schema differs from the one the earlier run generated for: "
+            "aliases, rules and examples are generated again.",
+            markup=False,
+        )
+    if not reuse:
+        stored_aliases = stored_rules = stored_examples = None
+
+    def need_llm():
+        """The LLM, set up on first use when the early check was skipped."""
+        nonlocal llm
+        if llm is None:
+            llm = setup_wizard_llm(args)
+        return llm
+
+    try:
+        # ---- Step 3: Aliases ----
+        if stored_aliases is not None:
+            console.print("  Step 3: reusing the aliases generated by the earlier run.", markup=False)
+            alias_result = stored_aliases
+        else:
+            alias_result = step3_aliases(args, snapshot, need_llm(), log, language, namer)
+        entities_data = alias_result["entities"]
+        ring_aliases  = alias_result["ring_aliases"]
+        save()
+
+        # ---- Step 4: Business rules ----
+        if stored_rules is not None:
+            console.print("  Step 4: reusing the business rules generated by the earlier run.", markup=False)
+            rules = stored_rules
+        else:
+            rules = step4_business_rules(args, snapshot, need_llm(), log, namer, links)
+        save()
+
+        # ---- Step 5: Examples ----
+        if stored_examples is not None:
+            console.print("  Step 5: reusing the examples generated by the earlier run.", markup=False)
+            examples = stored_examples
+        else:
+            examples = step5_examples(args, snapshot, need_llm(), log, language)
+        save()
+    except CachedAnswersError as exc:
+        # Nothing is written: no project file, and the steps that finished
+        # stay recorded in the log, so --resume continues from this one.
+        save()
+        console.print(f"ERROR: {exc}", markup=False)
+        return 3
+    except (ValueError, RemoteLLMNotAllowedError) as exc:
+        console.print(f"ERROR: {exc}", markup=False)
+        return 2
+
+    # ---- Value synonyms: only when asked for ----
+    value_synonyms: dict[str, list[str]] = {}
+    if args.value_synonyms:
+        value_synonyms = _collect_value_synonyms(snapshot, read_from, log)
+        save()
+
+    # ---- Step 6: Review & write ----
+    step6_review_and_write(
+        args=args,
+        output_dir=output_dir,
+        generated_at=generated_at,
+        source_url=source_url,
+        entities_data=entities_data,
+        ring_aliases=ring_aliases,
+        rules=rules,
+        examples=examples,
+        snapshot=snapshot,
+        log=log,
+        llm=llm,
+        language=language,
+        namer=namer,
+        links=links,
+        existing=existing,
+        rename=rename,
+        backup_stamp=backup_stamp,
+        backups=backups,
+        source_order=source_order,
+        synonyms=value_synonyms,
+        collapsed=collapsed,
+    )
+    save()
+
+    # ---- Step 7: Validate ----
+    if not args.dry_run:
+        step7_validate(output_dir, log)
+        save()
+
+    _print_summary(log, output_dir, protected, args)
+    return 0
+
+
+if __name__ == "__main__":
+    use_utf8_console()
+    sys.exit(main())

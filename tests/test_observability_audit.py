@@ -1,0 +1,309 @@
+# SPDX-License-Identifier: BUSL-1.1
+# Copyright (c) 2024-2026 Ali Sadeghi Aghili
+"""Unit tests for observability/audit.py."""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from unittest.mock import patch
+
+import pytest
+
+from observability.audit import AuditRecord, save_audit_record
+
+
+def _record(**overrides) -> AuditRecord:
+    defaults = dict(
+        timestamp=datetime(2026, 8, 26, 12, 0, 0),
+        request_id="r_abc123",
+        question="چند مشتری فعال داریم؟",
+        generated_sql="SELECT COUNT(*) FROM [Dim].[Customer]",
+        guard={"verdict": "allowed", "rule": None, "injected_top": None,
+               "tables_touched": ["Customer"]},
+        row_count=1,
+        tier="T2",
+        timings={"total_ms": 100, "plan_ms": 1, "prompt_ms": 2, "llm_ms": 90,
+                  "guard_ms": 1, "execute_ms": 6, "interpret_ms": 0},
+        llm={"backend": "ollama", "model": "m", "endpoint_status": 200,
+             "attempts": 1, "finish_reason": "stop", "structured_output": False,
+             "prompt_tokens": 100, "completion_tokens": 10, "prefill_ms": 5,
+             "decode_ms": 50, "total_ms": 55, "tokens_per_second": 20.0,
+             "prefix_cache_hit": False, "temperature": 0.0, "seed": None,
+             "corrections": 0},
+        columns=["CustomerCount"],
+    )
+    defaults.update(overrides)
+    return AuditRecord(**defaults)
+
+
+class TestAuditRecordShape:
+    def test_as_dict_round_trips_core_fields(self):
+        record = _record()
+        d = record.as_dict()
+        assert d["request_id"] == "r_abc123"
+        assert d["question"] == "چند مشتری فعال داریم؟"
+        assert d["generated_sql"] == "SELECT COUNT(*) FROM [Dim].[Customer]"
+        assert d["row_count"] == 1
+        assert d["tier"] == "T2"
+        assert d["guard"]["verdict"] == "allowed"
+        assert d["columns"] == ["CustomerCount"]
+
+    def test_timestamp_serialised_as_iso_string(self):
+        d = _record().as_dict()
+        assert d["timestamp"] == "2026-08-26T12:00:00"
+
+    def test_timings_embedded_verbatim(self):
+        d = _record().as_dict()
+        assert d["timings"]["llm_ms"] == 90
+
+    def test_llm_embedded_verbatim(self):
+        d = _record().as_dict()
+        assert d["llm"]["prefix_cache_hit"] is False
+
+    def test_defaults_for_optional_fields(self):
+        record = AuditRecord(
+            timestamp=datetime(2026, 8, 26, 12, 0, 0),
+            request_id="r_1", question="q", generated_sql="SELECT 1",
+            guard={"verdict": "allowed"},
+        )
+        d = record.as_dict()
+        assert d["row_count"] == 0
+        assert d["tier"] is None
+        assert d["error_code"] is None
+        assert d["error_message"] is None
+        assert d["timings"] == {}
+        assert d["llm"] is None
+        assert d["columns"] is None
+
+    def test_error_fields_populated_on_failure(self):
+        record = _record(
+            tier=None, error_code="FORBIDDEN_SQL",
+            error_message="DELETE is not allowed", row_count=0, llm=None,
+        )
+        d = record.as_dict()
+        assert d["error_code"] == "FORBIDDEN_SQL"
+        assert d["error_message"] == "DELETE is not allowed"
+        assert d["llm"] is None
+
+    def test_is_json_serialisable(self):
+        d = _record().as_dict()
+        line = json.dumps(d, ensure_ascii=False)
+        assert json.loads(line) == d
+
+
+class TestNeverWritesRowData:
+    def test_columns_of_plain_strings_accepted(self):
+        record = _record(columns=["CustomerName", "TotalVolume"])
+        assert record.columns == ["CustomerName", "TotalVolume"]
+
+    def test_columns_none_is_fine(self):
+        record = _record(columns=None)
+        assert record.columns is None
+
+    def test_columns_containing_int_rejected(self):
+        with pytest.raises(TypeError, match="row values"):
+            _record(columns=["CustomerCount", 42])
+
+    def test_columns_containing_dict_rejected(self):
+        """A caller accidentally passing a row (e.g. {'CustomerName': 'Acme'})
+        instead of a column name must be rejected, not silently logged."""
+        with pytest.raises(TypeError, match="row values"):
+            _record(columns=[{"CustomerName": "Acme"}])
+
+    def test_columns_containing_tuple_rejected(self):
+        with pytest.raises(TypeError, match="row values"):
+            _record(columns=[("Acme", 123)])
+
+    def test_error_message_names_offending_index(self):
+        with pytest.raises(TypeError, match="index 2"):
+            _record(columns=["A", "B", 3])
+
+    def test_no_field_exists_that_could_hold_row_values(self):
+        """Structural guarantee: the dataclass has no field named anything
+        like 'rows'/'result'/'data' that could carry row payloads."""
+        field_names = set(AuditRecord.__dataclass_fields__.keys())
+        forbidden = {"rows", "row_data", "result", "results", "data"}
+        assert field_names.isdisjoint(forbidden)
+
+
+class TestSaveAuditRecord:
+    def test_creates_audit_log_file(self, tmp_path):
+        log_file = tmp_path / "audit_log.jsonl"
+        with patch("observability.audit._AUDIT_LOG_FILE", str(log_file)):
+            save_audit_record(_record())
+        assert log_file.exists()
+
+    def test_writes_valid_json_line(self, tmp_path):
+        log_file = tmp_path / "audit_log.jsonl"
+        with patch("observability.audit._AUDIT_LOG_FILE", str(log_file)):
+            save_audit_record(_record(request_id="r_42"))
+        line = log_file.read_text(encoding="utf-8").strip()
+        record = json.loads(line)
+        assert record["request_id"] == "r_42"
+
+    def test_appends_multiple_records(self, tmp_path):
+        log_file = tmp_path / "audit_log.jsonl"
+        with patch("observability.audit._AUDIT_LOG_FILE", str(log_file)):
+            save_audit_record(_record(request_id="r_1"))
+            save_audit_record(_record(request_id="r_2"))
+        lines = log_file.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 2
+        assert json.loads(lines[0])["request_id"] == "r_1"
+        assert json.loads(lines[1])["request_id"] == "r_2"
+
+    def test_unicode_preserved(self, tmp_path):
+        log_file = tmp_path / "audit_log.jsonl"
+        with patch("observability.audit._AUDIT_LOG_FILE", str(log_file)):
+            save_audit_record(_record(question="بیشترین خرید مشتریان"))
+        record = json.loads(log_file.read_text(encoding="utf-8").strip())
+        assert record["question"] == "بیشترین خرید مشتریان"
+
+    def test_uses_log_dir_setting_when_path_not_overridden(self, tmp_path):
+        from config import override_settings
+
+        with patch("observability.audit._AUDIT_LOG_FILE", ""), \
+             override_settings(log_dir=str(tmp_path)):
+            save_audit_record(_record())
+        assert (tmp_path / "audit_log.jsonl").exists()
+
+    def test_oserror_does_not_raise(self, tmp_path):
+        """The hard rule: writing an audit record must never fail the user's query."""
+        blocker = tmp_path / "blocker"
+        blocker.write_text("not a directory", encoding="utf-8")
+        bad_path = str(blocker / "nested" / "audit_log.jsonl")
+        with patch("observability.audit._AUDIT_LOG_FILE", bad_path):
+            # should not raise
+            save_audit_record(_record())
+
+    def test_oserror_is_logged(self, tmp_path, caplog):
+        import logging
+
+        blocker = tmp_path / "blocker"
+        blocker.write_text("not a directory", encoding="utf-8")
+        bad_path = str(blocker / "nested" / "audit_log.jsonl")
+        with patch("observability.audit._AUDIT_LOG_FILE", bad_path):
+            with caplog.at_level(logging.ERROR, logger="observability.audit"):
+                save_audit_record(_record())
+        assert any("audit" in rec.message.lower() for rec in caplog.records)
+
+    def test_shares_rotation_with_logs_logger(self, tmp_path):
+        """save_audit_record delegates to logs.logger.append_jsonl, so the
+        audit log rotates under the same LOG_MAX_BYTES/LOG_BACKUP_COUNT
+        knobs as the REPL's query log -- one rotation implementation, not two.
+
+        Both knobs are Settings fields (see config.py), so the live patch
+        is config.override_settings(), not monkeypatch.setenv()."""
+        from config import override_settings
+
+        log_file = tmp_path / "audit_log.jsonl"
+        line_size = len(
+            json.dumps(_record(request_id="r_1").as_dict(), ensure_ascii=False).encode("utf-8")
+        ) + 1
+        with patch("observability.audit._AUDIT_LOG_FILE", str(log_file)), \
+                override_settings(log_max_bytes=line_size, log_backup_count=2):
+            save_audit_record(_record(request_id="r_1"))
+            save_audit_record(_record(request_id="r_1"))  # same length request_id
+        assert (tmp_path / "audit_log.jsonl.1").exists()
+
+
+class TestResolvedColumnsNeverCarryRowValues:
+    """Phase 5b's hard rule: the audit trail may record that a database-
+    backed value resolution happened, and against which column, but must
+    never gain the resolved row value itself. ``resolved_columns`` follows
+    the exact "names, never values" discipline ``columns`` already
+    enforces (see the module docstring's two hard rules).
+    """
+
+    _POISON = "زهرا نادری؛ کدملی ۰۰۱۲۳۴۵۶۷۸؛ افشا نشود"
+
+    def test_resolved_columns_round_trip_as_identifiers(self):
+        record = _record(resolved_columns=["Customer.Name", "Symbol.Commodity_Symbol"])
+        d = record.as_dict()
+        assert d["resolved_columns"] == ["Customer.Name", "Symbol.Commodity_Symbol"]
+
+    def test_a_non_string_entry_is_rejected_not_silently_stored(self):
+        """Same structural guard as ``columns``: nothing on this dataclass
+        can hold row *data* (a tuple, a dict, ...) at all -- only a plain
+        identifier string is ever accepted."""
+        with pytest.raises(TypeError, match="resolved_columns"):
+            _record(resolved_columns=["Customer.Name", ("Customer", self._POISON)])
+
+    def test_poison_value_never_appears_anywhere_in_the_serialised_record(self):
+        """Construct a realistic resolved-query record the way
+        ``retrieval.value_resolver.resolve_value`` actually populates this
+        field -- question, SQL, and ``resolved_columns`` all naming only
+        tables/columns, never a resolved value -- and prove the poison
+        value, which never legitimately reaches this dataclass through any
+        real call site, does not leak into the serialised record through
+        any field either."""
+        record = _record(
+            question="مشتری فولاد مبارکه چند قرارداد دارد؟",
+            resolved_columns=["Customer.Name"],
+        )
+        serialised = json.dumps(record.as_dict(), ensure_ascii=False)
+        assert self._POISON not in serialised
+
+    def test_defaults_to_none_when_no_resolution_happened(self):
+        d = _record().as_dict()
+        assert d["resolved_columns"] is None
+
+
+_BLOCK = {
+    "checked": 2,
+    "unknown": [{"column": "Ring.Name", "value_sha256": "0123456789abcdef", "length": 10}],
+    "corrected": False,
+    "fallback": True,
+}
+
+
+class TestValueCheck:
+    """The filter value check's block: additive, and never a value."""
+
+    def test_no_key_at_all_when_unset_so_a_line_is_what_it_always_was(self):
+        assert "value_check" not in _record().as_dict()
+        assert list(_record().as_dict())[-1] == "datasource_selection"
+
+    def test_written_after_the_existing_keys_when_set(self):
+        d = _record(value_check=_BLOCK).as_dict()
+
+        assert list(d)[-1] == "value_check"
+        assert d["value_check"] == _BLOCK
+
+    def test_round_trips_through_the_file(self, tmp_path):
+        path = tmp_path / "audit_log.jsonl"
+        with patch("observability.audit._AUDIT_LOG_FILE", str(path)):
+            save_audit_record(_record(value_check=_BLOCK))
+            save_audit_record(_record(request_id="r_old"))
+
+        first, second = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        assert first["value_check"] == _BLOCK
+        assert "value_check" not in second
+
+    def test_a_line_written_before_the_field_existed_is_read_as_before(self, tmp_path):
+        from scripts.analyze_audit_log import iter_records
+
+        path = tmp_path / "audit_log.jsonl"
+        old_line = _record().as_dict()
+        path.write_text(json.dumps(old_line, ensure_ascii=False) + "\n", encoding="utf-8")
+
+        (record,) = list(iter_records([path]))
+        assert record.get("value_check") is None
+        assert record["generated_sql"] == "SELECT COUNT(*) FROM [Dim].[Customer]"
+
+    @pytest.mark.parametrize(
+        "block",
+        [
+            {**_BLOCK, "unknown": [{"column": "Ring.Name", "value_sha256": "0" * 16, "length": 3, "value": "Gamma"}]},
+            {**_BLOCK, "unknown": [{"column": "Ring.Name", "value_sha256": "0" * 16}]},
+            {**_BLOCK, "unknown": [{"column": "Ring.Name", "value_sha256": "0" * 16, "length": "Gamma"}]},
+            {**_BLOCK, "nearest": ["Alpha Hall"]},
+            {k: v for k, v in _BLOCK.items() if k != "fallback"},
+            {**_BLOCK, "checked": "2"},
+            {**_BLOCK, "unknown": ["Gamma"]},
+        ],
+        ids=["literal-key", "missing-key", "wrong-type", "extra-key", "missing-flag", "count-as-text", "bare-value"],
+    )
+    def test_a_block_that_could_hold_a_value_is_rejected_not_stored(self, block):
+        with pytest.raises(TypeError, match="value_check"):
+            _record(value_check=block)

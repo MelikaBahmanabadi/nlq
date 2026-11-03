@@ -1,0 +1,831 @@
+# SPDX-License-Identifier: BUSL-1.1
+# Copyright (c) 2024-2026 Ali Sadeghi Aghili
+"""LLM-agnostic SQL agent with self-correction.
+
+Pipeline (every attempt, first and corrections alike)
+-------------------------------------------------------
+    question
+        → ContextRetriever
+        → build_prompt_segments  (initial PromptSegments; corrections append
+                                   every prior round's correction text to
+                                   the *question* segment only — never the
+                                   static_prefix, see "Prefix invariance"
+                                   below)
+        → LLMRouter.generate_for_task(SQL_GENERATION)  ─────────────────┐
+        → clean_sql                                                     │ ValueError
+        → validate_sql                                                  │ (bad syntax,
+        → ensure_top             (injects TOP n if still absent)        │  unknown table,
+        → execute_sql  ──────────────────────────────────────┐          │  forbidden kw...)
+                                                              │ RuntimeError
+Correction loop (up to MAX_CORRECTION_ATTEMPTS rounds)        │          │
+────────────────────────────────────────────────             │          │
+    error message                                            ↓          ↓
+        → _build_correction_prompt   ←────────────────────────────────────┘
+        (loops back to LLMRouter.generate_for_task above)
+
+Both failure modes above — a guard rejecting the generated SQL
+(ValueError) and the database rejecting a syntactically-valid query at
+execution time (RuntimeError) — feed the SAME correction loop and share
+the same ``max_corrections`` budget. Previously only execution failures
+were retried; a validation failure (bad syntax, an unknown table, a
+forbidden keyword — the most common small-model mistake) aborted the run
+immediately with no correction attempt at all.
+
+Not every guard rejection is retried, though: ``security.sql_guard`` now
+raises one of two typed ``ValueError`` subclasses (see its module
+docstring). A :class:`~security.sql_guard.CorrectableRejection` (bad
+syntax, an unknown table, ...) keeps looping exactly as described above.
+A :class:`~security.sql_guard.PolicyRejection` (a forbidden statement, a
+denied column, ...) breaks out of the loop immediately instead — the
+policy that caused it is not in the prompt, so re-prompting the model
+cannot change the outcome, and doing so anyway would spend
+``max_corrections`` extra LLM round trips just to reach the exact same
+rejection a second, third, and fourth time. The raised exception and the
+returned :class:`SQLGenerationResult` (were the call to succeed on a later
+round, which it structurally cannot after this) are unaffected either way
+— a caller switching on message text, as ``api/runner.py`` does, sees no
+difference.
+
+The loop aborts as soon as execution succeeds, a ``PolicyRejection`` is
+hit, or the attempt cap is reached. On the final failed attempt (or the
+first ``PolicyRejection``, whichever comes first) the last exception
+(``ValueError`` for a validation failure, ``RuntimeError`` for an
+execution failure) is re-raised so the caller (app.py / api/runner.py)
+can log and translate it normally. ``OUT_OF_SCOPE`` is the one exception
+this loop never retries — it's a terminal signal from the model, not a
+fixable mistake.
+
+Prefix invariance (why correction text never touches ``static_prefix``)
+-------------------------------------------------------------------------
+``build_prompt_segments`` (``llm/router.py``) splits the prompt into a
+byte-identical ``static_prefix`` (schema, business rules, examples — cached
+per system-prompt version) and a small variable ``question`` suffix. Every
+correction round below rebuilds its :class:`~llm.router.PromptSegments`
+by copying ``static_prefix``/``session_context`` from the FIRST round's
+segments unchanged and appending the accumulated correction text only to
+``question``. If correction text ever leaked into ``static_prefix``
+instead, every retry would present the provider with a different prefix,
+silently defeating implicit KV-cache reuse (llama.cpp/vLLM) or automatic
+prompt caching (OpenAI's own hosted API) on the very requests that most need a fast retry — with
+no test failing and no error raised. ``tests/test_sql_agent_router.py``
+asserts this holds across correction rounds.
+
+With several data sources configured the prefix is the chosen source's
+(``build_prompt_segments(..., source=...)``), and every correction round
+keeps it. The one thing that replaces it is the ``OUT_OF_SCOPE`` retry
+below, which starts over on another source with no correction text.
+
+Choosing the data source, and the one retry
+-------------------------------------------
+With more than one data source the agent routes the question to one of
+them before building the prompt (:class:`~llm.source_routing.SourceRouting`,
+:mod:`retrieval.source_selector`): the model sees only that source's
+tables. If it answers ``OUT_OF_SCOPE`` and another candidate source exists,
+the agent retries **once** with the next candidate -- one extra generation
+call beyond the correction budget, never more, and the correction history
+(which describes the other source's tables) is dropped. A second
+``OUT_OF_SCOPE`` is raised as it always was. With one source nothing of
+this runs. The selection is returned on
+:attr:`~llm.base.SQLGenerationResult.datasource_selection`, and attached
+to a raised exception as ``datasource_selection``, for the audit record.
+
+A filter value that does not exist (opt-in, ``FILTER_VALUE_CHECK``)
+-----------------------------------------------------------------
+With :data:`config.Settings.filter_value_check` on, a statement the guard
+accepted is read once more before it runs
+(:func:`retrieval.filter_values.check_filter_values`): a string literal it
+compares to a column whose whole value set is cached and that is not in that
+set gets ONE correction message through the same prompt layout as any other
+correction (the static prefix untouched, the text appended to the question
+segment). It is the one thing that can add a model call beyond the correction
+budget: at most one per request, and only when ``max_corrections`` is not
+zero. The corrected statement runs only if it passes the guard, keeps no
+unknown literal and executes; every other outcome (the model keeps the
+value, a guard rejection, an error from the model or the database) runs the
+original statement as it would have run without the check, through the loop
+below as ever. The check never refuses a request. With the setting off none
+of this code is reached.
+
+A filter literal spelled with other letters (``FILTER_VALUE_SPELLING``)
+----------------------------------------------------------------------
+With :data:`config.Settings.filter_value_spelling` on (the default), every
+statement the guard accepted is read once before it runs
+(:func:`retrieval.filter_spelling.respell_filters`): a string literal compared
+to a column whose whole value set is cached that is not one of its values, but
+is exactly one of them up to Arabic/Persian letter forms (``ي`` for ``ی``,
+``ك`` for ``ک``), is replaced by that stored value, and a ``LIKE`` pattern gets
+the form the column stores. No model call and no database read; the guard
+checks the rewritten statement again and the original runs if it refuses it. It
+runs ahead of the filter value check, so a fixed literal is a known value and
+costs no correction round, and the executed statement
+(:attr:`~llm.base.SQLGenerationResult.sql`) is the rewritten one. With the
+setting off none of this code is reached.
+
+Design notes
+------------
+* ``SQLAgent`` depends on ``LLMBackend``/``LLMRouter`` (abstract), not on
+  any one transport specifically. Pass ``backend=`` to use one backend directly (it is
+  wrapped in a single-element :class:`~llm.router.LLMRouter` chain), or
+  ``router=`` for full task-based routing, fallback chains, and governance
+  — see :meth:`SQLAgent.__init__`.
+* ``execute_fn`` is injected so the agent can be unit-tested without a
+  real database (pass a mock / stub).
+* When *execute_fn* is **not** supplied, the agent calls
+  ``database.executor.execute_query`` through its module reference every
+  time — this ensures that ``monkeypatch.setattr(database.executor,
+  'execute_query', ...)`` in tests is visible at call time.
+* Every correction round's prompt is the initial ``question`` segment
+  followed by **every** correction prompt built so far (not just the
+  latest), so the model always has the full history of what it already
+  tried and was told was wrong — otherwise it can (and in practice does)
+  repeat the exact same mistake on the next attempt.
+* Worst-case LLM call count is unchanged by bringing validation failures
+  into this loop: it was already bounded at ``max_corrections + 1`` total
+  generation calls (by the execution-failure retry path alone);
+  validation failures now consume rounds from that same existing budget
+  instead of bypassing it via an immediate raise. A
+  :class:`~security.sql_guard.PolicyRejection` is the one case that exits
+  well below that bound — exactly one generation call, regardless of
+  ``max_corrections`` — since no later round could ever do better.
+* :meth:`run` calls :meth:`~llm.router.LLMRouter.generate_for_task`, which
+  wraps a chain-exhausted failure in one ``RuntimeError`` with the
+  original backend exception as ``__cause__`` (see ``llm/router.py``).
+  :meth:`run` unwraps that immediately (``exc.__cause__ or exc``) so
+  callers that switch on the ORIGINAL exception type — ``api/runner.py``'s
+  ``ValueError("OUT_OF_SCOPE")`` / ``requests.Timeout`` /
+  ``requests.ConnectionError`` / plain ``RuntimeError`` translation — keep
+  working unchanged whether or not a router with multiple chain entries is
+  involved. ``ValueError("OUT_OF_SCOPE")`` is the one exception the router
+  never wraps at all: it short-circuits the chain and is re-raised as-is
+  (``__cause__`` is ``None``, which ``exc.__cause__ or exc`` resolves back
+  to the exception itself), because a decline is a terminal domain
+  decision — a second backend must not get to answer a question the first
+  one correctly refused.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import logging
+from collections.abc import Callable, Iterable
+from contextlib import AbstractContextManager, nullcontext
+from typing import Any
+
+import pandas as pd
+
+import config as cfg
+from llm.base import LLMBackend, SQLGenerationResult
+from llm.correction_hints import correction_hint
+from llm.router import LLMRouter, PromptSegments, TaskType, build_prompt_segments
+from llm.source_routing import SourceRouting, generate_with_source_fallback
+from observability.timing import StageTimer
+from retrieval.context_retriever import ContextRetriever
+from retrieval.filter_spelling import respell_filters
+from retrieval.filter_values import audit_block, check_filter_values, correction_text
+from security.sql_guard import (
+    PolicyRejection,
+    clean_sql,
+    ensure_top,
+    transpile_and_revalidate,
+    validate_sql,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _stage(timer: StageTimer | None, name: str) -> AbstractContextManager[None]:
+    """Return ``timer.stage(name)``, or a no-op context manager when *timer* is ``None``.
+
+    Lets every internal step below be wrapped unconditionally, so
+    :meth:`SQLAgent.run` reads the same whether or not a caller passed a
+    timer (e.g. from a unit test that doesn't care about timings).
+    """
+    return timer.stage(name) if timer is not None else nullcontext()
+
+MAX_CORRECTION_ATTEMPTS: int = 2
+
+_CORRECTION_TEMPLATE = """
+The SQL query you generated failed to execute.
+
+--- FAILED SQL ---
+{sql}
+
+--- DATABASE ERROR ---
+{error}
+{hint}
+--- INSTRUCTIONS ---
+Fix ONLY the SQL error above. Do not change the intent of the query.
+Return only the corrected SQL statement with no explanation.
+
+SQL:
+"""
+
+
+def _default_execute(sql: str) -> pd.DataFrame:
+    """Call ``database.executor.execute_query`` via module lookup.
+
+    Looking up through the module (rather than capturing the function at
+    import time) means ``monkeypatch.setattr(database.executor,
+    'execute_query', stub)`` is always visible at call time.
+    """
+    import database.executor as _executor_mod
+    return _executor_mod.execute_query(sql)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ValueRound:
+    """What :meth:`SQLAgent._filter_value_round` found and did."""
+
+    audit: dict[str, Any] | None = None
+    prompt: str | None = None
+    executed: tuple[pd.DataFrame, str, str, dict[str, Any], int | None] | None = None
+    spelling: dict[str, Any] | None = None
+    """What the spelling fix did to the corrected statement in ``executed``."""
+
+
+class SQLAgent:
+    """Orchestrates retrieval → prompt → LLM → execute with self-correction.
+
+    Parameters
+    ----------
+    backend:
+        Any :class:`LLMBackend` implementation. Honoured for backward
+        compatibility: wrapped in a single-element
+        :class:`~llm.router.LLMRouter` chain (``LLMRouter(default_chain=[backend])``)
+        so callers that construct ``SQLAgent(backend=...)`` directly — a
+        lot of the existing test suite, and ``llm/wizard_llm.py`` —
+        keep working unchanged, just now routed through the same
+        task-based machinery every other backend uses. Ignored if
+        *router* is also given.
+    router:
+        An :class:`~llm.router.LLMRouter` for full task-based routing,
+        fallback chains, per-task budgets, and remote-provider governance.
+        Takes precedence over *backend* when both are given.
+    execute_fn:
+        Callable ``(sql: str) -> pd.DataFrame``.  Defaults to
+        :func:`database.executor.execute_query` (looked up at call time so
+        monkeypatching works).  Override in tests for explicit injection.
+    max_corrections:
+        How many correction rounds to attempt before giving up.
+
+    Examples
+    --------
+    Backward-compatible single-backend construction still works, routed
+    through a one-entry chain under the hood:
+
+    >>> from llm.providers import MockBackend
+    >>> agent = SQLAgent(backend=MockBackend(response="SELECT 1"), execute_fn=lambda sql: None)
+    >>> agent._backend.name
+    'mock:stub'
+
+    A second provider serves SQL generation with no call-site change —
+    only the constructor argument differs:
+
+    >>> import pandas as pd
+    >>> agent2 = SQLAgent(
+    ...     backend=MockBackend(response="SELECT TOP 10 * FROM [sales].[Customer]"),
+    ...     execute_fn=lambda sql: pd.DataFrame({"Id": [1]}),
+    ... )
+    >>> df, result = agent2.run("q", system_prompt="")
+    >>> result.sql
+    'SELECT TOP 10 * FROM [sales].[Customer]'
+    """
+
+    def __init__(
+        self,
+        backend: LLMBackend | None = None,
+        execute_fn: Callable[[str], pd.DataFrame] | None = None,
+        max_corrections: int = MAX_CORRECTION_ATTEMPTS,
+        *,
+        router: LLMRouter | None = None,
+    ) -> None:
+        if router is not None:
+            self._router = router
+        elif backend is not None:
+            self._router = LLMRouter(default_chain=[backend])
+        else:
+            self._router = LLMRouter.from_settings()
+
+        # Backward-compat attribute: api/runner.py reads `agent._backend`
+        # directly (model name for QueryResponse.model, audit llm-status
+        # display) -- mirrors the primary SQL_GENERATION backend, i.e. the
+        # one this agent talks to before any fallback. The actual backend
+        # that serves a given request may differ (see RouteResult.provider
+        # / .fallback_used, threaded through SQLGenerationResult.llm_meta).
+        self._backend = (
+            backend if backend is not None
+            else self._router._chain_for(TaskType.SQL_GENERATION)[0]
+        )
+
+        self._execute = execute_fn if execute_fn is not None else _default_execute
+        self._max_corrections = max_corrections
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def run(
+        self,
+        question: str,
+        system_prompt: str,
+        *,
+        timer: StageTimer | None = None,
+        sql_cache_lookup: Callable[[str], pd.DataFrame | None] | None = None,
+        denied_columns: Iterable[str] | None = None,
+    ) -> tuple[pd.DataFrame, SQLGenerationResult]:
+        """Answer *question* and return ``(DataFrame, SQLGenerationResult)``.
+
+        Both a guard failure (bad syntax, unknown table, forbidden
+        keyword — ``ValueError`` from ``clean_sql``/``validate_sql``) and
+        a database execution failure (``RuntimeError``) are corrected in
+        the SAME loop, sharing the same ``max_corrections`` budget — with
+        one exception: a guard failure that is a
+        :class:`~security.sql_guard.PolicyRejection` (a forbidden
+        statement, a denied column, ...) is never retried, since the
+        policy behind it isn't in the prompt and no re-prompt can change
+        it; it raises immediately instead of consuming the rest of the
+        budget on rounds that would only repeat the identical rejection.
+        A :class:`~security.sql_guard.CorrectableRejection` keeps looping
+        exactly as before. Each later round's prompt includes every prior
+        round's correction prompt, not just the most recent, so the model
+        has the full history of what it already tried.
+
+        Parameters
+        ----------
+        question, system_prompt:
+            As before.
+        timer:
+            Optional :class:`~observability.timing.StageTimer` supplied by
+            the caller (e.g. ``api/runner.py``, one per request) to record
+            per-stage durations — ``"plan"`` (context retrieval),
+            ``"prompt"`` (prompt assembly), ``"llm"`` (accumulated across
+            every ``generate_with_meta`` call, including retried
+            corrections), ``"guard"`` (clean/validate/cap), and
+            ``"execute"``. ``None`` (the default) disables timing
+            entirely — every stage below becomes a no-op context manager
+            in that case, so callers that don't care about timings (most
+            unit tests) are unaffected.
+        sql_cache_lookup:
+            Optional callable ``(sql: str) -> pandas.DataFrame | None``,
+            consulted immediately before executing the guard-approved SQL.
+            A non-``None`` return is used as the result *instead of*
+            calling ``execute_fn`` — this is Phase 2 task 6's "cache by
+            generated SQL" win: two different questions that happen to
+            produce the identical SQL string share one execution, skipping
+            the (potentially slow) database round-trip for the second.
+            ``None`` (the default) disables this — every call falls
+            through to ``execute_fn`` as before. See
+            ``api/runner.py``'s ``_sql_cache_lookup`` for how the cache
+            key is built (prefix-version + mode + SQL text).
+        denied_columns:
+            Column names the caller's :class:`~security.auth.Principal`
+            must never see (Phase 8) -- threaded straight through to every
+            :func:`~security.sql_guard.validate_sql` call this method
+            makes, on the first attempt and every correction round alike.
+            ``None`` (the default) applies no column restriction, exactly
+            this method's pre-Phase-8 behaviour.
+
+        Notes
+        -----
+        With several data sources the question is first routed to one of
+        them and the model is shown only that source's tables; an
+        ``OUT_OF_SCOPE`` answer is retried once on the next candidate
+        source (see the module docstring, "Choosing the data source, and
+        the one retry"). The returned result, or a raised exception, carries
+        the selection as ``datasource_selection``. With one source none of
+        this applies.
+
+        Raises
+        ------
+        ValueError("OUT_OF_SCOPE")
+            When the model signals the question is out of scope.  Never
+            retried on the same source — this is a terminal signal, not a
+            fixable mistake — and retried at most once, on another data
+            source, when several are configured.
+        ValueError
+            When SQL validation still fails after all correction attempts.
+        RuntimeError
+            When execution still fails after all correction attempts.
+        """
+        with _stage(timer, "plan"):
+            context = ContextRetriever.retrieve(question)
+        with _stage(timer, "prompt"):
+            routing = SourceRouting.plan(
+                question, context,
+                build=lambda source: build_prompt_segments(
+                    question, system_prompt, context, source=source,
+                    denied_columns=denied_columns,
+                ),
+            )
+            initial_segments = (
+                routing.segments if routing is not None
+                else build_prompt_segments(
+                    question, system_prompt, context, denied_columns=denied_columns,
+                )
+            )
+
+        try:
+            df, result = self._attempt_loop(
+                question, initial_segments, routing,
+                timer=timer, sql_cache_lookup=sql_cache_lookup,
+                denied_columns=denied_columns,
+            )
+        except Exception as exc:
+            if routing is not None:
+                exc.datasource_selection = routing.audit()  # type: ignore[attr-defined]
+            raise
+        if routing is not None:
+            result = dataclasses.replace(result, datasource_selection=routing.audit())
+        return df, result
+
+    def _attempt_loop(
+        self,
+        question: str,
+        initial_segments: PromptSegments,
+        routing: SourceRouting | None,
+        *,
+        timer: StageTimer | None,
+        sql_cache_lookup: Callable[[str], pd.DataFrame | None] | None,
+        denied_columns: Iterable[str] | None,
+    ) -> tuple[pd.DataFrame, SQLGenerationResult]:
+        """The generate / validate / execute / correct loop of :meth:`run`.
+
+        Split out so :meth:`run` can attach the data-source selection to
+        whatever leaves the loop, a result or an exception alike. See
+        :meth:`run` for the contract; *routing* is ``None`` unless several
+        data sources are configured.
+        """
+        correction_prompts: list[str] = []
+        seen_hints: set[str] = set()
+        last_error: str | None = None
+        last_exception: BaseException | None = None
+        sql = ""
+        raw = ""
+        llm_meta: dict[str, Any] = {}
+        injected_top: int | None = None
+        attempt = 1
+        # The filter value check (see the module docstring): at most one
+        # extra model call per request, outside the correction budget.
+        value_checked = False
+        value_audit: dict[str, Any] | None = None
+        value_prompts: list[str] = []
+        extra_round = 0
+        # The filter value spelling fix (see the module docstring): what it did
+        # to the statement of the current round, if it reached execution.
+        spelling_audit: dict[str, Any] | None = None
+
+        for correction_round in range(self._max_corrections + 1):
+            spelling_audit = None
+            segments = initial_segments
+            if correction_round > 0:
+                # What exists, when the error is a name that does not
+                # (llm/correction_hints.py): a deterministic extra block in
+                # this round's correction text, which -- like the rest of
+                # it -- goes to the question segment only. A block the
+                # model has already been shown in an earlier round of this
+                # request is not repeated.
+                hint = correction_hint(
+                    last_exception, denied_columns=denied_columns,
+                    source=routing.current if routing is not None else None,
+                ) if last_exception is not None else ""
+                if hint in seen_hints:
+                    hint = ""
+                elif hint:
+                    seen_hints.add(hint)
+                correction_prompt = _CORRECTION_TEMPLATE.format(
+                    sql=sql or raw,
+                    error=last_error,
+                    hint=f"\n{hint}\n" if hint else "",
+                )
+                correction_prompts.append(correction_prompt)
+                # Every prior round's correction prompt, not just this one,
+                # is appended to the *question* segment only -- never to
+                # static_prefix/session_context -- so the model has the
+                # full history of what it already tried while the prefix
+                # stays byte-identical across every round (see the module
+                # docstring's "Prefix invariance" section). Leaking this
+                # text into static_prefix would silently defeat KV-cache
+                # reuse on every retry.
+                segments = PromptSegments(
+                    static_prefix=initial_segments.static_prefix,
+                    session_context=initial_segments.session_context,
+                    question=initial_segments.question + "".join(correction_prompts),
+                )
+                attempt = correction_round + 1
+                logger.info(
+                    "Self-correction attempt %d/%d for question: %.80s",
+                    correction_round,
+                    self._max_corrections,
+                    question,
+                )
+
+            # ValueError("OUT_OF_SCOPE") (or any other exception a backend
+            # itself raises — a transport failure, say) is intentionally
+            # NOT swallowed here: LLMRouter.generate_for_task wraps a
+            # chain-exhausted failure in one RuntimeError with the
+            # original exception as __cause__ (see llm/router.py), so it
+            # is unwrapped and re-raised as that original exception --
+            # propagating straight out of run(), uncorrected, exactly as
+            # before the router existed. OUT_OF_SCOPE never reaches that
+            # wrapper: the router short-circuits the chain and re-raises it
+            # unwrapped, so `exc.__cause__ or exc` yields the very same
+            # ValueError here (its __cause__ is None). The "llm" stage still records its
+            # elapsed time (StageTimer.stage times the block even when it
+            # raises — see its docstring), and OpenAIBackend attaches an
+            # "llm_meta" attribute to the OUT_OF_SCOPE ValueError itself,
+            # which survives the unwrap (it's the same exception object),
+            # so a caller further up (api/runner.py) can still recover
+            # call metadata for the audit trail on this uncaught path.
+            with _stage(timer, "llm"):
+                try:
+                    route_result, replaced = generate_with_source_fallback(
+                        lambda s: self._router.generate_for_task(TaskType.SQL_GENERATION, s),
+                        routing, segments,
+                    )
+                except Exception as exc:  # noqa: BLE001 - unwrapped and re-raised below
+                    raise exc.__cause__ or exc
+            if replaced is not None:
+                # The model declined on the first source and the one retry
+                # on the next candidate answered. Corrections gathered so
+                # far describe the other source's tables, so they start
+                # over from this source's own prompt (its prefix is what
+                # every later round keeps).
+                initial_segments = replaced
+                correction_prompts.clear()
+            raw = route_result.text or ""
+            llm_meta = route_result.meta
+
+            try:
+                with _stage(timer, "guard"):
+                    sql, injected_top = self._clean_validate_cap(raw, denied_columns=denied_columns)
+            except PolicyRejection as exc:
+                # The guard rejected this SQL for a reason no re-prompt can
+                # fix (a forbidden statement, a denied column, ...) -- the
+                # policy that caused it is not in the prompt, so every
+                # further correction round would just spend another LLM
+                # round trip to reach this exact same rejection. Break out
+                # immediately, on the very first occurrence, with the SAME
+                # outcome the final-attempt branch below produces (attempt
+                # still 1, candidate_sql already attached by
+                # _clean_validate_cap) -- see security.sql_guard's module
+                # docstring for the taxonomy this relies on.
+                last_error = str(exc)
+                logger.warning(
+                    "SQL failed validation (attempt %d): %s -- policy rejection, aborting without retry",
+                    attempt,
+                    last_error,
+                )
+                exc.llm_meta = llm_meta  # type: ignore[attr-defined]
+                # How many generation attempts this request actually cost
+                # -- 1 here, always, regardless of max_corrections -- so a
+                # caller further up (api/runner.py's audit trail) can
+                # report the honest count instead of implying the full
+                # budget was spent chasing an unfixable rejection.
+                exc.attempt = attempt + extra_round  # type: ignore[attr-defined]
+                if value_audit is not None:
+                    exc.value_check = value_audit  # type: ignore[attr-defined]
+                raise
+            except ValueError as exc:
+                last_error = str(exc)
+                last_exception = exc
+                logger.warning(
+                    "SQL failed validation (attempt %d): %s",
+                    attempt,
+                    last_error,
+                )
+                if correction_round == self._max_corrections:
+                    exc.llm_meta = llm_meta  # type: ignore[attr-defined]
+                    exc.attempt = attempt + extra_round  # type: ignore[attr-defined]
+                    if value_audit is not None:
+                        exc.value_check = value_audit  # type: ignore[attr-defined]
+                    # _clean_validate_cap already attached candidate_sql
+                    # (see its docstring) -- nothing further to add here.
+                    raise
+                continue
+
+            if cfg.settings.filter_value_spelling:
+                sql, spelling_audit = respell_filters(
+                    sql, denied_columns=denied_columns, dialect=cfg.settings.sql_dialect,
+                )
+
+            if cfg.settings.filter_value_check and not value_checked:
+                value_checked = True
+                value_round = self._filter_value_round(
+                    sql, initial_segments, correction_prompts,
+                    timer=timer, sql_cache_lookup=sql_cache_lookup, denied_columns=denied_columns,
+                )
+                value_audit = value_round.audit
+                if value_round.prompt is not None:
+                    value_prompts = [value_round.prompt]
+                    extra_round = 1
+                if value_round.executed is not None:
+                    df, sql, raw, llm_meta, injected_top = value_round.executed
+                    logger.info("Filter value correction used: %.120s", sql)
+                    return df, SQLGenerationResult(
+                        sql=sql,
+                        raw_response=raw,
+                        attempt=attempt + extra_round,
+                        correction_prompts=correction_prompts + value_prompts,
+                        llm_meta=llm_meta,
+                        injected_top=injected_top,
+                        value_check=value_audit,
+                        value_spelling=value_round.spelling,
+                    )
+
+            try:
+                with _stage(timer, "execute"):
+                    df = None
+                    if sql_cache_lookup is not None:
+                        df = sql_cache_lookup(sql)
+                    if df is None:
+                        df = self._execute(sql)
+                result = SQLGenerationResult(
+                    sql=sql,
+                    raw_response=raw,
+                    attempt=attempt + extra_round,
+                    correction_prompts=correction_prompts + value_prompts if value_prompts else correction_prompts,
+                    llm_meta=llm_meta,
+                    injected_top=injected_top,
+                    value_check=value_audit,
+                    value_spelling=spelling_audit,
+                )
+                if attempt > 1:
+                    logger.info(
+                        "Self-correction succeeded on attempt %d: %.120s",
+                        attempt,
+                        sql,
+                    )
+                return df, result
+
+            except RuntimeError as exc:
+                last_error = str(exc)
+                last_exception = None
+                logger.warning(
+                    "Execution failed (attempt %d): %s",
+                    attempt,
+                    last_error,
+                )
+                if correction_round == self._max_corrections:
+                    exc.llm_meta = llm_meta  # type: ignore[attr-defined]
+                    # Unlike the ValueError branch above, this sql DID
+                    # pass the guard -- it is exactly what SQLGenerationResult.sql
+                    # would have carried on success, so attach it (and the
+                    # cap that was actually applied) for the audit trail.
+                    exc.candidate_sql = sql  # type: ignore[attr-defined]
+                    exc.injected_top = injected_top  # type: ignore[attr-defined]
+                    if extra_round:
+                        exc.attempt = attempt + extra_round  # type: ignore[attr-defined]
+                    if value_audit is not None:
+                        exc.value_check = value_audit  # type: ignore[attr-defined]
+                    if spelling_audit is not None:
+                        exc.value_spelling = spelling_audit  # type: ignore[attr-defined]
+                    raise
+
+        # unreachable
+        raise RuntimeError("SQLAgent loop exited unexpectedly")  # pragma: no cover
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _filter_value_round(
+        self,
+        sql: str,
+        initial_segments: PromptSegments,
+        correction_prompts: list[str],
+        *,
+        timer: StageTimer | None,
+        sql_cache_lookup: Callable[[str], pd.DataFrame | None] | None,
+        denied_columns: Iterable[str] | None,
+    ) -> _ValueRound:
+        """Check the literals of *sql* and, if some do not exist, try one corrected statement.
+
+        See the module docstring ("A filter value that does not exist").
+        Never raises. ``executed`` is set only when the corrected statement
+        passed the guard, has no unknown literal and ran; otherwise the
+        caller runs the original *sql*.
+
+        Returns
+        -------
+        _ValueRound
+            ``audit`` for the audit record (``None`` when nothing could be
+            checked), ``prompt`` the message sent (``None`` when no model call
+            was made), ``executed`` the corrected statement's
+            ``(df, sql, raw, llm_meta, injected_top)`` when it ran, ``spelling``
+            what the spelling fix did to that statement (the corrected
+            statement is respelled like any other before it runs).
+        """
+        dialect = cfg.settings.sql_dialect
+        check = check_filter_values(sql, denied_columns=denied_columns, dialect=dialect)
+        if not check.unknown:
+            return _ValueRound(audit_block(check, corrected=False, fallback=False))
+        if self._max_corrections <= 0:
+            return _ValueRound(audit_block(check, corrected=False, fallback=True))
+
+        prompt = "\n" + correction_text(sql, check)
+        segments = PromptSegments(
+            static_prefix=initial_segments.static_prefix,
+            session_context=initial_segments.session_context,
+            question=initial_segments.question + "".join(correction_prompts) + prompt,
+        )
+        try:
+            with _stage(timer, "llm"):
+                route_result = self._router.generate_for_task(TaskType.SQL_GENERATION, segments)
+            raw = route_result.text or ""
+            with _stage(timer, "guard"):
+                new_sql, new_top = self._clean_validate_cap(raw, denied_columns=denied_columns)
+                spelling = None
+                if cfg.settings.filter_value_spelling:
+                    new_sql, spelling = respell_filters(new_sql, denied_columns=denied_columns, dialect=dialect)
+                again = check_filter_values(new_sql, denied_columns=denied_columns, dialect=dialect)
+            if again.unknown:
+                raise ValueError("the corrected statement keeps a value that does not exist")
+            with _stage(timer, "execute"):
+                df = None
+                if sql_cache_lookup is not None:
+                    df = sql_cache_lookup(new_sql)
+                if df is None:
+                    df = self._execute(new_sql)
+        except Exception as exc:  # noqa: BLE001 - whatever goes wrong, the original statement runs
+            logger.info("Filter value correction not used (%s): %.120s", type(exc).__name__, exc)
+            return _ValueRound(audit_block(check, corrected=False, fallback=True), prompt)
+        return _ValueRound(
+            audit_block(check, corrected=True, fallback=False), prompt,
+            (df, new_sql, raw, route_result.meta, new_top), spelling,
+        )
+
+    def _clean_validate_cap(
+        self, raw: str, *, denied_columns: Iterable[str] | None = None,
+    ) -> tuple[str, int | None]:
+        """clean_sql + validate_sql + ensure_top (+ transpile, for a non-tsql target).
+
+        Returns
+        -------
+        tuple[str, int | None]
+            ``(sql, injected_top)`` — *sql* is the validated, capped query,
+            in this deployment's target dialect
+            (:data:`config.Settings.sql_dialect`); *injected_top* is the
+            row cap :func:`~security.sql_guard.ensure_top` injected, or
+            ``None`` if the model's own SQL already carried a row-limit
+            clause (``ensure_top`` returned its input unchanged). Detected
+            by comparing ``ensure_top``'s output to its input, since
+            ``ensure_top`` itself only returns the capped string, not
+            whether it changed anything. This is measured on the model's
+            ``tsql`` output *before* any transpilation, since that is where
+            the cap is actually injected (see
+            :func:`~security.sql_guard.transpile_and_revalidate`'s
+            docstring: capping happens once, on tsql, and sqlglot carries
+            the resulting row-limiting clause into the target dialect's
+            own syntax when transpiling).
+
+        Multi-dialect pipeline
+        --------------------------
+        The model always generates ``tsql`` (see
+        :data:`config.Settings.sql_dialect`'s docstring for why), so
+        :func:`~security.sql_guard.clean_sql`,
+        :func:`~security.sql_guard.validate_sql`, and
+        :func:`~security.sql_guard.ensure_top` all run pinned to ``tsql``
+        here, completely unchanged from this method's pre-multi-dialect
+        behaviour. Only the *last* step is new:
+        :func:`~security.sql_guard.transpile_and_revalidate` transpiles the
+        guard-approved, capped ``tsql`` text to
+        ``cfg.settings.sql_dialect`` and re-validates the **transpiled**
+        text with the guard pinned to that dialect before this method ever
+        returns it for execution — never trusting that transpiled SQL
+        which merely *parses* is also safe (see that function's own
+        docstring for the finding that makes this non-negotiable). When
+        the target dialect is ``"tsql"`` (this deployment's default), that
+        step is a documented no-op passthrough: nothing above changes for
+        an existing tsql-only deployment.
+
+        A rejected candidate is still recoverable for the audit trail: on
+        a ``ValueError``, the raised exception gets a ``candidate_sql``
+        attribute — the last successfully-produced SQL text (cleaned,
+        capped, or transpiled, whichever stage got furthest before the
+        rejection), or ``None`` if :func:`clean_sql` itself failed (no
+        candidate SQL ever existed to report).
+        """
+        try:
+            sql = clean_sql(raw)
+        except ValueError as exc:
+            exc.candidate_sql = None  # type: ignore[attr-defined]
+            raise
+        try:
+            validate_sql(sql, denied_columns=denied_columns)
+        except ValueError as exc:
+            exc.candidate_sql = sql  # type: ignore[attr-defined]
+            raise
+        capped = ensure_top(sql, cfg.settings.default_top_n)
+        injected_top = cfg.settings.default_top_n if capped != sql else None
+
+        try:
+            final_sql = transpile_and_revalidate(
+                capped,
+                target_dialect=cfg.settings.sql_dialect,
+                denied_columns=denied_columns,
+            )
+        except ValueError as exc:
+            exc.candidate_sql = capped  # type: ignore[attr-defined]
+            raise
+
+        return final_sql, injected_top

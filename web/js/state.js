@@ -1,0 +1,282 @@
+/* web/js/state.js — small app-wide state: run mode, theme, and the
+ * transcript accumulated so far. No framework, just a plain object plus a
+ * handful of pub/sub-free helper functions; main.js owns when to re-render. */
+
+"use strict";
+
+const STORAGE_THEME_KEY = "lsa-web-theme";
+const STORAGE_BASE_KEY = "lsa-web-base";
+const STORAGE_SESSION_KEY = "lsa-web-session-id";
+const STORAGE_INTERPRET_KEY = "lsa-web-interpret";
+const STORAGE_LANG_KEY = "lsa-web-lang";
+
+export const state = {
+  // "live" is the default. A deployment is live and the analysts opening
+  // this page expect real answers; defaulting to "simulated" would mean
+  // synthetic, made-up numbers render in the exact same UI as real ones
+  // — clearly labelled, but still the wrong DEFAULT once the system is
+  // actually serving people. Simulated mode stays fully available (it is
+  // genuinely used for demos and training — see web/README.md's
+  // "Modes"); only the default changes. See resolveBootMode below for
+  // how `?live=0` / `?live=1` override this — the only override left;
+  // run mode is a deploy/debug concern now, not a topbar control an
+  // analyst could mis-click into showing synthetic data as real.
+  // Consequence to hold honestly: on a first load against
+  // an unreachable backend, an analyst now sees an error (from
+  // refreshHealth in main.js) instead of a working simulated demo — see
+  // that error's own wording for why that is the right trade.
+  mode: "live", // "simulated" | "live"
+  // Placeholder only -- every real page boot (web/js/main.js,
+  // web/admin/main.js) overwrites this immediately via
+  // resolveDefaultBaseUrl (config.js's DEFAULT_BASE_URL/DEFAULT_API_PORT)
+  // before loadPersisted() even runs. Kept non-empty here only so a
+  // module that imports state.js without running either boot sequence
+  // (a stray test, say) still gets a syntactically valid URL rather than
+  // an empty string.
+  baseUrl: "http://localhost:8000",
+  theme: "system", // "system" | "light" | "dark"
+  lang: "fa", // "fa" | "en" — chrome only; questions may be either
+  sessionId: null,
+  sessions: [], // SessionSummary[] — the conversation-list sidebar's index
+  turns: [], // Turn[] rendered so far, in order
+  memory: null, // {entries, rememberable} | null — the memory panel's last fetch
+  // Whether each turn asks for a plain-language summary. Off by default,
+  // matching the API: an interpretation sends up to twenty rows of real
+  // result data to the model, and defaulting that on would be deciding
+  // for the analyst rather than asking them.
+  interpret: false,
+  busy: false,
+  nextScriptedIndex: 0, // pointer into SCENARIO.turns for the "sample" flow
+};
+
+export function loadPersisted() {
+  try {
+    const t = localStorage.getItem(STORAGE_THEME_KEY);
+    if (t === "light" || t === "dark" || t === "system") state.theme = t;
+  } catch { /* localStorage unavailable (private mode, etc.) — keep default */ }
+  try {
+    const b = localStorage.getItem(STORAGE_BASE_KEY);
+    if (b) {
+      // A value saved before normalizeBaseUrl existed (or saved by a
+      // build that had a bug, like the real "172.16.101.42:8076" no
+      // scheme/trailing-path incident this normalisation exists for)
+      // must not go on shadowing the deploy default forever just
+      // because it once made it into localStorage. Repair it in place
+      // when it is fixable (e.g. missing scheme); when it is not
+      // parseable/valid at all, drop it instead of loading a value that
+      // would only fail every request — the deploy-time default (already
+      // in state.baseUrl at this point in the boot sequence) stands.
+      const result = normalizeBaseUrl(b);
+      if (result.ok) {
+        state.baseUrl = result.url;
+        if (result.url !== b) {
+          try { localStorage.setItem(STORAGE_BASE_KEY, result.url); } catch { /* ignore */ }
+        }
+      } else {
+        try { localStorage.removeItem(STORAGE_BASE_KEY); } catch { /* ignore */ }
+      }
+    }
+  } catch { /* ignore */ }
+  try {
+    const s = localStorage.getItem(STORAGE_SESSION_KEY);
+    if (s) state.sessionId = s;
+  } catch { /* ignore — reload just won't return the analyst to the same conversation */ }
+  try {
+    state.interpret = localStorage.getItem(STORAGE_INTERPRET_KEY) === "1";
+  } catch { /* ignore — the toggle just won't survive a reload */ }
+  try {
+    const lang = localStorage.getItem(STORAGE_LANG_KEY);
+    if (lang === "fa" || lang === "en") state.lang = lang;
+  } catch { /* ignore — default fa */ }
+}
+
+/** Remembers the analyst's interpretation choice for this browser. */
+export function persistInterpret(on) {
+  state.interpret = !!on;
+  try {
+    if (state.interpret) localStorage.setItem(STORAGE_INTERPRET_KEY, "1");
+    else localStorage.removeItem(STORAGE_INTERPRET_KEY);
+  } catch { /* ignore — it just won't survive a reload */ }
+}
+
+/** Remembers which conversation the analyst was on, so a reload returns
+ * them to it (see resolveActiveSessionId, which reconciles this stored id
+ * against the real index once it's fetched — the id might be stale). */
+export function persistSessionId(sessionId) {
+  state.sessionId = sessionId;
+  try {
+    if (sessionId) localStorage.setItem(STORAGE_SESSION_KEY, sessionId);
+    else localStorage.removeItem(STORAGE_SESSION_KEY);
+  } catch { /* ignore — the choice just won't survive a reload */ }
+}
+
+/** Picks which session should be active once the real index is known.
+ * Pure, total, no localStorage access (loadPersisted already read the
+ * raw stored id; this just reconciles it against the index):
+ *   - an empty index -> null (first-run: nothing to select yet).
+ *   - a stored id still present in the index -> kept as-is.
+ *   - a stored id that is stale, missing, or was never set -> the most
+ *     recently active session in the index, never a thrown error and
+ *     never an arbitrary (e.g. array-order) pick. */
+export function resolveActiveSessionId(storedId, sessions) {
+  if (!sessions || sessions.length === 0) return null;
+  if (storedId && sessions.some((s) => s.session_id === storedId)) return storedId;
+  const newest = sessions.slice().sort(
+    (a, b) => new Date(b.last_active_at).getTime() - new Date(a.last_active_at).getTime(),
+  )[0];
+  return newest.session_id;
+}
+
+/** Resolves the effective run mode for THIS page load from the `?live=`
+ * URL param, falling back to *defaultMode* (state.mode's own initial
+ * value, "live" — see its comment above) when the param is absent or
+ * unrecognized. Pure, total, no DOM/localStorage access, so the exact
+ * precedence rule is unit-testable without standing up the whole page:
+ *   - `?live=1` -> "live" (explicit opt-in — e.g. a bookmarked/shared link)
+ *   - `?live=0` -> "simulated" (explicit opt-out — demos, training, CI)
+ *   - anything else (param absent, or an unrecognized value) -> defaultMode
+ * Keeping this a pure function (rather than the inline if/if it used to
+ * be in main.js's boot) is what lets the DEFAULT itself change in exactly
+ * one place (state.mode's initializer) without this precedence rule
+ * needing to change, or be re-verified, along with it. */
+export function resolveBootMode(searchParams, defaultMode) {
+  const live = searchParams.get("live");
+  if (live === "1") return "live";
+  if (live === "0") return "simulated";
+  return defaultMode;
+}
+
+/** Resolves the effective backend base URL for THIS page load. `?base=`
+ * is the highest-precedence override (an operator pointing this one load
+ * somewhere else for debugging) and always wins when present; otherwise
+ * *currentBaseUrl* stands unchanged — by the time main.js calls this,
+ * loadPersisted() has already folded in a localStorage override (if any)
+ * on top of web/js/config.js's deploy-time DEFAULT_BASE_URL, so "leave it
+ * alone" here already means "the persisted value, or the deploy default".
+ * Pure, total, no DOM access. */
+export function resolveBootBaseUrl(searchParams, currentBaseUrl) {
+  const base = searchParams.get("base");
+  return base ? base : currentBaseUrl;
+}
+
+/** Derives the effective deploy-time DEFAULT backend base URL from
+ * web/js/config.js's two constants and THIS page's own location, so both
+ * web/ and web/admin/ resolve the same default the same way without
+ * either one hardcoding a host.
+ *
+ * *defaultBaseUrl* (config.js's DEFAULT_BASE_URL) wins whenever it is a
+ * non-empty string, unchanged — this is the existing, documented "one
+ * file a deployment edits" path, kept exactly as it already worked.
+ * Only when it is empty does this derive an address from *pageOrigin*
+ * (an object with `protocol`/`hostname`, e.g. `window.location` itself,
+ * or a plain object in a test) and *defaultApiPort* (config.js's
+ * DEFAULT_API_PORT): `<page protocol>//<page hostname>:<port>`. This is
+ * what lets a deployment move the API+UI pair to a new host with no JS
+ * edit at all — the API is assumed reachable on the same hostname the
+ * page itself was loaded from, just on its own port.
+ *
+ * Pure, total, no DOM access beyond reading the two fields off
+ * *pageOrigin* that are passed in explicitly — unit-testable without a
+ * real `window.location`. */
+export function resolveDefaultBaseUrl(defaultBaseUrl, defaultApiPort, pageOrigin) {
+  const trimmed = (defaultBaseUrl || "").trim();
+  if (trimmed) return trimmed;
+  return `${pageOrigin.protocol}//${pageOrigin.hostname}:${defaultApiPort}`;
+}
+
+/** Closed set of reasons normalizeBaseUrl can reject a value — each
+ * page renders its OWN message (in its own language) for each reason
+ * rather than this shared module owning any UI copy; see
+ * web/js/main.js's / web/admin/main.js's own mapping. */
+export const BASE_URL_INVALID_EMPTY = "empty";
+export const BASE_URL_INVALID_UNPARSEABLE = "unparseable";
+export const BASE_URL_INVALID_SCHEME = "scheme";
+
+/** Normalises and validates a typed or saved API base-address string —
+ * an admin top-bar entry, a `?base=` query param, or a value already
+ * sitting in localStorage from a previous, possibly-bad save.
+ *
+ * A real deployment typed "172.16.101.42:8076" (no scheme) into the
+ * admin top bar; `fetch` then treated it as a RELATIVE path, and every
+ * request went to `GET /admin/172.16.101.42:8076/admin/...` on the
+ * static file server instead of the API. This exists so that never
+ * happens silently again:
+ *   1. trim whitespace;
+ *   2. if there is no `scheme://` prefix, prepend `http://` (the exact
+ *      repair the incident above needed);
+ *   3. parse with `new URL()` — a value that still does not parse (spaces,
+ *      garbage, ...) is rejected, not silently used as a relative path;
+ *   4. reject anything whose scheme is not `http`/`https` (e.g.
+ *      `javascript:`, `file:`);
+ *   5. on success, keep only the origin — `protocol//host` — discarding
+ *      any path, query, or trailing slash, so `http://host:port/some/path`
+ *      and `http://host:port/` both normalise to `http://host:port`.
+ *
+ * A second, narrower repair lives here too: a value that does NOT start
+ * with a scheme but has one embedded further in ("/http://host:port" —
+ * an accidental leading slash pasted in front of an otherwise-correct
+ * address) is deliberately REJECTED rather than guessed at. Blindly
+ * prepending "http://" to that one (as step 2 does for the ordinary
+ * no-scheme case) parses "successfully" into a nonsense origin
+ * (`new URL("http:///http://host:port")` resolves the second "http" as
+ * the HOSTNAME, silently) — a wrong answer that never surfaces as an
+ * error. An address that already contains "://" somewhere is only safe
+ * to accept when that occurrence is the leading scheme; anywhere else,
+ * this rejects it with a clear reason instead of risking a silent
+ * mis-parse toward the wrong host.
+ *
+ * Returns `{ok: true, url}` or `{ok: false, reason}` (one of the
+ * `BASE_URL_INVALID_*` constants above) — never throws. Pure, total, no
+ * DOM/localStorage access. */
+export function normalizeBaseUrl(raw) {
+  const trimmed = (raw || "").trim();
+  if (!trimmed) return { ok: false, reason: BASE_URL_INVALID_EMPTY };
+  const hasSchemePrefix = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed);
+  const hasSchemeElsewhere = !hasSchemePrefix && /:\/\//.test(trimmed);
+  if (hasSchemeElsewhere) return { ok: false, reason: BASE_URL_INVALID_UNPARSEABLE };
+  const candidate = hasSchemePrefix ? trimmed : `http://${trimmed}`;
+  let parsed;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    return { ok: false, reason: BASE_URL_INVALID_UNPARSEABLE };
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return { ok: false, reason: BASE_URL_INVALID_SCHEME };
+  }
+  return { ok: true, url: parsed.origin };
+}
+
+export function persistTheme(theme) {
+  state.theme = theme;
+  try {
+    localStorage.setItem(STORAGE_THEME_KEY, theme);
+  } catch { /* ignore — theme just won't survive a reload */ }
+}
+
+export function persistBaseUrl(url) {
+  state.baseUrl = url;
+  try {
+    localStorage.setItem(STORAGE_BASE_KEY, url);
+  } catch { /* ignore */ }
+}
+
+export function applyTheme() {
+  const root = document.documentElement;
+  if (state.theme === "system") root.removeAttribute("data-theme");
+  else root.setAttribute("data-theme", state.theme);
+}
+
+export function addTurn(turn) {
+  state.turns.push(turn);
+  return turn;
+}
+
+export function findTurn(turnId) {
+  return state.turns.find((t) => t.turn_id === turnId) || null;
+}
+
+export function resetTranscript() {
+  state.turns = [];
+  state.nextScriptedIndex = 0;
+}

@@ -1,0 +1,392 @@
+# SPDX-License-Identifier: BUSL-1.1
+# Copyright (c) 2024-2026 Ali Sadeghi Aghili
+"""Domain exception hierarchy and FastAPI exception handlers.
+
+The handlers registered in ``register_handlers(app)`` translate these
+typed exceptions into consistent JSON error responses with the correct
+HTTP status code.
+
+Exception map
+-------------
+
+The ``raised`` column is deliberate: this table used to read as though
+every row were wired up, and five of them are not raised anywhere in
+production code. They are reserved slots in the hierarchy, exercised by
+``tests/test_errors.py`` and imported by ``api/runner.py``, kept so the
+taxonomy stays complete — but a reader should not infer from this table
+that the input-validation errors below are live. Pydantic currently
+rejects short, long and out-of-range input before the pipeline sees it,
+surfacing as ``RequestValidationError`` (422), not as a 400.
+
+  Layer             Exception                        HTTP  raised
+  ───────────────   ──────────────────────────────   ────  ──────
+  Auth              UnauthenticatedError              401  yes
+                    AdminRequiredError                403  yes
+                    OperationsRequiredError            403  yes
+                    SecurityRequiredError              403  yes
+  Input validation  QuestionTooShortError             400  no
+                    QuestionTooLongError              400  no
+                    InvalidModeError                  400  no
+  Security          ForbiddenSQLError                 400  yes
+                    InjectionAttemptError             400  no
+  Scope             OutOfScopeError                   422  yes
+  LLM               ModelUnavailableError             503  yes
+                    ModelTimeoutError                 504  yes
+                    EmptySQLResponseError             502  yes
+                    InvalidSQLResponseError           502  yes
+  Database          DatabaseConnectionError           503  yes
+                    QueryTimeoutError                 504  yes
+                    QueryExecutionError               502  yes
+  Overload          ServerOverloadError               503  no
+  Maintenance       MaintenanceModeError               503  yes
+  Catch-all         fastapi.RequestValidationError    422  yes  (Pydantic)
+                    Exception                         500  yes
+
+``ServerOverloadError`` is a special case worth recording. It cannot
+simply be raised from the middleware: exceptions raised inside a
+``BaseHTTPMiddleware.dispatch`` propagate above the router, so FastAPI's
+``@app.exception_handler`` handlers never see them and the client gets a
+500 instead of a 503. ``RateLimitMiddleware`` and
+``ConcurrencyMiddleware`` therefore construct their JSON envelopes
+directly. That duplicates the shape built by ``_error_response`` here,
+which is a real drift risk — the two should share one builder.
+"""
+
+from __future__ import annotations
+
+import logging
+import traceback
+import uuid
+
+from fastapi import FastAPI, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+from observability.llm_status import TRUNCATED_OUTPUT_ERROR_CODE
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Base
+# ---------------------------------------------------------------------------
+
+class NLQError(Exception):
+    """Root for all domain exceptions.  Always carries a user-facing message."""
+
+    http_status: int = status.HTTP_500_INTERNAL_SERVER_ERROR
+    error_code: str = "INTERNAL_ERROR"
+
+    def __init__(self, message: str, *, detail: str | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.detail = detail  # extra context for logs (never sent to client)
+
+
+# ---------------------------------------------------------------------------
+# 401 Unauthorized
+# ---------------------------------------------------------------------------
+
+class UnauthenticatedError(NLQError):
+    """Missing or invalid credentials on a route that requires them.
+
+    ``register_handlers``'s ``nlq_error_handler`` special-cases this
+    exception to also attach a ``WWW-Authenticate: Bearer`` header — the
+    one piece of the 401 response ``_error_response``'s generic envelope
+    builder doesn't carry, since no other error in this hierarchy needs
+    it.
+    """
+    http_status = status.HTTP_401_UNAUTHORIZED
+    error_code = "UNAUTHENTICATED"
+
+
+# ---------------------------------------------------------------------------
+# 403 Forbidden
+# ---------------------------------------------------------------------------
+
+class AdminRequiredError(NLQError):
+    """The caller authenticated with a real key, but that key does not
+    carry the ``admin`` capability (``docs/admin-panel-architecture.md``
+    §2; ``security.auth.Principal.is_admin``) — raised by
+    :func:`api.auth.require_admin` for every ``/admin/*`` route.
+
+    403, not 401: the credential itself was valid, it is simply
+    insufficient for this route, which is a different fact than "no
+    credential was presented/accepted" — so this does NOT carry the
+    ``WWW-Authenticate`` header ``UnauthenticatedError`` does (that header
+    tells a client *how* to authenticate; there is nothing more this
+    client's own key could present to fix a 403).
+    """
+    http_status = status.HTTP_403_FORBIDDEN
+    error_code = "ADMIN_REQUIRED"
+
+
+class OperationsRequiredError(NLQError):
+    """The caller authenticated, but that principal does not carry the
+    ``operations`` capability (admin panel phase 2 —
+    ``docs/admin-panel-architecture.md`` §2;
+    ``security.auth.Principal.is_operations``) — raised by
+    :func:`api.auth.require_operations` for every operations-gated
+    ``/admin/*`` write route (key lifecycle)."""
+    http_status = status.HTTP_403_FORBIDDEN
+    error_code = "OPERATIONS_REQUIRED"
+
+
+class SecurityRequiredError(NLQError):
+    """The caller authenticated, but that principal does not carry the
+    ``security`` capability (admin panel phase 2 §2;
+    ``security.auth.Principal.is_security``) — raised by
+    :func:`api.auth.require_security` for every security-gated
+    ``/admin/*`` write route (ACL changes, role grants)."""
+    http_status = status.HTTP_403_FORBIDDEN
+    error_code = "SECURITY_REQUIRED"
+
+
+# ---------------------------------------------------------------------------
+# 400 Bad Request
+# ---------------------------------------------------------------------------
+
+class QuestionTooShortError(NLQError):
+    http_status = status.HTTP_400_BAD_REQUEST
+    error_code = "QUESTION_TOO_SHORT"
+
+
+class QuestionTooLongError(NLQError):
+    http_status = status.HTTP_400_BAD_REQUEST
+    error_code = "QUESTION_TOO_LONG"
+
+
+class InvalidModeError(NLQError):
+    http_status = status.HTTP_400_BAD_REQUEST
+    error_code = "INVALID_MODE"
+
+
+class ForbiddenSQLError(NLQError):
+    """Generated SQL contains a forbidden keyword (DELETE, DROP, …)."""
+    http_status = status.HTTP_400_BAD_REQUEST
+    error_code = "FORBIDDEN_SQL"
+
+
+class InjectionAttemptError(NLQError):
+    """Question looks like a prompt-injection or SQL-injection attempt."""
+    http_status = status.HTTP_400_BAD_REQUEST
+    error_code = "INJECTION_ATTEMPT"
+
+
+# ---------------------------------------------------------------------------
+# 422 Unprocessable
+# ---------------------------------------------------------------------------
+
+class OutOfScopeError(NLQError):
+    """Model signalled the question is outside the scope of the data this system covers."""
+    http_status = status.HTTP_422_UNPROCESSABLE_ENTITY
+    error_code = "OUT_OF_SCOPE"
+
+
+# ---------------------------------------------------------------------------
+# 502 Bad Gateway  (upstream returned garbage)
+# ---------------------------------------------------------------------------
+
+class EmptySQLResponseError(NLQError):
+    """LLM returned an empty or whitespace-only response."""
+    http_status = status.HTTP_502_BAD_GATEWAY
+    error_code = "EMPTY_SQL_RESPONSE"
+
+
+class TruncatedSQLResponseError(NLQError):
+    """LLM was cut off at its token cap before emitting any SQL.
+
+    A distinct code from :class:`EmptySQLResponseError` because the two
+    have distinct fixes and only one of them is the operator's. "Empty"
+    sends the reader to the model, the prompt and the schema; this one
+    names ``LLM_NUM_PREDICT`` and ``LLM_EXTRA_BODY``, which is where the
+    problem actually is -- see
+    :func:`observability.llm_status.is_truncated_empty_completion`.
+    """
+    http_status = status.HTTP_502_BAD_GATEWAY
+    error_code = TRUNCATED_OUTPUT_ERROR_CODE
+
+
+class InvalidSQLResponseError(NLQError):
+    """LLM response could not be parsed into valid SQL."""
+    http_status = status.HTTP_502_BAD_GATEWAY
+    error_code = "INVALID_SQL_RESPONSE"
+
+
+class QueryExecutionError(NLQError):
+    """SQL executed but the database returned an error."""
+    http_status = status.HTTP_502_BAD_GATEWAY
+    error_code = "QUERY_EXECUTION_ERROR"
+
+
+# ---------------------------------------------------------------------------
+# 503 Service Unavailable  (dependency down)
+# ---------------------------------------------------------------------------
+
+class ModelUnavailableError(NLQError):
+    """The configured LLM endpoint is not reachable."""
+    http_status = status.HTTP_503_SERVICE_UNAVAILABLE
+    error_code = "MODEL_UNAVAILABLE"
+
+
+class DatabaseConnectionError(NLQError):
+    """Cannot connect to the SQL Server database."""
+    http_status = status.HTTP_503_SERVICE_UNAVAILABLE
+    error_code = "DATABASE_UNAVAILABLE"
+
+
+class ServerOverloadError(NLQError):
+    """Too many concurrent requests — server is at capacity."""
+    http_status = status.HTTP_503_SERVICE_UNAVAILABLE
+    error_code = "SERVER_OVERLOAD"
+
+
+class MaintenanceModeError(NLQError):
+    """The system is in maintenance mode (``api.maintenance`` — admin panel
+    phase 6, ``docs/admin-panel-architecture.md`` §3 tier 3). Raised by
+    :func:`api.maintenance.require_not_in_maintenance` for a new analyst
+    query — never for a request already past that check (see that
+    function's docstring for why that is what makes drain-not-cut true by
+    construction), and never for ``/admin/*``, ``/health``, or ``/``,
+    which do not depend on this dependency at all.
+
+    503, matching :class:`ServerOverloadError`'s reasoning: this is a
+    refusal a well-behaved client should retry later, not a defect in the
+    request itself."""
+    http_status = status.HTTP_503_SERVICE_UNAVAILABLE
+    error_code = "MAINTENANCE_MODE"
+
+
+# ---------------------------------------------------------------------------
+# 504 Gateway Timeout
+# ---------------------------------------------------------------------------
+
+class ModelTimeoutError(NLQError):
+    """LLM inference took longer than the configured timeout."""
+    http_status = status.HTTP_504_GATEWAY_TIMEOUT
+    error_code = "MODEL_TIMEOUT"
+
+
+class QueryTimeoutError(NLQError):
+    """SQL query exceeded the LOCK_TIMEOUT / query_timeout_seconds limit."""
+    http_status = status.HTTP_504_GATEWAY_TIMEOUT
+    error_code = "QUERY_TIMEOUT"
+
+
+# ---------------------------------------------------------------------------
+# JSON response builder
+# ---------------------------------------------------------------------------
+
+def _error_response(
+    request: Request,
+    status_code: int,
+    error_code: str,
+    message: str,
+    request_id: str,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "code": error_code,
+                "message": message,
+                "request_id": request_id,
+                "path": str(request.url.path),
+            }
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# FastAPI handler registration
+# ---------------------------------------------------------------------------
+
+def register_handlers(app: FastAPI) -> None:
+    """Attach all exception handlers to *app*."""
+
+    @app.exception_handler(NLQError)
+    async def nlq_error_handler(request: Request, exc: NLQError) -> JSONResponse:
+        request_id = _get_request_id(request)
+        logger.warning(
+            "[%s] %s %s → %s(%s): %s",
+            request_id,
+            request.method,
+            request.url.path,
+            type(exc).__name__,
+            exc.http_status,
+            exc.message,
+        )
+        if exc.detail:
+            logger.debug("[%s] detail: %s", request_id, exc.detail)
+        response = _error_response(
+            request,
+            exc.http_status,
+            exc.error_code,
+            exc.message,
+            request_id,
+        )
+        if isinstance(exc, UnauthenticatedError):
+            response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        request_id = _get_request_id(request)
+        errors = exc.errors()
+        first = errors[0] if errors else {}
+        field = ".".join(str(loc) for loc in first.get("loc", []))
+        msg = first.get("msg", "Invalid request")
+        human = f"{field}: {msg}" if field else msg
+        logger.info("[%s] Validation error: %s", request_id, errors)
+        return _error_response(
+            request,
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "VALIDATION_ERROR",
+            human,
+            request_id,
+        )
+
+    @app.exception_handler(Exception)
+    async def unhandled_error_handler(
+        request: Request, exc: Exception
+    ) -> JSONResponse:
+        request_id = _get_request_id(request)
+        logger.error(
+            "[%s] Unhandled %s: %s\n%s",
+            request_id,
+            type(exc).__name__,
+            exc,
+            traceback.format_exc(),
+        )
+        return _error_response(
+            request,
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "An unexpected error occurred. Please try again later.",
+            request_id,
+        )
+
+
+def _get_request_id(request: Request) -> str:
+    """Return this request's id, preferring the id RequestIDMiddleware already stamped.
+
+    ``RequestIDMiddleware`` stores the id on ``request.state.request_id``
+    (echoing the client's ``X-Request-ID`` header if it supplied one,
+    otherwise minting a fresh one) *before* any route handler or
+    exception path runs, and later copies that same value onto the
+    ``X-Request-ID`` response header. Reading ``request.state`` first here
+    — instead of re-reading the header and minting an independent id when
+    absent — guarantees the id in an error body always matches the
+    response's ``X-Request-ID`` header, which is what operators actually
+    correlate against server logs.
+
+    The header and fresh-uuid fallbacks below only matter when something
+    bypasses ``RequestIDMiddleware`` entirely, e.g. a unit test that wires
+    up ``register_handlers()`` without the middleware.
+    """
+    state_request_id = getattr(request.state, "request_id", None)
+    if state_request_id:
+        return state_request_id
+    return request.headers.get("x-request-id") or uuid.uuid4().hex[:12]

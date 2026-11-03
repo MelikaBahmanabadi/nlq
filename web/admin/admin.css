@@ -1,0 +1,802 @@
+/* web/admin/admin.css — admin panel.
+ *
+ * Every colour token, plus .topbar, .live-key-row, .theme-toggle, .foot and
+ * the light/dark custom properties, come from ../styles/style.css unchanged.
+ * This file adds only what a dashboard needs and a chat transcript does not.
+ *
+ * Three decisions worth stating, because each encodes something true rather
+ * than decorating:
+ *
+ * 1. NAVY IS THE ADMIN'S CHROME. The analyst UI leads with teal. Reusing
+ *    that here would let an operator lose track of which surface they are
+ *    on -- and one of these two can eventually change who sees what data.
+ *    Navy is already in the shared palette, so this differentiates within
+ *    the system rather than inventing a second visual language.
+ *
+ * 2. NOT EVERYTHING IS A CARD. This started as four equal cards in a grid,
+ *    which flattens hierarchy: a failing deployment check looked exactly as
+ *    urgent as a cache size. Border, fill and shadow are spent by role now.
+ *    The deployment checks and the headline figures are lifted; the two
+ *    detail tables underneath are plain sections.
+ *
+ * 3. THE PREFIX-CACHE RATE IS EMPHASISED ON PURPOSE. It is the metric
+ *    docs/admin-panel-architecture.md names as the silent failure: when
+ *    prefix reuse breaks, every request pays full prefill and nothing
+ *    errors. A number nobody looks at cannot warn anyone, so it is given
+ *    the weight its consequences have. */
+
+/* ── Layout ─────────────────────────────────────────────────────────── */
+
+.admin-jump {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow-x: auto;
+  padding: 8px 16px;
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+  max-width: 100%;
+}
+.admin-jump a {
+  flex: 0 0 auto;
+  text-decoration: none;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  padding: 6px 12px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.admin-jump a:hover { background: var(--card-2); color: var(--ink); }
+.admin-jump a.on { background: var(--navy); color: #fff; }
+.admin-jump a:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+/* The backend address in the top bar. Its rules left style.css with the
+ * analyst page's copy of the field, which left this one in the browser's
+ * default look; these match the key controls beside it. */
+.live-base-row { display: flex; gap: 6px; align-items: center; min-width: 0; }
+.live-base-input {
+  min-width: 0; flex: 1 1 160px; width: 200px; max-width: 100%;
+  font: inherit; font-size: 12.5px; padding: 6px 10px; border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, .3); background: rgba(255, 255, 255, .08); color: #fff;
+}
+.live-base-input:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.live-base-connect {
+  font: inherit; border: 1px solid rgba(255, 255, 255, .3); border-radius: 8px;
+  background: transparent; color: #e2e8f0; padding: 6px 14px; font-size: 12.5px; font-weight: 600; cursor: pointer;
+}
+.live-base-connect:hover { background: rgba(255, 255, 255, .12); }
+.live-base-connect:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+/* Grouped views (views.js): a segmented control at the start of the
+ * sticky nav. The pressed view is a filled navy pill (aria-pressed), the
+ * jump links after it list only that view's sections. A view that needs
+ * attention carries a dot plus screen-reader text, never colour alone. */
+.admin-views {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  margin-inline-end: 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--card-2);
+}
+.admin-view-btn {
+  position: relative;
+  border: none;
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 700;
+  padding: 6px 14px;
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.admin-view-btn:hover { background: var(--card); }
+.admin-view-btn[aria-pressed="true"] { background: var(--navy); color: #fff; }
+.admin-view-btn:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.admin-view-btn.attn::after {
+  content: "";
+  position: absolute;
+  top: 4px;
+  inset-inline-end: 5px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--status-critical);
+  box-shadow: 0 0 0 2px var(--card-2);
+}
+.admin-jump a[hidden] { display: none; }
+.admin-columns[hidden], .admin-section[hidden] { display: none; }
+
+/* A summary-rail item opens its section (main.js's RAIL_TARGETS). */
+.rail-item.is-link { cursor: pointer; }
+.rail-item.is-link:hover { box-shadow: var(--shadow); }
+.rail-item.is-link:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+.admin-last-updated {
+  font-size: 11.5px;
+  color: #94a3b8;
+  white-space: nowrap;
+}
+
+.admin-summary-rail {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+}
+.admin-summary-rail .rail-item {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 12px);
+  border-inline-start: 4px solid var(--status-neutral, var(--muted));
+  padding: 12px 14px;
+}
+.admin-summary-rail .rail-item.good {
+  border-inline-start-color: var(--status-good);
+}
+.admin-summary-rail .rail-item.warn {
+  border-inline-start-color: var(--status-warn);
+  background: var(--status-warn-bg);
+}
+.admin-summary-rail .rail-item.crit {
+  border-inline-start-color: var(--status-critical);
+  background: var(--status-critical-bg);
+}
+.admin-summary-rail .rail-lab {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.admin-summary-rail .rail-val {
+  font-size: 20px;
+  font-weight: 800;
+  color: var(--navy);
+  margin-top: 4px;
+  font-variant-numeric: tabular-nums;
+}
+.admin-summary-rail .rail-item.crit .rail-val { color: var(--status-critical); }
+.admin-summary-rail .rail-item.warn .rail-val { color: #92400e; }
+.admin-summary-rail .rail-sub {
+  font-size: 11.5px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.admin-layout {
+  flex: 1;
+  width: 100%;
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 22px 20px 44px;
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+  min-width: 0;
+}
+
+.admin-columns {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 26px;
+  align-items: start;
+}
+
+.admin-section { min-width: 0; }
+
+.admin-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-block-end: 12px;
+  padding-block-end: 8px;
+  border-block-end: 1px solid var(--border);
+}
+
+.admin-section-head h2 {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--ink);
+  letter-spacing: 0.01em;
+}
+
+.admin-section-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* ── Admin chrome: navy, not the analyst UI's teal ──────────────────── */
+
+.admin-mark {
+  background: var(--navy);
+  color: #fff;
+}
+
+.admin-topbar { border-block-end: 2px solid var(--navy); }
+
+.admin-refresh-all,
+.admin-btn-refresh {
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--ink);
+  border-radius: 8px;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.82rem;
+  padding: 6px 12px;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.admin-btn-refresh {
+  padding: 2px 9px;
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+
+.admin-refresh-all:hover,
+.admin-btn-refresh:hover {
+  background: var(--card-2);
+  border-color: var(--navy-3);
+  color: var(--ink);
+}
+
+.admin-refresh-all:focus-visible,
+.admin-btn-refresh:focus-visible,
+.admin-toggle input:focus-visible {
+  outline: 2px solid var(--navy-3);
+  outline-offset: 2px;
+}
+
+.admin-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.78rem;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+/* ── Deployment checks: a severity stripe, read before any number ───── */
+
+.admin-rail {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 8px;
+}
+
+.admin-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 9px 11px;
+  border-radius: 9px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  /* The stripe is the state. Colour alone would fail a colour-blind
+   * reader, so the label carries the word too. */
+  border-inline-start: 3px solid var(--status-neutral);
+  /* These cards are the only part of this Persian panel whose content is
+     entirely English: scripts/verify_deployment.py writes the check names
+     and details, and what they carry is exception text, SQL, connection
+     URLs and file paths. Laid out RTL, that content is not merely
+     right-aligned -- it is reordered. "Settings.validate()" rendered as
+     "()Settings.validate", and a connection URL broke across lines in the
+     wrong order, which is exactly the shape of output an operator reads
+     character by character to find a typo in.
+
+     LTR for the whole card rather than plaintext per line, because the
+     name, the status pill and the detail are one English sentence and
+     should align as one. */
+  direction: ltr;
+  text-align: left;
+  min-width: 0;
+}
+
+.admin-check.pass { border-inline-start-color: var(--status-good); }
+
+/* The passed checks, folded into one line under the ones that need
+ * reading (renderHealth). Spans the whole grid; opens to the same cards. */
+.admin-checks-passed { grid-column: 1 / -1; }
+/* The cache-age and deep-check notes are lines of the card, not cards: in
+ * the checks grid each took a whole cell and pushed the first card along. */
+.admin-rail > .admin-cache-age { grid-column: 1 / -1; }
+.admin-checks-passed > summary {
+  cursor: pointer;
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--status-good);
+  padding: 6px 0;
+}
+.admin-checks-passed > summary:focus-visible { outline: none; box-shadow: var(--focus-ring); border-radius: 6px; }
+.admin-checks-passed > .admin-rail { margin-top: 6px; }
+.admin-check.fail {
+  border-inline-start-color: var(--status-critical);
+  background: var(--status-critical-bg);
+}
+.admin-check.skip { border-inline-start-color: var(--status-neutral); }
+
+.admin-check-name {
+  font-size: 0.8rem;
+  color: var(--ink);
+  font-weight: 700;
+  line-height: 1.5;
+}
+
+.admin-check-detail {
+  font-size: 0.74rem;
+  color: var(--muted);
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.admin-check-mark {
+  flex: 0 0 auto;
+  font-size: 0.78rem;
+  line-height: 1.6;
+  font-weight: 700;
+}
+.admin-check.pass .admin-check-mark { color: var(--status-good); }
+.admin-check.fail .admin-check-mark { color: var(--status-critical); }
+.admin-check.skip .admin-check-mark { color: var(--status-neutral); }
+
+.admin-rail-summary {
+  grid-column: 1 / -1;
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin: 0 0 2px;
+}
+.admin-rail-summary strong { color: var(--ink); }
+.admin-rail-summary.has-failures strong { color: var(--status-critical); }
+
+/* ── Feedback triage (admin panel phase 4) ─────────────────────────── */
+
+#feedback-body .admin-check {
+  flex-direction: column;
+  align-items: stretch;
+  margin-block-end: 8px;
+}
+#feedback-body .admin-check > span:last-child {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.admin-feedback-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-block-start: 4px;
+}
+.admin-feedback-actions .fb-note {
+  flex: 1 1 220px;
+  font-size: 0.78rem;
+  padding: 5px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--ink);
+}
+
+/* ── Headline figures ───────────────────────────────────────────────── */
+
+.admin-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin-block-end: 16px;
+}
+
+.admin-stat {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  min-width: 0;
+}
+
+.admin-stat-label {
+  display: block;
+  font-size: 0.72rem;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+  margin-block-end: 5px;
+}
+
+.admin-stat-value {
+  display: block;
+  font-size: 1.42rem;
+  font-weight: 700;
+  color: var(--ink);
+  line-height: 1.25;
+  font-variant-numeric: tabular-nums;
+  direction: ltr;
+  text-align: start;
+}
+
+.admin-stat-unit {
+  font-size: 0.72rem;
+  font-weight: 400;
+  color: var(--muted);
+  margin-inline-start: 3px;
+}
+
+.admin-stat-sub {
+  display: block;
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin-block-start: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The one figure whose failure is silent — see this file's header. */
+.admin-stat.is-keystone {
+  border-color: var(--navy-3);
+  box-shadow: inset 0 0 0 1px var(--navy-3);
+}
+.admin-stat.is-keystone .admin-stat-value { color: var(--navy-3); }
+.admin-stat.is-degraded {
+  border-color: var(--status-warn);
+  box-shadow: inset 0 0 0 1px var(--status-warn);
+  background: var(--status-warn-bg);
+}
+.admin-stat.is-degraded .admin-stat-value { color: var(--status-warn); }
+
+/* ── Tables ─────────────────────────────────────────────────────────── */
+
+.admin-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--card);
+}
+
+.admin-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+
+.admin-table th,
+.admin-table td {
+  padding: 8px 11px;
+  text-align: start;
+  border-block-end: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.admin-table thead th {
+  background: var(--card-2);
+  color: var(--muted);
+  font-weight: 700;
+  font-size: 0.74rem;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  position: sticky;
+  top: 0;
+}
+
+.admin-table tbody tr:last-child th,
+.admin-table tbody tr:last-child td { border-block-end: none; }
+
+.admin-table td.num {
+  font-variant-numeric: tabular-nums;
+  direction: ltr;
+  text-align: start;
+}
+
+/* ── Key/value list ─────────────────────────────────────────────────── */
+
+.admin-kv {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--card);
+  overflow: hidden;
+}
+
+.admin-kv dt,
+.admin-kv dd {
+  margin: 0;
+  padding: 7px 12px;
+  font-size: 0.8rem;
+  border-block-end: 1px solid var(--border);
+  /* A value here can be Persian (a maintenance note) or English (a path,
+     an endpoint, a principal id), and the markup cannot know which.
+     `plaintext` takes each value's direction from its own first strong
+     character instead of forcing one on both. */
+  unicode-bidi: plaintext;
+}
+
+.admin-kv dt { color: var(--muted); white-space: nowrap; }
+
+.admin-kv dd {
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.admin-kv dt:nth-last-of-type(1),
+.admin-kv dd:nth-last-of-type(1) { border-block-end: none; }
+
+/* ── Pills, banners, states ─────────────────────────────────────────── */
+
+.admin-status-pill {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 0.71rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.admin-status-pass {
+  background: var(--status-good-bg);
+  color: var(--status-good);
+}
+.admin-status-fail {
+  background: var(--status-critical-bg);
+  color: var(--status-critical);
+}
+.admin-status-skip {
+  background: var(--status-neutral-bg);
+  color: var(--status-neutral);
+}
+
+.admin-mode-pill {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 0.71rem;
+  font-weight: 700;
+  background: var(--status-neutral-bg);
+  color: var(--status-neutral);
+  margin-block-end: 12px;
+  direction: ltr;
+}
+
+/* The opt-in mode attaches verbatim questions to the report. Saying so at
+ * a glance matters: that is the mode whose output must not leave the
+ * server casually. */
+.admin-mode-pill.examples {
+  background: var(--status-warn-bg);
+  color: var(--status-warn);
+}
+
+.admin-banner {
+  border-radius: 10px;
+  padding: 11px 14px;
+  font-size: 0.85rem;
+  line-height: 1.7;
+  border: 1px solid var(--border);
+}
+
+.admin-banner-warn {
+  background: var(--status-warn-bg);
+  color: var(--status-warn);
+  border-color: var(--status-warn);
+}
+
+/* The wrong-address / unreachable-API message (js/diagnosis.js): several
+ * lines, one per line of the message; the .env line stands on its own line. */
+.admin-banner-diagnosis {
+  background: var(--status-critical-bg);
+  color: var(--status-critical);
+  border-color: var(--status-critical);
+  white-space: pre-line;
+}
+
+.admin-loading {
+  color: var(--muted);
+  font-size: 0.82rem;
+  margin: 0;
+  padding: 10px 0;
+}
+
+/* 2026 warehouse-load audit: the age of a server-cached expensive-card
+   result (health checks, schema drift) -- see main.js's formatCacheAge. */
+.admin-cache-age {
+  color: var(--muted);
+  font-size: 0.76rem;
+  margin: 0 0 8px;
+}
+
+.admin-inline-label {
+  font-size: 0.76rem;
+  color: var(--muted);
+}
+
+.admin-select {
+  font: inherit;
+  font-size: 0.8rem;
+  padding: 3px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--ink);
+}
+
+.admin-section-title {
+  font-size: 0.78rem;
+  color: var(--muted);
+  font-weight: 700;
+  margin: 16px 0 8px;
+  letter-spacing: 0.02em;
+}
+
+.admin-foot { border-block-start: 1px solid var(--border); }
+
+@media (max-width: 640px) {
+  .admin-layout { padding: 16px 13px 32px; gap: 20px; }
+  .admin-stat-value { font-size: 1.2rem; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .admin-refresh-all,
+  .admin-btn-refresh { transition: none; }
+}
+
+/* ── Admin panel phase 7: keys and roles ────────────────────────────
+ *
+ * Two things carry visual weight here, and deliberately only two: the
+ * one-time raw-key reveal, and the revoke button. Everything else in this
+ * card is an ordinary table, because everything else in this card is
+ * reversible.
+ *
+ * Status colours come from style.css's --status-* tokens rather than the
+ * brand ones, for the reason that file states: brand colour means "our
+ * chrome", status colour means "a fact about the system right now". A
+ * revoke button is the second kind. */
+
+.key-role {
+  display: inline-block;
+  /* Role names and principal ids are identifiers, not prose. `isolate`
+     keeps each one a self-contained LTR run so a hyphenated id like
+     "ops-1" cannot be reordered by the surrounding RTL paragraph -- the
+     same treatment style.css already gives numbers via `.num`. */
+  direction: ltr;
+  unicode-bidi: isolate;
+  margin-inline-start: 0.4rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  color: var(--muted);
+  background: var(--status-neutral-bg);
+  border: 1px solid var(--border);
+}
+
+#keys-body code {
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+
+/* Cells in this table mix languages per row: a principal id and ".env"
+   are LTR, a name and "بدون محدودیت" are RTL. `plaintext` lets each cell
+   take its direction from its own content.
+
+   ".env" is the reason this is not optional. Its leading dot is a neutral
+   character, so under an RTL paragraph it reorders to the END and the
+   cell reads "env." -- a filename, displayed wrong, in the column that
+   tells an operator where a key came from. */
+#keys-body td {
+  unicode-bidi: plaintext;
+}
+
+.key-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.key-actions button {
+  font: inherit;
+  font-size: 0.78rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 6px;
+  cursor: pointer;
+  background: var(--card-2);
+  border: 1px solid var(--border);
+  color: var(--ink);
+}
+
+.key-actions button:hover:not(:disabled) {
+  border-color: var(--navy-3);
+}
+
+.key-actions button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* The only irreversible control on this page. It does not merely need to
+ * differ from its neighbours -- it has to be distinguishable at a glance
+ * from "غیرفعال کردن", which sits directly beside it and means something
+ * recoverable. */
+.key-actions button.key-danger,
+/* ADR-004 part 1: the "Deny" button in the access-request queue (§sec-
+   access-requests) reuses this same critical styling -- it is not the
+   irreversible key-revoke action above, but it is still the one control
+   in that row that closes a request out with a negative outcome, and
+   should read distinctly from "تأیید" beside it the same way. */
+.admin-feedback-actions button.key-danger {
+  border-color: var(--status-critical);
+  color: var(--status-critical);
+}
+
+.key-actions button.key-danger:hover:not(:disabled),
+.admin-feedback-actions button.key-danger:hover:not(:disabled) {
+  background: var(--status-critical);
+  color: #fff;
+}
+
+/* The reveal. Sized and coloured to stop the reader, because the value
+ * inside it is the only copy that will ever exist -- the same reasoning
+ * as scripts/issue_api_key.py's framed block, against the same failure. */
+.keys-reveal {
+  margin: 0 0 1rem;
+  padding: 1rem 1.1rem;
+  border: 2px solid var(--status-warn);
+  border-radius: 10px;
+  background: var(--status-warn-bg);
+  color: var(--ink);
+}
+
+.keys-reveal h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+
+.keys-reveal p {
+  margin: 0.4rem 0;
+  font-size: 0.85rem;
+  line-height: 1.7;
+}
+
+.keys-reveal-value {
+  display: block;
+  margin: 0.7rem 0;
+  padding: 0.7rem 0.9rem;
+  border-radius: 8px;
+  background: var(--sql-bg);
+  color: var(--sql-text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 1rem;
+  letter-spacing: 0.02em;
+  word-break: break-all;
+  /* One click selects the whole key. Partial selection of a 43-character
+   * token is a silent way to copy something that will never authenticate. */
+  user-select: all;
+}
+
+.keys-reveal-warn {
+  border-inline-start: 3px solid var(--status-critical);
+  padding-inline-start: 0.7rem;
+}
+
+.keys-reveal button {
+  font: inherit;
+  font-size: 0.8rem;
+  margin-top: 0.5rem;
+  padding: 0.3rem 0.8rem;
+  border-radius: 6px;
+  cursor: pointer;
+  background: var(--card);
+  border: 1px solid var(--border);
+  color: var(--ink);
+}

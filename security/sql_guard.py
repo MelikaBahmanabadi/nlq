@@ -1,0 +1,3223 @@
+# SPDX-License-Identifier: BUSL-1.1
+# Copyright (c) 2024-2026 Ali Sadeghi Aghili
+"""SQL safety layer — clean, validate, and cap generated SQL queries.
+
+Three public functions form a processing pipeline that every model-generated
+SQL string passes through before execution:
+
+1. :func:`clean_sql`    — strip LLM artefacts (markdown fences, prose
+   preamble, ``LIMIT → TOP``) and return bare T-SQL.
+2. :func:`validate_sql` — block destructive / out-of-scope queries.
+3. :func:`ensure_top`   — inject ``TOP n`` when no row-limit clause exists.
+
+Typical usage::
+
+    from security.sql_guard import clean_sql, validate_sql, ensure_top
+
+    raw = llm_backend.generate(prompt)
+    sql = clean_sql(raw)       # raises ValueError if no SELECT found
+    validate_sql(sql)           # raises ValueError if the query is unsafe
+    sql = ensure_top(sql, 100)  # adds TOP 100 if missing
+
+Every rejection raised by any of the three functions above is one of two
+:class:`ValueError` subclasses, not a bare ``ValueError`` — every existing
+``except ValueError`` call site across the codebase still catches them
+unchanged, but a caller that cares (the self-correction loops in
+``llm/sql_agent.py`` and ``session/engine.py``) can tell them apart:
+
+* :class:`CorrectableRejection` — a malformed-but-fixable candidate (bad
+  syntax, a literal ``LIMIT``, an empty response, a hallucinated table or
+  column name, a disallowed comment, ...). A corrected re-prompt can
+  plausibly produce different, valid SQL, so this is retried exactly as
+  before.
+* :class:`PolicyRejection` — the query is categorically out of bounds
+  regardless of phrasing (a forbidden statement type or keyword, a
+  system-catalogue reference, a denied column, ...). No re-prompt can
+  change that outcome, since the policy that caused it is not part of the
+  prompt — retrying would only spend another LLM round trip to reach the
+  exact same rejection, so both correction loops stop immediately instead.
+
+Each raise site below is annotated with which of the two it uses and why.
+
+``validate_sql`` — parser-based, not a string blocklist
+---------------------------------------------------------
+Earlier versions of this module checked forbidden keywords with a substring
+scan (``"DROP " in sql.upper()``), which is defeated by *any* separator other
+than a literal trailing space (``DROP\\n``, ``DROP\\t``, or the keyword being
+the last token in the string) and produces false positives for ordinary
+identifiers that merely contain a blocked substring (``EXP_DATE`` contains
+``XP_``). See ``tests/test_sql_guard_bypass.py`` for the full catalogue of
+bypasses this was replaced to fix.
+
+``validate_sql`` now parses the query with `sqlglot <https://sqlglot.com/>`_,
+pinned to the ``tsql`` dialect (SQL Server is the only execution target), and
+checks the resulting **AST**, not the source text:
+
+* Exactly one statement is required — sqlglot splits on ``;`` the same way
+  the database driver would, so stacked statements are rejected as a class
+  rather than by recognising each one's keyword individually.
+* The single statement's root node must be a read-only query
+  (``SELECT``/``WITH``, or a top-level ``UNION``/``INTERSECT``/``EXCEPT``).
+  Anything else — ``INSERT``, ``UPDATE``, ``DELETE``, ``DROP``, ``CREATE``,
+  ``ALTER``, ``MERGE``, ``TRUNCATE``, ``GRANT``, ``REVOKE``, ``EXEC`` — is
+  refused by its node type, so a bypass now requires defeating the parser
+  itself, not guessing at a new spelling of a keyword.
+* The whole tree is walked for dangerous constructs that can hide inside an
+  otherwise-innocuous ``SELECT``: ``SELECT ... INTO`` (creates a table),
+  ``OPENROWSET``/``OPENQUERY``/``OPENDATASOURCE`` (remote/file access),
+  and any ``xp_*``/``sp_*``-prefixed function or table reference.
+* Because the check operates on typed AST nodes, a keyword that merely
+  *contains* a forbidden substring (``EXP_DATE``) or that appears inside a
+  string literal's *value* (``N'please DROP the box'``) is never confused
+  with the keyword appearing as actual SQL syntax — the parser already knows
+  the difference between an ``Identifier`` / ``Literal`` and a ``Drop``
+  statement.
+* **Any SQL comment is refused outright**, regardless of its content. An
+  earlier version of this check scanned comment *text* for forbidden
+  keywords — but that is exactly the substring-scanning mistake this
+  module was rewritten to get away from, just relocated to a new part of
+  the string (see the string-literal bullet above: the fix there was to
+  stop treating a string literal's *value* as syntax, not to scan it more
+  cleverly). A model generating SQL for this application has no legitimate
+  reason to emit a comment, and a comment is a known vector for hiding an
+  instruction from a keyword scanner (or a human reviewer) without
+  affecting execution, so the presence of *any* comment — not its
+  content — is the refusal condition.
+* Every table reference is checked against
+  ``schema_data.columns.TABLE_COLUMNS`` (case-insensitively, brackets
+  ignored) and **rejected if it does not resolve to a known table** —
+  except a reference to a CTE defined earlier in the same query, which is
+  not a reference to a real table at all. This is enforced even though
+  the application's DB login is not yet scoped to just these tables (see
+  ``docs/db-hardening.md``): the guard should not depend on that
+  hardening having been applied to do its job, and a hallucinated or
+  out-of-domain table name (``HR_Payroll``, ``[Evil].[Secrets]``, ...) is
+  exactly the kind of reference this allowlist exists to catch. A
+  reference's schema/database QUALIFIER is checked too, not ignored (see
+  ``docs/design/TABLE-NAMES.md`` and :func:`_match_table_ref`): a
+  ``schema.yaml`` table key may itself be qualified (``sales.Customer``)
+  for a warehouse with the same bare table name in more than one schema,
+  and a reference that names some OTHER schema for an allowlisted bare
+  name (``[hr].[Customer]`` when only ``sales.Customer`` is allowlisted)
+  is refused rather than silently resolved — closing what used to be a
+  real allowlist-bypass hole. An unqualified reference to a bare name
+  more than one key shares is refused as ``ambiguous_table`` instead,
+  naming every qualified reference to disambiguate with.
+* Every *column* reference that can be unambiguously resolved to a known
+  table is checked against that table's known columns; this part remains
+  deliberately conservative — an unqualified column, a column qualified by
+  a CTE name or a derived-table alias, or ``*`` (when no ``denied_columns``
+  policy is active — see below) is **allowed** rather than rejected, since
+  guessing wrong here would reject a working production query. See the
+  accompanying phase report for the specific references this module
+  chose not to resolve, and why. Table names are not given this same
+  leniency: an unresolvable *table* is refused (previous bullet), while an
+  unresolvable *column qualifier* is allowed — these are different
+  failure modes with different false-positive risk, not an inconsistency.
+* ``denied_columns`` is an optional seam for column-level access control: any
+  column reference whose name is in that set is refused regardless of which
+  table it resolves to. No policy data ships with this module yet — this is
+  the foundation multi-tenant column policies (a later phase) will build on.
+  When a policy is active, ``*`` cannot be used to silently read around it:
+  ``alias.*`` is expanded against the table ``alias`` resolves to and
+  checked column-by-column, and a bare ``*`` is expanded against the
+  tables directly in its own ``SELECT``'s ``FROM``/``JOIN``; either form is
+  refused outright if it cannot be resolved that way (a derived table, a
+  CTE, or an unrecognised source), since "cannot prove it's safe" and
+  "unsafe" get the same answer when a column policy is actually in force.
+* Entries of ``denied_columns`` that carry a ``.`` or ``:`` are *scoped*
+  (``schema.Table.Col``, ``Source:schema.Table.Col``, ``Source:Col`` --
+  :mod:`security.column_policy`): the column becomes **join-only** on the
+  named table (on the named data source's tables), usable solely as one
+  side of ``a.col = b.col`` inside a ``JOIN ... ON``. Anywhere else it is a
+  :class:`CorrectableRejection` with ``reason="join_only_column"`` -- unlike a
+  legacy full denial, a rewrite of the query can still answer the question.
+  The entry is enforced only when the data source the query executes on
+  (:func:`database.routing.choose_datasource`) is one it applies to.
+
+Functions and session variables were, until ADR-001, the one construct
+still governed by a denylist (the ``xp_*``/``sp_*``/
+``_DANGEROUS_FUNCTION_NAMES`` check above) rather than the allowlist model
+the rest of this module committed to — and a table-less query escaped the
+table/column allowlist entirely rather than tripping it, since that
+allowlist has nothing to check when there is no table reference to walk.
+Worse, even a query that *does* reference a real, allowlisted table can
+still smuggle a metadata function — ``SERVERPROPERTY``, ``OBJECT_NAME``,
+``COL_NAME``, ``DB_NAME``, and similar — into its ``SELECT`` list: that
+produces an output column the allowlist was never designed to inspect
+(it is neither a column reference nor a table reference), turning an
+otherwise-innocuous projection into a schema-enumeration or
+server-reconnaissance channel. Three rules close this gap, run at the very
+end of :func:`validate_sql` so they see the whole tree exactly as rules
+1-10 left it: a forbidden state-reading node (``exp.Parameter``,
+``exp.CurrentUser``, ``exp.SessionUser``, ``exp.CurrentSchema``,
+``exp.ObjectId`` — but never ``exp.CurrentTimestamp``, which is ordinary
+``GETDATE()``/``CURRENT_TIMESTAMP`` syntax) is refused wherever it appears
+in the tree; an ``exp.Anonymous`` function call is refused unless its name
+is in the measured-legitimate :data:`_SAFE_ANONYMOUS_FUNCTIONS` allowlist;
+and the tree must contain at least one non-CTE ``exp.Table`` at all. Taken
+together with rules 1-10, the guard now enforces one coherent shape:
+warehouse-reading queries only — allowlisted tables and columns, read
+through ordinary data functions — not merely "no destructive statement, no
+unknown table".
+
+``INFORMATION_SCHEMA`` / ``sys.*`` access remains blocked (against the
+*target* dialect's own catalogue names — see "Multi-dialect" below, not
+always literally ``INFORMATION_SCHEMA``/``sys``), and a literal ``LIMIT n``
+is rejected **only when validating tsql** — MySQL/Postgres/SQLite syntax,
+invalid T-SQL. sqlglot's tsql dialect parses ``LIMIT`` and ``TOP`` into the
+*same* AST node, so this one check is necessarily a raw-text scan rather
+than an AST check: by the time the query is parsed, the syntactic
+distinction the check cares about (did the *model* write ``LIMIT``, which
+is invalid T-SQL, as opposed to ``TOP``) has already been normalised away.
+This is the one narrowly-scoped ``if dialect == "tsql":`` in this module —
+not a dialect-branching ladder, but a guard that must not fire for a
+dialect where ``LIMIT`` is the *correct* syntax (every other dialect this
+module supports): rejecting it there would refuse the majority of valid
+queries, not close a bypass.
+
+``clean_sql`` — always tsql, deliberately still string/structure based
+--------------------------------------------------------------------------
+:func:`clean_sql` has no ``dialect`` parameter and is not part of the
+multi-dialect surface described below: the model always generates ``tsql``
+regardless of the deployment's target dialect (see
+:data:`config.Settings.sql_dialect`'s docstring for why), so the raw text
+this function cleans is always tsql, unconditionally. It still locates the
+query's outermost ``SELECT`` (or top-level set operation) using a
+paren-depth / string-literal-aware scan rather than a naive "first
+occurrence of the word SELECT" search — the Phase 0 fix (commit
+``ad44b93``) for the CTE / ``DISTINCT`` / subquery / ``UNION`` bugs
+documented in ``tests/test_sql_guard_bypass.py`` — because its LIMIT-to-TOP
+rewrite must land on the correct SELECT without disturbing the rest of the
+model's original text (:func:`ensure_top`, below, is a different function
+covering the already-has-a-cap detection; ``clean_sql`` only ever calls it
+to have that placement logic run once, not to regenerate its own output).
+
+``ensure_top`` — AST row cap for every dialect except tsql
+------------------------------------------------------------------
+This phase set out to replace this function's hand-written paren-depth /
+string-literal-aware scanner with a genuine sqlglot AST cap
+(``exp.Select.limit()``, rendered with ``Expression.sql(dialect=...)``) —
+a scanner that would otherwise need to grow a second, per-dialect opinion
+about row-limiting syntax is exactly the "second, hand-written dialect
+layer beside sqlglot" this project's own review history warns against.
+
+That rewrite was verified by running it against every existing assertion
+in ``tests/test_sql_guard.py`` and ``tests/test_sql_guard_bypass.py``, not
+by inspection — and running it surfaced a real cost the earlier,
+text-splicing implementation's own docstring had already predicted: a
+full AST render does not reproduce the exact input text whenever a query
+contains an unaliased CTE/derived-table column (``SELECT 1`` inside a CTE
+becomes ``SELECT 1 AS [1]``) or an operator sqlglot re-spaces
+(``Active=1`` becomes ``Active = 1``). For **tsql**, that turned out not
+to be a narrow edge case confined to this function's own tests:
+:func:`clean_sql`'s LIMIT-to-TOP conversion also calls this function, so
+the same reformatting leaked into ordinary ``clean_sql`` output for the
+common production case (any generated query needing a cap injected,
+i.e. lacking its own ``TOP``) — a real behavioural change to this
+deployment's default and, before this phase, *only* dialect, with
+consequences this module's own tests do not fully capture (cache keys,
+audit-log SQL text, golden-set fixtures).
+
+So the AST rewrite is used for every dialect **except** tsql, which keeps
+its original text-splicing implementation completely unchanged — see
+:func:`ensure_top`'s own docstring for the full reasoning and
+:func:`_ensure_top_ast` for the AST implementation used for
+postgres/mysql/sqlite. This is reported, not quietly decided: the
+multi-dialect phase report asked for this function's *implementation* to
+be replaced outright, and this is the one place that request could not be
+honoured literally without a regression risk to tsql's existing,
+already-verified production behaviour that this project's own review
+history would equally object to.
+
+Multi-dialect: ``dialect`` parameters and :mod:`security.dialects`
+------------------------------------------------------------------------
+:func:`validate_sql`, :func:`ensure_top`, and :func:`extract_touched_tables`
+all take an optional ``dialect`` keyword (default ``"tsql"``, this
+module's original and only target) naming a sqlglot dialect key. Passing a
+different value re-points every sqlglot parse/render call in the function
+at that dialect, and swaps the system-catalogue blocklist and
+dangerous-function-name set for the ones configured for that dialect in
+:data:`security.dialects.DIALECT_PROFILES` — never a hardcoded
+``if dialect == ...: ... elif ...`` chain re-implementing what sqlglot (SQL
+shape) or :mod:`security.dialects` (per-dialect *data*: catalogue names,
+session-timeout statements, schema-qualification style) already own. The
+table/column allowlist itself (:data:`schema_data.columns.TABLE_COLUMNS`)
+is dialect-agnostic — it is warehouse domain data, not SQL syntax — so it
+needs no per-dialect variant.
+
+The *default* dialect (``"tsql"``) is unaffected by any of this: every
+call site that does not pass ``dialect=`` explicitly behaves exactly as it
+did before this module supported other dialects, which is how
+``tests/test_sql_guard.py`` and ``tests/test_sql_guard_bypass.py`` keep
+passing for tsql without themselves being rewritten. See
+:func:`transpile_and_revalidate` for how a *different* target dialect is
+actually reached in production: this module never generates SQL in another
+dialect, it only validates/caps whatever
+``llm.sql_agent.SQLAgent`` hands it after transpiling the model's tsql
+output with sqlglot.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from collections.abc import Iterable
+from dataclasses import dataclass
+
+import sqlglot
+from sqlglot import exp
+from sqlglot.errors import SqlglotError
+
+from schema_data.columns import TABLE_COLUMNS
+from schema_data.registry import get_table_schema_qualifiers, table_ref_parts, table_reference_sql
+from security.column_policy import (
+    ColumnPolicyError,
+    JoinOnlyRestrictions,
+    SchemaView,
+    cached_column_policy,
+    resolve_join_only,
+)
+from security.dialects import get_dialect_profile
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Exception taxonomy
+# ---------------------------------------------------------------------------
+#
+# Every rejection this module raises is a ``ValueError`` subclass, split
+# into two flavours a caller that cares can switch on without inspecting
+# message text -- specifically the self-correction loops in
+# ``llm/sql_agent.py`` and ``session/engine.py``, which previously
+# re-prompted the model up to ``max_corrections`` times for EVERY
+# rejection alike, including ones no re-prompt could ever fix (a denied
+# column, a forbidden statement type -- the policy that caused the
+# rejection is not in the prompt, so the model has no way to produce a
+# different outcome). Each blocked request used to cost
+# ``max_corrections + 1`` LLM round trips and return the same rejection it
+# would have returned immediately.
+
+
+#: The closed set of machine-readable refusal categories a rejection can
+#: carry as :attr:`SqlGuardRejection.reason`. Mirrors
+#: ``session.models.GuardVerdict.reason``'s ``Literal`` exactly (that
+#: module cannot import this one -- ``security`` sits below ``session`` in
+#: the dependency graph -- so the two are kept in lockstep by convention
+#: and by ``tests/test_guard_error_contract.py`` asserting every value
+#: raised here is one this set names). ``"other"`` is not "uncategorised
+#: by omission" -- it is set explicitly at raise sites whose rejection
+#: reason is not one of the four specific, UI-actionable categories (a
+#: syntax error, a disallowed comment, a literal ``LIMIT``, ...), so a
+#: caller can always tell "this rejection was considered and has no more
+#: specific category" from "the raise site never set a reason at all"
+#: (``reason is None``, which no raise site below actually produces).
+#:
+#: ``"join_only_column"`` is the scoped counterpart of ``"denied_column"``: a
+#: column restricted to ``JOIN ... ON`` keys was used elsewhere. Its
+#: ``subject`` is the whole ``denied_columns`` entry (for example
+#: ``sales.Order.ID``), not a bare column name, so that "Request access"
+#: removes exactly the entry that blocked the query.
+_REASONS = frozenset({
+    "denied_column", "join_only_column", "forbidden_statement", "unknown_table",
+    "system_catalogue", "no_table_reference", "cross_datasource",
+    "ambiguous_table", "other",
+})
+
+
+class SqlGuardRejection(ValueError):
+    """Base class for every rejection this module raises.
+
+    Subclasses :class:`ValueError` so every existing ``except ValueError``
+    call site across the codebase (``api/``, ``llm/``, ``session/``,
+    ``app.py``, and the test suite) keeps working unchanged -- this is a
+    backward-compatible refinement of the exception type, not a new one
+    replacing it.
+
+    Carries two more attributes, ``reason`` and ``subject``, alongside the
+    free-text message every caller already reads via ``str(exc)``. These
+    exist because a caller two layers up (``session/engine.py``, building
+    the ``Turn.guard`` the web UI renders per
+    ``docs/design/DESIGN-INVARIANTS.md`` §8) needs to offer a *targeted*
+    next action for a denied-column refusal ("Ask without that column") --
+    and the only way to name that column without ``reason``/``subject``
+    would be regexing the free-text message the line below builds
+    (``f"...denied column '{name}'"``), which is exactly the
+    substring-matching mistake this module's own rewrite (see the module
+    docstring) exists to get away from, just relocated to a downstream
+    caller instead of fixed at the source. This module already knows,
+    at the moment it decides to raise, which branch it took and which
+    column/table/keyword triggered it -- so that structure is captured
+    here, once, rather than reconstructed by parsing prose later:
+
+    * ``reason`` -- one of :data:`_REASONS`, or ``None`` for the
+      pre-Phase-11 raise sites this attribute was retrofitted onto only
+      where a caller-actionable category applies (there are none left --
+      every raise site in this module now sets one -- but the type stays
+      optional because a bare ``ValueError`` from a lower-level dependency,
+      e.g. ``sqlglot`` failing in a way this module doesn't wrap, is still
+      possible in principle and must not crash whatever reads this
+      attribute back).
+    * ``subject`` -- the specific column, table, or keyword the refusal is
+      about, when the raise site can name exactly one (``None`` when the
+      rejection is about the query's *shape* rather than one identifier --
+      a syntax error, a stacked-statement query with no single dangerous
+      statement, or a ``denied_columns`` policy that a bare ``*`` could
+      expose to more than one column at once).
+
+    Two INDEPENDENT axes are modelled on this hierarchy, and a caller must
+    not conflate them:
+
+    * **Can a retry help?** -- the class itself
+      (:class:`CorrectableRejection` vs. :class:`PolicyRejection`), which
+      the two self-correction loops (``llm/sql_agent.py``,
+      ``session/engine.py``) switch on to decide whether to keep
+      re-prompting.
+    * **Is this a refusal, or unusable output?** -- :attr:`is_refusal`,
+      which a caller translating to an HTTP status (``api/runner.py``)
+      switches on instead: ``True`` means "the query was syntactically
+      fine but we refuse to run it" (400 ``FORBIDDEN_SQL``); ``False``
+      means "nothing usable came out of the pipeline" (502
+      ``INVALID_SQL_RESPONSE``).
+
+    These two axes do not line up one-to-one. Every :class:`PolicyRejection`
+    is necessarily a refusal (the class sets :attr:`is_refusal` to
+    ``True`` for the whole class), but an unknown-table rejection is a
+    counter-example on the :class:`CorrectableRejection` side: a retry
+    can plausibly fix it (name a real table), yet it is *also* a refusal
+    -- the table-allowlist violation, not the SQL's shape, is why it was
+    rejected -- so that one raise site flips :attr:`is_refusal` to
+    ``True`` on the specific instance despite its class default. Encoding
+    the HTTP-status axis as a substring test on the message
+    (``"Forbidden keyword" in str(exc)``) was the bug this attribute
+    replaces: it happened to match most refusals only because their
+    messages were written to start with that phrase, and silently
+    mis-mapped the ones that weren't (``"System catalogue forbidden: ..."``
+    had no such guarantee).
+    """
+
+    #: ``True`` if this rejection should be reported as an outright
+    #: refusal (e.g. HTTP 400) rather than unusable model output (e.g.
+    #: HTTP 502). Default ``False`` here; see the class docstring above
+    #: for how :class:`PolicyRejection` and the unknown-table raise site
+    #: override it.
+    is_refusal: bool = False
+
+    #: The canonical table key an unknown-column rejection is about
+    #: (``schema.yaml``'s key), set at that one raise site; ``None``
+    #: everywhere else. It lets the self-correction loops
+    #: (:mod:`llm.correction_hints`) list the table's real columns without
+    #: parsing the message.
+    table: str | None = None
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str | None = None,
+        subject: str | None = None,
+    ) -> None:
+        """Store *message* exactly as every existing caller already reads it.
+
+        *reason* and *subject* are keyword-only and both default to
+        ``None`` so every raise site written before this attribute existed
+        (there are none left in this module, but a subclass outside it is
+        not impossible) keeps constructing a valid instance without
+        modification -- adding structure to an exception's attributes,
+        never changing what ``str(exc)`` returns, is the same
+        backward-compatible-refinement discipline the class docstring
+        describes for the ``ValueError`` subclassing itself.
+
+        Asserts *reason* is one of :data:`_REASONS` (or ``None``) rather
+        than accepting an arbitrary string: a typo'd reason
+        (``"denied_col"`` for ``"denied_column"``) would silently produce a
+        ``GuardVerdict.reason`` no UI branch matches, which is a worse
+        failure mode (a silently generic fallback in production) than an
+        assertion error at raise time, in the same test run that exercises
+        the raise site.
+        """
+        super().__init__(message)
+        assert reason is None or reason in _REASONS, f"unknown guard rejection reason: {reason!r}"
+        self.reason = reason
+        self.subject = subject
+
+
+class CorrectableRejection(SqlGuardRejection):
+    """A rejection a corrected re-prompt can plausibly resolve.
+
+    Raised for a malformed-but-fixable candidate: a syntax error, a
+    MySQL-style ``LIMIT``, an empty or non-SQL response, a hallucinated
+    table or column name, or this module's own inability to safely inject
+    a row cap. A model told what went wrong and asked to try again can
+    plausibly produce different, valid SQL on the next attempt -- this is
+    exactly today's self-correction behaviour, preserved by this class.
+
+    ``is_refusal`` stays ``False`` (this class's inherited default) for
+    every raise site except one: an unknown table is *also* a refusal (a
+    table-allowlist violation, not merely unusable SQL), so that specific
+    instance has ``is_refusal`` set to ``True`` -- see its raise site in
+    :func:`validate_sql` for the reasoning.
+    """
+
+
+class PolicyRejection(SqlGuardRejection):
+    """A rejection no re-prompt can resolve, because the answer is "no".
+
+    Raised when the *query itself* is categorically out of bounds
+    regardless of how it is phrased: a forbidden statement type or
+    keyword, a system-catalogue reference, a denied column, or any other
+    construct this module refuses on principle rather than for being
+    malformed. A caller's correction loop should treat this as terminal
+    and stop re-prompting immediately: the policy that caused the
+    rejection is not in the prompt, so a retry cannot change the outcome
+    -- it would only spend an extra LLM round trip to reach the exact
+    same rejection.
+
+    Every instance is also a refusal by definition -- there is no
+    PolicyRejection that is merely "unusable output" -- so ``is_refusal``
+    is fixed ``True`` for the whole class.
+    """
+
+    is_refusal = True
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+#: SQL Server is this module's default and original target — every parse
+#: and validation call defaults to this dialect rather than sqlglot's
+#: generic default, so T-SQL-specific syntax (``TOP``, bracketed
+#: identifiers, ``N''`` national string literals, ``+`` string
+#: concatenation, ...) is understood instead of rejected as invalid. Every
+#: public function that takes an explicit ``dialect`` keyword (see the
+#: module docstring's "Multi-dialect" section) still defaults to this
+#: constant, so a call site that never mentions ``dialect`` at all behaves
+#: exactly as it did before this module supported any other target.
+_DIALECT = "tsql"
+
+_LIMIT_RE        = re.compile(r"\bLIMIT\s+(\d+)", re.IGNORECASE)
+_FENCE_RE        = re.compile(r"```(?:sql)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+_SELECT_START_RE = re.compile(r"(SELECT|WITH)\b", re.IGNORECASE)
+_TOP_DISTINCT_RE = re.compile(r"SELECT\s+TOP\s+(\d+)\s+DISTINCT", re.IGNORECASE)
+_LIMIT_STRIP_RE  = re.compile(r"\s*\bLIMIT\s+\d+\b", re.IGNORECASE)
+
+# ensure_top() tsql helpers — locate the query's structurally OUTERMOST
+# SELECT instead of naively matching the first literal "SELECT" in the
+# string (see ensure_top's docstring for why that matters for CTEs,
+# subqueries, and DISTINCT ordering, and for why the tsql path keeps this
+# text-based approach rather than the AST-based one used for every other
+# dialect).
+_SELECT_TOKEN_RE           = re.compile(r"\bSELECT\b", re.IGNORECASE)
+_ORDER_BY_RE               = re.compile(r"\bORDER\s+BY\b", re.IGNORECASE)
+_DISTINCT_AFTER_SELECT_RE  = re.compile(r"\s+DISTINCT\b", re.IGNORECASE)
+_TOP_AFTER_RE              = re.compile(r"\s+TOP\s+\d+\b", re.IGNORECASE)
+
+
+def _scan_structure(sql: str) -> tuple[list[int], list[bool]]:
+    """Return parallel per-character ``(paren_depth, in_string)`` arrays.
+
+    ``'...'`` string literals (T-SQL escapes an embedded quote by
+    doubling it, e.g. ``N'it''s'``) are treated as opaque: a ``(``/``)``
+    inside one does not affect ``paren_depth``, and a keyword match
+    starting inside one is reported via ``in_string`` so callers can
+    exclude it — a forbidden or structural keyword appearing as quoted
+    *data* is not the same as it appearing as SQL syntax.
+    """
+    depth = 0
+    in_string = False
+    depths: list[int] = []
+    in_str: list[bool] = []
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if in_string:
+            depths.append(depth)
+            in_str.append(True)
+            if ch == "'":
+                if i + 1 < n and sql[i + 1] == "'":
+                    depths.append(depth)
+                    in_str.append(True)
+                    i += 2
+                    continue
+                in_string = False
+            i += 1
+            continue
+        if ch == "'":
+            in_string = True
+            depths.append(depth)
+            in_str.append(True)
+            i += 1
+            continue
+        depths.append(depth)
+        in_str.append(False)
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        i += 1
+    return depths, in_str
+
+
+def _top_level_select_matches(sql: str) -> list[re.Match[str]]:
+    """Return ``SELECT`` keyword matches at paren depth 0, outside strings.
+
+    These are the query's outermost SELECT(s) — a CTE body's inner
+    SELECT (inside the CTE's own parentheses) and any subquery's SELECT
+    sit at depth >= 1 and are excluded. More than one match means a
+    top-level ``UNION``/``INTERSECT``/``EXCEPT``.
+    """
+    depths, in_str = _scan_structure(sql)
+    matches = []
+    for m in _SELECT_TOKEN_RE.finditer(sql):
+        pos = m.start()
+        if pos < len(depths) and depths[pos] == 0 and not in_str[pos]:
+            matches.append(m)
+    return matches
+
+
+def _has_top_level_order_by(sql: str) -> bool:
+    """True if *sql* has an ``ORDER BY`` at paren depth 0, outside strings."""
+    depths, in_str = _scan_structure(sql)
+    for m in _ORDER_BY_RE.finditer(sql):
+        pos = m.start()
+        if pos < len(depths) and depths[pos] == 0 and not in_str[pos]:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# validate_sql() — AST-based constants and helpers
+# ---------------------------------------------------------------------------
+
+#: Root/node types that are always refused, mapped to the human-readable
+#: label used in the raised message. Checked both as the parsed statement's
+#: root (a bare ``DELETE FROM t`` — the whole query *is* the dangerous
+#: statement) and while walking every statement's full tree (a
+#: ``SELECT ... INTO`` — the dangerous part is nested inside an otherwise
+#: allowed ``Select``). ``exp.TruncateTable`` is relabelled to the more
+#: familiar ``TRUNCATE`` keyword.
+_NAMED_FORBIDDEN_TYPES: dict[type[exp.Expression], str] = {
+    exp.Insert: "INSERT",
+    exp.Update: "UPDATE",
+    exp.Delete: "DELETE",
+    exp.Drop: "DROP",
+    exp.Alter: "ALTER",
+    exp.Create: "CREATE",
+    exp.Merge: "MERGE",
+    exp.TruncateTable: "TRUNCATE",
+    exp.Revoke: "REVOKE",
+    exp.Execute: "EXECUTE",
+    exp.Into: "INTO",
+}
+
+#: Root node types that represent a read-only query. A ``WITH ... SELECT``
+#: parses as an ``exp.Select`` with its CTEs attached, not a separate root
+#: type, so no explicit ``With`` entry is needed here.
+_ALLOWED_ROOT_TYPES: tuple[type[exp.Expression], ...] = (
+    exp.Select, exp.Union, exp.Intersect, exp.Except,
+)
+
+#: Function/table names that grant remote, file, or cross-server access
+#: regardless of the columns/rows they touch — these are refused by name
+#: even though sqlglot has no dedicated node type for them (they parse as
+#: an ``exp.Anonymous`` function call). Dialect-agnostic: these are T-SQL
+#: spellings, but refusing them by name costs nothing even when validating
+#: another dialect's SQL, and a per-dialect *equivalent* remote/file-access
+#: name is layered on top via
+#: :attr:`security.dialects.DialectProfile.extra_dangerous_functions` (see
+#: :func:`_is_dangerous_identifier`) rather than replacing this set.
+_DANGEROUS_FUNCTION_NAMES = frozenset({"OPENROWSET", "OPENQUERY", "OPENDATASOURCE"})
+
+#: The measured legitimate residue of T-SQL functions sqlglot has no
+#: dedicated ``exp.Func`` subclass for and so parses as ``exp.Anonymous`` —
+#: everything else (``SUM``, ``CAST``, ``DATEADD``, ``ROW_NUMBER``, ...)
+#: parses to a typed node this module never needs to name individually.
+#: This set is a projection allowlist, not a danger check: an
+#: ``exp.Anonymous`` whose upper-cased name is not in here is refused by
+#: rule R3 in :func:`validate_sql` regardless of whether it is "dangerous"
+#: by any other measure, because an unrecognised anonymous function is
+#: exactly the shape a metadata/reconnaissance function
+#: (``SERVERPROPERTY``, ``OBJECT_NAME``, ``COL_NAME``, ``DB_NAME``, ...)
+#: takes -- it produces an output column the table/column allowlist above
+#: was never designed to inspect, turning an otherwise-innocuous SELECT
+#: into a schema-enumeration or server-reconnaissance channel even though
+#: it references a real, allowlisted table. Seeded from a standalone
+#: prototype run against the full attack/negative-control catalogue (see
+#: the accompanying design doc); this is the single place to add another
+#: name if production surfaces a legitimate data function sqlglot also
+#: leaves untyped.
+_SAFE_ANONYMOUS_FUNCTIONS = frozenset({
+    "VAR", "VARP", "STDEVP", "STRING_SPLIT", "CHOOSE", "PARSE",
+    "CHECKSUM", "BINARY_CHECKSUM",
+})
+
+#: AST node types that read server/session/connection *state* rather than
+#: warehouse data -- refused unconditionally, anywhere in the tree, by rule
+#: R2 in :func:`validate_sql`. Each of these has its own typed sqlglot node
+#: (unlike the metadata functions rule R3 catches, which fall through to
+#: ``exp.Anonymous``): ``@@version``/``@@spid`` parse as ``exp.Parameter``,
+#: ``CURRENT_USER``/``SESSION_USER`` as ``exp.CurrentUser``/
+#: ``exp.SessionUser``, ``SCHEMA_NAME()`` as ``exp.CurrentSchema``, and
+#: ``OBJECT_ID()`` as ``exp.ObjectId``. Deliberately does NOT include
+#: ``exp.CurrentTimestamp`` -- ``GETDATE()``/``CURRENT_TIMESTAMP`` is
+#: ordinary, legitimate data-query syntax with no server-reconnaissance
+#: value, unlike every other node type in this set.
+_FORBIDDEN_STATE_NODE_TYPES: tuple[type[exp.Expression], ...] = (
+    exp.Parameter, exp.CurrentUser, exp.SessionUser, exp.CurrentSchema, exp.ObjectId,
+)
+
+
+def _is_dangerous_identifier(name: str, dialect: str = _DIALECT) -> bool:
+    """True if *name* is a stored-procedure/extension prefix or remote-access function.
+
+    ``xp_*``/``sp_*`` and :data:`_DANGEROUS_FUNCTION_NAMES` are checked for
+    every dialect unconditionally (see that constant's docstring); *dialect*
+    additionally pulls in that dialect's own
+    :attr:`~security.dialects.DialectProfile.extra_dangerous_functions` —
+    e.g. PostgreSQL's ``dblink*`` family, MySQL's ``LOAD_FILE`` — instead of
+    a hardcoded ``if dialect == ...`` branch naming them inline here.
+    """
+    upper = name.upper()
+    profile = get_dialect_profile(dialect)
+    return (
+        upper.startswith("XP_")
+        or upper.startswith("SP_")
+        or upper in _DANGEROUS_FUNCTION_NAMES
+        or upper in profile.extra_dangerous_functions
+    )
+
+
+def _is_string_literal_operand(node: exp.Expression | None) -> bool:
+    """True if *node* is unambiguously a string value: a string
+    :class:`exp.Literal`, or a T-SQL national-character literal
+    (``N'...'``, parsed by sqlglot as :class:`exp.National` wrapping an
+    inner string ``Literal`` — a *separate* node type, not a
+    ``Literal(is_string=True)`` itself, so it needs its own check here; see
+    :func:`validate_sql`'s ``+``-concatenation rule, the one call site that
+    needs this distinction).
+    """
+    if isinstance(node, exp.National):
+        return True
+    return isinstance(node, exp.Literal) and node.is_string
+
+
+def _forbidden_label(node: exp.Expression) -> str | None:
+    """Return a human-readable forbidden-keyword label for *node*, or ``None``.
+
+    ``exp.Command`` is sqlglot's fallback node for T-SQL statements it has
+    no dedicated class for (``GRANT``, ``SHUTDOWN WITH NOWAIT``, ...); its
+    ``this`` attribute carries the leading keyword sqlglot recognised
+    (``GRANT``), which is a better label than the generic type name.
+    """
+    if isinstance(node, exp.Command):
+        cmd = node.this
+        return str(cmd).upper() if cmd else "COMMAND"
+    for node_type, label in _NAMED_FORBIDDEN_TYPES.items():
+        if isinstance(node, node_type):
+            return label
+    return None
+
+
+def _build_schema_lookup() -> tuple[
+    dict[str, str], dict[str, frozenset[str]], dict[str, tuple[str, ...]],
+    dict[str, str], dict[str, tuple[str, ...]],
+]:
+    """Build this module's table/column/qualifier lookup structures from
+    ``TABLE_COLUMNS`` (and the same registry's effective-qualifier map).
+
+    Returns
+    -------
+    tuple
+        ``(table_lookup, columns_by_table, qualifier_parts, qualifier_str, bare_name_index)``:
+
+        * *table_lookup* -- lower-cased full table KEY -> its canonical
+          (correctly-cased) key, e.g. ``"sales.customer" -> "sales.Customer"``.
+          Not used to resolve a real SQL table reference (its qualifier and
+          bare name are separate AST slots, never one dotted string) --
+          kept for any caller that already has a literal key string in
+          hand and just needs its canonical case.
+        * *columns_by_table* -- canonical key -> frozenset of its
+          lower-cased column names.
+        * *qualifier_parts* -- canonical key -> its EFFECTIVE qualifier
+          (:func:`schema_data.registry.get_table_schema_qualifiers`),
+          lower-cased parts, ``()`` for a table with none -- what
+          :func:`_match_table_ref` compares a SQL reference's own qualifier
+          against.
+        * *qualifier_str* -- the same qualifier, ORIGINAL case, dot-joined
+          exactly as :func:`schema_data.registry.get_table_schema_qualifiers`
+          returns it (``""`` when absent) -- for building a human-readable
+          ``[q].[Name]`` reference in a rejection message
+          (:func:`~schema_data.registry.table_reference_sql`), never for
+          matching.
+        * *bare_name_index* -- lower-cased BARE table name -> every
+          canonical key that shares it, in ``schema.yaml`` order. More than
+          one entry means two or more schema.yaml keys name the same table
+          under different qualifiers (``sales.Customer``/``ref.Customer``)
+          -- exactly the case :func:`_match_table_ref` disambiguates.
+    """
+    table_lookup = {name.lower(): name for name in TABLE_COLUMNS}
+    columns_by_table = {
+        name: frozenset(col.lower() for col in cols)
+        for name, cols in TABLE_COLUMNS.items()
+    }
+    qualifiers = get_table_schema_qualifiers()
+    qualifier_parts: dict[str, tuple[str, ...]] = {}
+    qualifier_str: dict[str, str] = {}
+    bare_name_index: dict[str, list[str]] = {}
+    for name in TABLE_COLUMNS:
+        bare = table_ref_parts(exp.to_table(name, dialect="tsql"))[-1]
+        bare_name_index.setdefault(bare.lower(), []).append(name)
+        qualifier = qualifiers.get(name, "")
+        qualifier_str[name] = qualifier
+        qualifier_parts[name] = tuple(p.lower() for p in qualifier.split(".")) if qualifier else ()
+    return (
+        table_lookup, columns_by_table, qualifier_parts, qualifier_str,
+        {bare: tuple(keys) for bare, keys in bare_name_index.items()},
+    )
+
+
+(
+    _TABLE_LOOKUP, _COLUMNS_BY_TABLE, _QUALIFIER_PARTS, _QUALIFIER_STR, _BARE_NAME_INDEX,
+) = _build_schema_lookup()
+
+
+def refresh_schema_lookup() -> None:
+    """Rebuild this module's table/column/qualifier lookup from whatever
+    ``schema.yaml`` :data:`config.Settings.project_config_dir` currently
+    names.
+
+    ``TABLE_COLUMNS`` (:mod:`schema_data.columns`) and the registry's own
+    process-lifetime cache (:mod:`schema_data.registry`) are both lazy
+    singletons, populated once on first access and never re-read on their
+    own -- by design, for production (see ``schema_data.registry``'s module
+    docstring: a ``schema.yaml`` edit takes effect on process restart, the
+    same as the rest of this guard's allowlist). Worse, this module's own
+    ``TABLE_COLUMNS`` name is a plain ``from schema_data.columns import
+    TABLE_COLUMNS`` snapshot taken once at import time -- clearing
+    ``schema_data.columns``' cache alone would not change what THIS name
+    already points to. A test that swaps ``schema.yaml`` mid-process
+    (:func:`config.override_settings` plus a ``tmp_path`` config directory)
+    needs every one of these re-read -- this module's own ``TABLE_COLUMNS``
+    binding, and the derived structures built from it
+    (:data:`_TABLE_LOOKUP`, :data:`_COLUMNS_BY_TABLE`, :data:`_QUALIFIER_PARTS`,
+    :data:`_QUALIFIER_STR`, :data:`_BARE_NAME_INDEX`) -- or the guard keeps
+    validating against whatever schema was loaded first. This function is
+    that explicit, test-only escape hatch: it clears both lazy caches,
+    re-fetches ``TABLE_COLUMNS`` fresh, and recomputes this module's
+    derived state from it, rather than leaving a test to reach into three
+    modules' private caches by hand. Not called anywhere in production code.
+    """
+    import schema_data.columns as columns_module
+    import schema_data.registry as registry_module
+
+    global TABLE_COLUMNS, _TABLE_LOOKUP, _COLUMNS_BY_TABLE, _QUALIFIER_PARTS, _QUALIFIER_STR, _BARE_NAME_INDEX
+    registry_module._cache.clear()
+    columns_module._cache.clear()
+    TABLE_COLUMNS = registry_module.get_table_columns()
+    (
+        _TABLE_LOOKUP, _COLUMNS_BY_TABLE, _QUALIFIER_PARTS, _QUALIFIER_STR, _BARE_NAME_INDEX,
+    ) = _build_schema_lookup()
+
+
+def _cte_names(tree: exp.Expression) -> frozenset[str]:
+    """Lower-cased names of every CTE defined in *tree*.
+
+    A reference to one of these is a reference to a CTE, not to a real
+    table — it must be excluded from both the table allowlist check and
+    table-name resolution, since the CTE's own body (not
+    ``TABLE_COLUMNS``) is what actually defines its shape.
+    """
+    return frozenset(cte.alias.lower() for cte in tree.find_all(exp.CTE) if cte.alias)
+
+
+@dataclass(frozen=True)
+class _TableMatch:
+    """The outcome of matching one SQL table reference against the schema
+    allowlist -- see :func:`_match_table_ref`.
+
+    ``status`` is one of:
+
+    * ``"resolved"`` -- exactly one table matches; ``canonical`` is its key.
+    * ``"unknown"`` -- no ``schema.yaml`` key shares this bare name at all.
+    * ``"ambiguous"`` -- more than one candidate matches (an unqualified
+      reference to a bare name more than one key shares, with no single
+      qualifier-less or exact-qualifier candidate to prefer).
+    * ``"qualifier_mismatch"`` -- the reference IS qualified, and candidates
+      share its bare name, but none has a matching (or absent) qualifier --
+      the ``[hr].[Customer]`` hole this feature closes.
+    * ``"multi_part_only"`` -- the reference is unqualified, exactly one
+      candidate shares its bare name, but that candidate's own qualifier is
+      multi-part (another database) -- an unqualified reference would read
+      the wrong database, so this is refused like an unknown table.
+
+    ``candidates`` -- every same-bare-name key considered, for a
+    caller-built "did you mean" message; empty only for ``"unknown"``.
+    """
+
+    canonical: str | None
+    candidates: tuple[str, ...]
+    status: str
+
+
+def _match_table_ref(name: str, qualifier: tuple[str, ...]) -> _TableMatch:
+    """Resolve one SQL table reference's bare *name* + *qualifier* against
+    the schema allowlist. See :class:`_TableMatch` for the possible outcomes.
+
+    Parameters
+    ----------
+    name:
+        The reference's bare table name, as written in the query.
+    qualifier:
+        The reference's own qualifier parts, already lower-cased, leftmost
+        first -- ``()`` for an unqualified reference.
+    """
+    candidates = _BARE_NAME_INDEX.get(name.lower(), ())
+    if not candidates:
+        return _TableMatch(None, (), "unknown")
+
+    if qualifier:
+        exact = [key for key in candidates if _QUALIFIER_PARTS[key] == qualifier]
+        if len(exact) == 1:
+            return _TableMatch(exact[0], candidates, "resolved")
+        if len(exact) > 1:  # pragma: no cover - schema.yaml validation forbids this
+            return _TableMatch(None, tuple(exact), "ambiguous")
+        # No exact match -- a candidate with NO known qualifier accepts any
+        # qualifier (documented residual gap: it cannot actually be
+        # checked; schema.yaml authors are advised to set db_schema).
+        loose = [key for key in candidates if not _QUALIFIER_PARTS[key]]
+        if len(loose) == 1:
+            return _TableMatch(loose[0], candidates, "resolved")
+        if len(loose) > 1:  # pragma: no cover - schema.yaml validation forbids this
+            return _TableMatch(None, tuple(loose), "ambiguous")
+        return _TableMatch(None, candidates, "qualifier_mismatch")
+
+    if len(candidates) == 1:
+        key = candidates[0]
+        if len(_QUALIFIER_PARTS[key]) <= 1:
+            return _TableMatch(key, candidates, "resolved")
+        return _TableMatch(None, candidates, "multi_part_only")
+    return _TableMatch(None, candidates, "ambiguous")
+
+
+def _table_ref_name_and_qualifier(table: exp.Table) -> tuple[str, tuple[str, ...]]:
+    """The bare name and lower-cased qualifier parts of SQL node *table*.
+
+    A thin adapter over :func:`schema_data.registry.table_ref_parts` (the
+    one place this codebase flattens a dotted/bracketed T-SQL identifier,
+    schema.yaml key or real query reference alike), so every caller in this
+    module reaches the schema allowlist through the same two pieces of
+    information -- never re-deriving them from ``table.db``/``table.catalog``
+    by hand at a second call site.
+    """
+    parts = table_ref_parts(table)
+    if not parts:  # pragma: no cover - defensive; a real exp.Table always names something
+        return "", ()
+    return parts[-1], tuple(p.lower() for p in parts[:-1])
+
+
+def _resolve_table_name(table: exp.Table, cte_names: frozenset[str]) -> str | None:
+    """Best-effort canonical key for *table*, or ``None``.
+
+    A thin, non-raising wrapper around :func:`_match_table_ref` for every
+    caller that only wants "the" table when the reference is unambiguous
+    and does not itself raise or otherwise report the difference between
+    "unknown", "ambiguous", and "qualifier mismatch" -- alias maps, ``*``
+    expansion, cross-datasource grouping, and
+    :func:`extract_touched_tables`. Collapses every non-``"resolved"``
+    :class:`_TableMatch` to ``None`` alike. Only :func:`validate_sql`'s own
+    table-allowlist walk (rule 8) calls :func:`_match_table_ref` directly,
+    for the specific diagnostic it needs to raise the right rejection.
+
+    ``None`` also covers *table* naming a CTE, or an empty name (e.g. a
+    table-valued function call, whose ``exp.Table.this`` is an
+    ``exp.Anonymous`` rather than an ``exp.Identifier``).
+    """
+    name, qualifier = _table_ref_name_and_qualifier(table)
+    if not name or name.lower() in cte_names:
+        return None
+    return _match_table_ref(name, qualifier).canonical
+
+
+def resolve_table_key(table: exp.Table, tree: exp.Expression) -> str | None:
+    """Return the ``schema.yaml`` key *table* refers to within *tree*, or ``None``.
+
+    The public form of the resolution :func:`validate_sql` applies, for a
+    caller that rebuilds SQL from an already-validated statement (e.g.
+    ``session.composer``) and must pick the same table the guard did --
+    with two keys sharing a bare name (``sales.Customer`` and
+    ``ref.Customer``) any other lookup could pick the wrong one.
+
+    Parameters
+    ----------
+    table:
+        A table reference inside *tree*.
+    tree:
+        The statement containing *table*; its CTE names are excluded.
+
+    Returns
+    -------
+    str | None
+        The canonical key, or ``None`` when *table* is a CTE, names no
+        allowlisted table, or is ambiguous.
+
+    Examples
+    --------
+    >>> import sqlglot
+    >>> tree = sqlglot.parse_one("WITH c AS (SELECT 1 AS x) SELECT * FROM c", read="tsql")
+    >>> resolve_table_key(next(tree.find_all(exp.Table)), tree) is None
+    True
+    """
+    return _resolve_table_name(table, _cte_names(tree))
+
+
+def _collect_table_alias_map(
+    tree: exp.Expression, cte_names: frozenset[str]
+) -> dict[str, str]:
+    """Map every resolvable alias/name (lower-cased) to its canonical table name.
+
+    By the time this runs, every non-CTE ``exp.Table`` in *tree* has
+    already been checked against the schema allowlist (see
+    ``validate_sql``'s main walk) and either resolved or caused a
+    rejection — so in practice every table this function sees does
+    resolve. It re-resolves defensively via :func:`_resolve_table_name`
+    rather than assuming that, so it stays correct on its own if ever
+    called before that check.
+
+    An alias always maps to its table. A bare, unqualified table name maps
+    to its table only when exactly one ``FROM``/``JOIN`` source in *tree*
+    writes that bare name -- a self-join of two same-bare-name, different-
+    qualifier tables (``[sales].[Customer] c1 JOIN [ref].[Customer] c2``)
+    writes ``Customer`` twice, so neither is entered under the bare name
+    here; a later qualified column reference (``Customer.Name``, with no
+    alias) is then genuinely ambiguous and is left for the lenient
+    unresolved-qualifier path in :func:`validate_sql`'s column check to
+    allow rather than mis-attribute to one side of the join.
+    """
+    alias_map: dict[str, str] = {}
+    entries: list[tuple[str, str]] = []
+    bare_name_counts: dict[str, int] = {}
+    for table in tree.find_all(exp.Table):
+        canonical = _resolve_table_name(table, cte_names)
+        if canonical is None:
+            continue
+        name_lower = table.name.lower()
+        entries.append((name_lower, canonical))
+        bare_name_counts[name_lower] = bare_name_counts.get(name_lower, 0) + 1
+        if table.alias:
+            alias_map[table.alias.lower()] = canonical
+    for name_lower, canonical in entries:
+        if bare_name_counts[name_lower] == 1:
+            alias_map[name_lower] = canonical
+    return alias_map
+
+
+def _enclosing_select(node: exp.Expression) -> exp.Select | None:
+    """Walk up *node*'s parents to the nearest enclosing ``exp.Select``."""
+    parent = node.parent
+    while parent is not None and not isinstance(parent, exp.Select):
+        parent = parent.parent
+    return parent
+
+
+def _direct_from_sources(select: exp.Select) -> list[exp.Expression]:
+    """The expressions directly in *select*'s own ``FROM``/``JOIN`` clauses.
+
+    Deliberately not recursive: a bare ``*`` in *select*'s own SELECT list
+    expands to columns from exactly these sources, not from a subquery
+    nested inside one of them.
+    """
+    sources: list[exp.Expression] = []
+    # sqlglot has spelled this arg key both "from" and "from_" across
+    # versions (Python cannot use the bare word "from" as an attribute
+    # name, which is likely why); check both so this does not silently
+    # stop finding FROM clauses on a sqlglot upgrade/downgrade.
+    from_clause = select.args.get("from_") or select.args.get("from")
+    if from_clause is not None and from_clause.this is not None:
+        sources.append(from_clause.this)
+    for join in select.args.get("joins") or ():
+        if join.this is not None:
+            sources.append(join.this)
+    return sources
+
+
+def _resolve_star_tables(
+    select: exp.Select | None, cte_names: frozenset[str]
+) -> list[str] | None:
+    """Canonical table names a bare ``*`` in *select* expands to, or ``None``.
+
+    ``None`` means "cannot resolve with confidence" — *select* is missing,
+    or one of its direct ``FROM``/``JOIN`` sources is not a plain
+    known-table reference (a derived table, a table-valued function, or a
+    CTE). Callers must treat ``None`` as "refuse", not "allow": this
+    function is only consulted when a ``denied_columns`` policy is active,
+    where an unprovable ``*`` must not be allowed to read around it.
+    """
+    if select is None:
+        return None
+    resolved: list[str] = []
+    for source in _direct_from_sources(select):
+        if not isinstance(source, exp.Table):
+            return None
+        canonical = _resolve_table_name(source, cte_names)
+        if canonical is None:
+            return None
+        resolved.append(canonical)
+    return resolved
+
+
+# ---------------------------------------------------------------------------
+# Where a column reference reads from
+# ---------------------------------------------------------------------------
+#
+# Used by callers that look at an already validated statement (the filter
+# value check); nothing in ``validate_sql`` calls it, so it decides nothing the
+# guard allows or refuses. It reads the same sources the join-only check does:
+# the ``FROM``/``JOIN`` sources of the nearest enclosing select, then the outer
+# select for a correlated reference.
+
+#: One stored column a reference can read: ``(table key, lower-cased column name)``.
+ColumnOrigin = tuple[str, str]
+
+
+def _source_label(source: exp.Expression) -> str:
+    """The lower-cased name a ``FROM``/``JOIN`` *source* is addressed by (its alias, else its name)."""
+    if isinstance(source, exp.Table):
+        return (source.alias or source.name or "").lower()
+    return (getattr(source, "alias", "") or "").lower()
+
+
+def _source_origins(
+    source: exp.Expression,
+    name: str,
+    ctes: dict[str, exp.Expression],
+    depth: int,
+) -> list[ColumnOrigin] | None:
+    """The stored columns column *name* of one ``FROM``/``JOIN`` *source* is, or ``None`` when unknown."""
+    if isinstance(source, exp.Table):
+        table_name, qualifier = _table_ref_name_and_qualifier(source)
+        if not qualifier and table_name.lower() in ctes:
+            return _body_origins(ctes[table_name.lower()], name, ctes, depth + 1)
+        canonical = _resolve_table_name(source, frozenset(ctes))
+        if canonical is None:
+            return None
+        return [(canonical, name)] if name in _COLUMNS_BY_TABLE[canonical] else []
+    if isinstance(source, exp.Subquery):
+        return _body_origins(source.this, name, ctes, depth + 1)
+    return None
+
+
+def _scope_origins(
+    select: exp.Select | None,
+    qualifier: str,
+    name: str,
+    ctes: dict[str, exp.Expression],
+    depth: int,
+    *,
+    outward: bool,
+) -> list[ColumnOrigin] | None:
+    """Stored columns column *name* (written with *qualifier*, ``""`` for none) is, seen from *select*.
+
+    A qualified name is looked up in the sources of *select* addressed by that
+    qualifier; an unqualified one in every source of *select*, and the answer
+    is every table that has a column of that name. With *outward* the search
+    moves to the enclosing select when this one has nothing to say (a
+    correlated reference); the body of a derived table or CTE never reaches
+    outside itself. ``None`` is "cannot tell" (a table-valued function, an
+    expression, recursion too deep), ``[]`` is "no stored column".
+    """
+    if depth > 6:
+        return None
+    scope = select
+    while scope is not None:
+        sources = _direct_from_sources(scope)
+        chosen = [s for s in sources if _source_label(s) == qualifier] if qualifier else sources
+        if chosen:
+            origins: list[ColumnOrigin] = []
+            for source in chosen:
+                found = _source_origins(source, name, ctes, depth)
+                if found is None:
+                    return None
+                origins.extend(found)
+            if origins or qualifier:
+                return origins
+        if not outward:
+            return []
+        scope = _enclosing_select(scope)
+    return []
+
+
+def _is_star(projection: exp.Expression) -> bool:
+    return isinstance(projection, exp.Star) or (
+        isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star)
+    )
+
+
+def _select_output_origins(
+    select: exp.Select, name: str, ctes: dict[str, exp.Expression], depth: int,
+) -> list[ColumnOrigin] | None:
+    """Stored columns the output column *name* of *select* is a plain copy of, or ``None``."""
+    stars = [p for p in select.expressions if _is_star(p)]
+    origins: list[ColumnOrigin] = []
+    matched = False
+    for projection in select.expressions:
+        if _is_star(projection) or (projection.alias_or_name or "").lower() != name:
+            continue
+        matched = True
+        inner = projection.unalias()
+        if not isinstance(inner, exp.Column) or not inner.name or _is_star(inner):
+            return None
+        found = _scope_origins(
+            select, (inner.table or "").lower(), inner.name.lower(), ctes, depth + 1, outward=False,
+        )
+        if found is None:
+            return None
+        origins.extend(found)
+    if matched:
+        return origins
+    for star in stars:
+        qualifier = (star.table or "").lower() if isinstance(star, exp.Column) else ""
+        found = _scope_origins(select, qualifier, name, ctes, depth + 1, outward=False)
+        if found is None:
+            return None
+        origins.extend(found)
+    return origins
+
+
+def _body_origins(
+    body: exp.Expression, name: str, ctes: dict[str, exp.Expression], depth: int,
+) -> list[ColumnOrigin] | None:
+    """Stored columns the output column *name* of a derived table or CTE *body* is, or ``None``."""
+    if depth > 6:
+        return None
+    while isinstance(body, (exp.Subquery, exp.Paren)):
+        body = body.this
+    if isinstance(body, exp.Select):
+        return _select_output_origins(body, name, ctes, depth)
+    branches = _setop_branches(body)
+    if len(branches) < 2 or not all(isinstance(b, exp.Select) for b in branches):
+        return None
+    first = branches[0]
+    if any(_is_star(p) for p in first.expressions):
+        by_name = [_select_output_origins(b, name, ctes, depth) for b in branches]
+        return None if any(found is None for found in by_name) else [o for f in by_name for o in f]
+    names = [(p.alias_or_name or "").lower() for p in first.expressions]
+    if name not in names:
+        return []
+    position = names.index(name)
+    origins: list[ColumnOrigin] = []
+    for branch in branches:
+        if len(branch.expressions) <= position or _is_star(branch.expressions[position]):
+            return None
+        inner = branch.expressions[position].unalias()
+        if not isinstance(inner, exp.Column) or not inner.name:
+            return None
+        found = _scope_origins(
+            branch, (inner.table or "").lower(), inner.name.lower(), ctes, depth + 1, outward=False,
+        )
+        if found is None:
+            return None
+        origins.extend(found)
+    return origins
+
+
+def column_origins(column: exp.Column, tree: exp.Expression) -> tuple[ColumnOrigin, ...]:
+    """The stored columns *column* reads, as ``(table key, lower-cased column)`` pairs.
+
+    The question the guard asks of a reference when it checks a denied or
+    join-only column, answered for a caller that needs the table too: the
+    qualifier is looked up through table aliases, then through the derived
+    tables and CTEs of the enclosing selects down to the table they copy the
+    column from (a plain copy only: ``r.Name`` or ``r.Name AS Label``, ``*``
+    or ``t.*``; a column computed by an expression is not a stored column). An
+    unqualified name is every table of its select that has a column of that
+    name, so a name two tables share gives both. The table key is the
+    ``schema.yaml`` key, as :func:`resolve_table_key` gives it.
+
+    Parameters
+    ----------
+    column:
+        A column reference inside *tree*.
+    tree:
+        The statement containing *column*.
+
+    Returns
+    -------
+    tuple[tuple[str, str], ...]
+        The stored columns, without repeats and in the order found; empty when
+        the reference is not (or cannot be shown to be) a plain read of a
+        stored column of a ``schema.yaml`` table.
+
+    Examples
+    --------
+    >>> tree = sqlglot.parse_one(
+    ...     "SELECT 1 FROM [sales].[Customer] AS c WHERE c.[Name] = 'x'", read="tsql")
+    >>> column_origins(next(tree.find_all(exp.Column)), tree)
+    (('Customer', 'name'),)
+    >>> tree = sqlglot.parse_one(
+    ...     "WITH c AS (SELECT * FROM [sales].[Customer]) SELECT 1 FROM c WHERE c.Name = 'x'",
+    ...     read="tsql")
+    >>> column_origins(list(tree.find_all(exp.Column))[-1], tree)
+    (('Customer', 'name'),)
+    >>> tree = sqlglot.parse_one("SELECT 1 FROM (SELECT 'x' AS Name) AS d WHERE d.Name = 'x'", read="tsql")
+    >>> column_origins(list(tree.find_all(exp.Column))[-1], tree)
+    ()
+    """
+    name = (column.name or "").lower()
+    if not name or _is_star(column):
+        return ()
+    ctes = {cte.alias.lower(): cte.this for cte in tree.find_all(exp.CTE) if cte.alias}
+    found = _scope_origins(
+        _enclosing_select(column), (column.table or "").lower(), name, ctes, 0, outward=True,
+    )
+    return tuple(dict.fromkeys(found or ()))
+
+
+# ---------------------------------------------------------------------------
+# Join-only columns (scoped entries of ``denied_columns``)
+# ---------------------------------------------------------------------------
+#
+# A join-only column may appear in exactly one place: as one side of an
+# equality between two columns inside a ``JOIN ... ON``. Everything below
+# decides, for each reference the query makes, (a) which restricted table it
+# can belong to and (b) whether it sits in that one allowed place. The
+# whole-name legacy check (``denied``) is separate and runs first.
+
+#: What a join-only rejection tells the model, appended to the part that names
+#: the column. The retry that follows can answer the question (join on the
+#: column, show another one), which is why this is correctable and the
+#: legacy full denial is not.
+_JOIN_ONLY_ADVICE = (
+    "it may only be used in JOIN ... ON a.col = b.col (an equality between two "
+    "columns); remove it from the SELECT list, WHERE, GROUP BY, ORDER BY, HAVING, "
+    "function arguments and USING()"
+)
+
+#: A select's directly visible sources: ``(names, tables)``. *names* maps each
+#: lower-cased alias (or bare table name, for an unaliased table) to the
+#: canonical tables behind it -- ``None`` for a derived table or CTE, whose
+#: columns are checked where its body is written; *tables* is every canonical
+#: table directly in that select's ``FROM``/``JOIN``.
+_SelectScope = tuple[dict[str, list[str | None]], list[str]]
+
+
+def _select_scope(
+    select: exp.Select, cte_names: frozenset[str], cache: dict[int, _SelectScope],
+) -> _SelectScope:
+    """The sources *select* reads directly (memoised in *cache* by node id)."""
+    cached = cache.get(id(select))
+    if cached is not None:
+        return cached
+    names: dict[str, list[str | None]] = {}
+    tables: list[str] = []
+    for source in _direct_from_sources(select):
+        canonical: str | None = None
+        if isinstance(source, exp.Table):
+            canonical = _resolve_table_name(source, cte_names)
+            if canonical is not None:
+                tables.append(canonical)
+            # An aliased table is addressed by its alias only.
+            label = (source.alias or source.name or "").lower()
+        else:
+            label = (getattr(source, "alias", "") or "").lower()
+        if label:
+            names.setdefault(label, []).append(canonical)
+    result = (names, tables)
+    cache[id(select)] = result
+    return result
+
+
+def _executing_source(tree: exp.Expression, cte_names: frozenset[str]) -> str | None:
+    """The data source the query will execute on, as the executor picks it.
+
+    The same rule as :func:`_require_single_datasource` and the executor
+    (:func:`database.routing.choose_datasource`): the sources that have every
+    table, the default one when it is among them. ``None`` for a query that
+    reads no configured table.
+    """
+    tables = {
+        canonical
+        for table in tree.find_all(exp.Table)
+        if (canonical := _resolve_table_name(table, cte_names)) is not None
+    }
+    if not tables:
+        return None
+
+    from database.routing import choose_datasource
+
+    return choose_datasource(tables)
+
+
+def _is_join_key_operand(column: exp.Column) -> bool:
+    """Whether *column* is one side of ``col = col`` inside a ``JOIN ... ON``.
+
+    The only place a join-only column may appear. Both operands of the
+    equality must be plain columns (``a.ID = 5`` and ``CAST(a.ID AS INT) =
+    b.ID`` do not qualify), and the equality must sit in a join's ``ON``
+    directly or under ``AND``/parentheses -- not under ``OR`` or ``NOT``,
+    where it no longer says "these rows pair up". ``join.args.get("on")``
+    rather than an attribute, which differs between sqlglot versions.
+    """
+    equality = column.parent
+    if not isinstance(equality, exp.EQ):
+        return False
+    if not (isinstance(equality.this, exp.Column) and isinstance(equality.expression, exp.Column)):
+        return False
+    node: exp.Expression = equality
+    while isinstance(node.parent, (exp.And, exp.Paren)):
+        node = node.parent
+    join = node.parent
+    return isinstance(join, exp.Join) and join.args.get("on") is node
+
+
+def _restricted_tables_of(
+    column: exp.Column,
+    restrictions: JoinOnlyRestrictions,
+    cte_names: frozenset[str],
+    alias_map: dict[str, str],
+    all_tables: set[str],
+    cache: dict[int, _SelectScope],
+) -> list[str]:
+    """The restricted tables *column* may be a reference to (empty: none).
+
+    Qualified: the table behind the qualifier, looked up in the nearest
+    enclosing select that has it (so a correlated reference reaches the outer
+    query's table). A qualifier naming a derived table or a CTE resolves to
+    nothing: that body is checked where it is written, so an outer reference
+    to its output is fine.
+
+    Unqualified: conservative. The column counts as restricted when any table
+    in the enclosing select's ``FROM``/``JOIN`` is restricted for that name,
+    even if another table there also has an unrestricted column of that name.
+    The search moves to the outer select only when no table of this one has
+    the column at all (a correlated reference).
+    """
+    name = column.name.lower()
+    qualifier = (column.table or "").lower()
+    scope = _enclosing_select(column)
+
+    if qualifier:
+        while scope is not None:
+            names, _ = _select_scope(scope, cte_names, cache)
+            if qualifier in names:
+                return [
+                    t for t in names[qualifier]
+                    if t is not None and restrictions.entry(t, name)
+                ]
+            scope = _enclosing_select(scope)
+        # Not a source of any enclosing select (a set operation's ORDER BY, say):
+        # fall back to the query-wide alias map.
+        canonical = alias_map.get(qualifier)
+        return [canonical] if canonical and restrictions.entry(canonical, name) else []
+
+    if scope is None:
+        # Outside every select (the ORDER BY of a UNION): any table of the query.
+        return [t for t in sorted(all_tables) if restrictions.entry(t, name)]
+    while scope is not None:
+        _, tables = _select_scope(scope, cte_names, cache)
+        hit = [t for t in tables if restrictions.entry(t, name)]
+        if hit:
+            return hit
+        if any(name in _COLUMNS_BY_TABLE[t] for t in tables):
+            return []
+        scope = _enclosing_select(scope)
+    return []
+
+
+def _join_only_rejection(
+    entry: str, table: str, column: str, *, unqualified: bool = False,
+) -> CorrectableRejection:
+    """The correctable rejection for a join-only column used outside ``JOIN ... ON``."""
+    advice = _JOIN_ONLY_ADVICE
+    if unqualified:
+        advice += (
+            "; if this column belongs to another table, qualify it with that table's alias"
+        )
+    exc = CorrectableRejection(
+        f"Forbidden keyword detected: column '{column}' of table '{table}' is restricted "
+        f"(policy entry '{entry}'): {advice}",
+        reason="join_only_column", subject=entry,
+    )
+    # A refusal on the HTTP axis too: when the retries run out, the request was
+    # refused by a rule, not garbled by the model (see SqlGuardRejection).
+    exc.is_refusal = True
+    return exc
+
+
+def _enforce_join_only(
+    tree: exp.Expression,
+    cte_names: frozenset[str],
+    restrictions: JoinOnlyRestrictions,
+    alias_map: dict[str, str],
+) -> None:
+    """Refuse every use of a join-only column except as a ``JOIN ... ON`` key.
+
+    Raises
+    ------
+    CorrectableRejection
+        ``reason="join_only_column"``, ``subject`` the policy entry (when one
+        entry is at fault), for: a restricted column anywhere but one side of
+        ``col = col`` in a join's ``ON``; a restricted column named in
+        ``USING (...)``; a ``NATURAL JOIN`` over a table with a restricted
+        column; a ``*``/``alias.*`` that would expose one; or a ``*`` over a
+        source this function cannot enumerate.
+    """
+    cache: dict[int, _SelectScope] = {}
+    all_tables = {
+        canonical
+        for table in tree.find_all(exp.Table)
+        if (canonical := _resolve_table_name(table, cte_names)) is not None
+    }
+
+    for column in tree.find_all(exp.Column):
+        name = column.name
+        if not name or name == "*" or name.lower() not in restrictions.names:
+            continue
+        tables = _restricted_tables_of(
+            column, restrictions, cte_names, alias_map, all_tables, cache,
+        )
+        if not tables or _is_join_key_operand(column):
+            continue
+        table = tables[0]
+        raise _join_only_rejection(
+            restrictions.entry(table, name) or name, table, name,
+            unqualified=not column.table,
+        )
+
+    for join in tree.find_all(exp.Join):
+        scope_select = _enclosing_select(join)
+        if scope_select is None:
+            continue
+        _, tables = _select_scope(scope_select, cte_names, cache)
+        for ident in join.args.get("using") or ():
+            written = getattr(ident, "name", "") or ""
+            if written.lower() in restrictions.names:
+                for table in tables:
+                    entry = restrictions.entry(table, written)
+                    if entry:
+                        raise _join_only_rejection(entry, table, written)
+        if str(join.args.get("method") or "").upper() == "NATURAL":
+            for table in tables:
+                columns = restrictions.by_table.get(table)
+                if columns:
+                    column_name, entry = next(iter(columns.items()))
+                    exc = CorrectableRejection(
+                        f"Forbidden keyword detected: NATURAL JOIN would join on every "
+                        f"column the tables share, including restricted column "
+                        f"'{column_name}' of table '{table}' (policy entry '{entry}'): "
+                        "write an explicit JOIN ... ON a.col = b.col instead",
+                        reason="join_only_column", subject=entry,
+                    )
+                    exc.is_refusal = True
+                    raise exc
+
+    for star in tree.find_all(exp.Star):
+        if isinstance(star.parent, exp.Count):
+            continue  # COUNT(*) reads no column value
+        parent = star.parent
+        star_tables: list[str] = []
+        unresolved = False
+        if isinstance(parent, exp.Column) and parent.table:
+            label = f"{parent.table}.*"
+            qualifier = parent.table.lower()
+            scope = _enclosing_select(parent)
+            found = False
+            while scope is not None and not found:
+                names, _ = _select_scope(scope, cte_names, cache)
+                if qualifier in names:
+                    star_tables = [t for t in names[qualifier] if t is not None]
+                    found = True
+                scope = _enclosing_select(scope)
+            if not found and qualifier in alias_map:
+                star_tables = [alias_map[qualifier]]
+        else:
+            label = "*"
+            select = _enclosing_select(star)
+            if select is None:
+                unresolved = True
+            else:
+                for source in _direct_from_sources(select):
+                    if isinstance(source, exp.Table):
+                        canonical = _resolve_table_name(source, cte_names)
+                        if canonical is not None:
+                            star_tables.append(canonical)
+                        elif (source.name or "").lower() not in cte_names:
+                            unresolved = True
+                    elif not isinstance(source, exp.Subquery):
+                        unresolved = True
+            # A CTE or derived table cannot hold a restricted column: the
+            # body that would have produced it was refused where it is written.
+
+        entries = sorted({
+            entry
+            for table in dict.fromkeys(star_tables)
+            for entry in restrictions.by_table.get(table, {}).values()
+        })
+        if entries:
+            exc = CorrectableRejection(
+                f"Forbidden keyword detected: '{label}' would expose restricted "
+                f"column(s) {entries}: name the columns instead of using '*' and leave "
+                "those out; they may only be used in JOIN ... ON a.col = b.col",
+                reason="join_only_column",
+                subject=entries[0] if len(entries) == 1 else None,
+            )
+            exc.is_refusal = True
+            raise exc
+        if unresolved:
+            exc = CorrectableRejection(
+                f"Forbidden keyword detected: cannot verify whether '{label}' exposes a "
+                "restricted column -- name the columns explicitly instead of using '*'",
+                reason="join_only_column",
+            )
+            exc.is_refusal = True
+            raise exc
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def _require_single_datasource(tree: exp.Expression, cte_names: frozenset[str]) -> None:
+    """Refuse a query no single data source can run.
+
+    Every table has already passed the allowlist when this runs. The
+    rule is :func:`database.routing.choose_datasource` -- the same one the
+    executor routes with: the sources that have every table, where a table
+    listed under several sources counts for each. With a single data
+    source (the default deployment) every table maps to it and this never
+    raises.
+
+    A :class:`CorrectableRejection` with ``is_refusal`` set, the same shape
+    as the unknown-table rejection: a retry can plausibly answer from one
+    source's tables (the message tells the model which table is where),
+    but the reason it was refused is a rule, not the SQL's shape.
+    """
+    tables = {
+        canonical
+        for table in tree.find_all(exp.Table)
+        if (canonical := _resolve_table_name(table, cte_names)) is not None
+    }
+    if len(tables) < 2:
+        return
+
+    from database.routing import CrossDatasourceError, choose_datasource
+
+    try:
+        choose_datasource(tables)
+    except CrossDatasourceError as err:
+        exc = CorrectableRejection(str(err), reason="cross_datasource")
+        exc.is_refusal = True
+        raise exc from None
+
+
+def clean_sql(raw: str) -> str:
+    """Strip LLM artefacts from *raw* and return a bare T-SQL string.
+
+    Cleaning steps (applied in order)
+    ----------------------------------
+    1. **Empty check** — raises :class:`ValueError` immediately if *raw* is
+       empty or whitespace-only.
+    2. **Markdown fence extraction** — if the response contains a
+       `````sql … ````` or ````` ``` … ````` block, the inner text is
+       extracted and the surrounding markdown is discarded.
+    3. **Preamble removal** — any text before the first ``SELECT`` or ``WITH``
+       keyword is discarded (handles "Here is the SQL: SELECT …").
+    4. **LIMIT → TOP conversion** — ``LIMIT n`` is MySQL syntax, invalid in
+       T-SQL.  Conversion rules (delegated to :func:`ensure_top`, which
+       locates the query's OUTERMOST ``SELECT`` — skipping CTE bodies and
+       subqueries — rather than blindly the first literal ``SELECT`` in
+       the string; see its docstring for the full CTE / DISTINCT /
+       subquery / ``UNION`` handling):
+
+       * ``TOP n`` already present on the outermost ``SELECT`` → strip
+         ``LIMIT n`` clause only.
+       * ``TOP n`` absent → inject ``SELECT TOP n`` on the outermost
+         ``SELECT`` and strip ``LIMIT n``.
+
+    5. **TOP DISTINCT fix** — reorders ``SELECT TOP n DISTINCT`` to the
+       valid T-SQL form ``SELECT DISTINCT TOP n``, for cases where the
+       LLM emitted that ordering directly (step 4's ``ensure_top`` call
+       already produces the correct order when *it* is the one adding
+       ``TOP``).
+
+    This is deliberately still text surgery rather than parse-and-regenerate
+    — see the module docstring for why a sqlglot round trip is unsafe here
+    (it does not reproduce the input text exactly). :func:`validate_sql`,
+    which runs immediately after this function in the pipeline, is the
+    parser-based half of the guard.
+
+    Parameters
+    ----------
+    raw:
+        Raw text returned by the LLM backend.  May contain markdown fences,
+        introductory sentences, or MySQL-style ``LIMIT`` clauses.
+
+    Returns
+    -------
+    str
+        Cleaned, bare T-SQL string ready for :func:`validate_sql`.
+
+    Raises
+    ------
+    CorrectableRejection
+        A :class:`ValueError` subclass (see the module docstring's
+        exception taxonomy):
+
+        * If *raw* is empty or whitespace-only.
+        * If no ``SELECT`` / ``WITH`` keyword is found after fence extraction.
+
+        Both are re-promptable — an empty or non-SQL response is exactly
+        the kind of mistake a corrected retry can fix — so neither is a
+        :class:`PolicyRejection`.
+
+    Examples
+    --------
+    >>> clean_sql("```sql\\nSELECT * FROM Contract\\n```")
+    'SELECT * FROM Contract'
+
+    >>> clean_sql("Here is the query:\\nSELECT TOP 10 * FROM Contract")
+    'SELECT TOP 10 * FROM Contract'
+
+    >>> clean_sql("SELECT * FROM Contract LIMIT 5")
+    'SELECT TOP 5 * FROM Contract'
+
+    >>> clean_sql("SELECT TOP 10 * FROM Contract LIMIT 5")
+    'SELECT TOP 10 * FROM Contract'
+
+    >>> clean_sql("SELECT TOP 10 DISTINCT Name FROM Customer")
+    'SELECT DISTINCT TOP 10 Name FROM Customer'
+
+    >>> clean_sql("WITH c AS (SELECT x FROM t) SELECT * FROM c LIMIT 5")
+    'WITH c AS (SELECT x FROM t) SELECT TOP 5 * FROM c'
+
+    >>> clean_sql("")
+    Traceback (most recent call last):
+        ...
+    security.sql_guard.CorrectableRejection: Received empty SQL from model
+
+    >>> clean_sql("No SQL here at all.")
+    Traceback (most recent call last):
+        ...
+    security.sql_guard.CorrectableRejection: No SELECT / CTE found in model response: 'No SQL here at all.'
+    """
+    if not raw or not raw.strip():
+        raise CorrectableRejection("Received empty SQL from model", reason="other")
+
+    fence_match = _FENCE_RE.search(raw)
+    sql = fence_match.group(1) if fence_match else raw
+
+    start = _SELECT_START_RE.search(sql)
+    if not start:
+        raise CorrectableRejection(
+            f"No SELECT / CTE found in model response: {sql[:200]!r}", reason="other",
+        )
+    sql = sql[start.start():].strip()
+
+    if _LIMIT_RE.search(sql):
+        limit_n = int(_LIMIT_RE.search(sql).group(1))   # type: ignore[union-attr]
+        sql = _LIMIT_STRIP_RE.sub("", sql)
+        # Delegate the actual placement of TOP to ensure_top(), which
+        # locates the OUTERMOST SELECT (skipping CTE bodies and
+        # subqueries) and is a no-op if that SELECT already has a TOP —
+        # exactly "TOP n absent -> inject" / "TOP n present -> strip
+        # LIMIT only" from the docstring above, without duplicating the
+        # CTE/DISTINCT/subquery-aware placement logic here too.
+        sql = ensure_top(sql, limit_n)
+
+    sql = _TOP_DISTINCT_RE.sub(
+        lambda m: f"SELECT DISTINCT TOP {m.group(1)}", sql
+    )
+
+    return sql.strip()
+
+
+def validate_sql(
+    sql: str,
+    *,
+    denied_columns: Iterable[str] | None = None,
+    dialect: str = _DIALECT,
+) -> None:
+    """Raise :class:`ValueError` if *sql* is not a safe, read-only SELECT query.
+
+    Validation rules (checked in order)
+    ------------------------------------
+    1. **Not empty** — blank / whitespace-only SQL is always rejected.
+    2. **No literal ``LIMIT`` — tsql only.** ``LIMIT`` is invalid T-SQL;
+       T-SQL requires ``TOP``. This check runs **only when** ``dialect ==
+       "tsql"`` — every other dialect this module supports treats ``LIMIT``
+       as its own correct row-limiting syntax, so rejecting it there would
+       refuse the majority of valid queries rather than close a bypass; see
+       the module docstring's "Multi-dialect" section for why this single
+       condition is not the dialect-branching ladder this module otherwise
+       avoids. It is a raw-text check rather than an AST check even for
+       tsql: sqlglot's ``tsql`` dialect parses ``LIMIT n`` and ``TOP n``
+       into the *same* AST node, so the syntactic distinction this check
+       cares about no longer exists once the query is parsed.
+    3. **Parses as exactly one statement in the target dialect** — the
+       query is parsed with `sqlglot <https://sqlglot.com/>`_ pinned to
+       *dialect* (``"tsql"`` unless the caller passes another supported
+       dialect — see :data:`security.dialects.DIALECT_PROFILES`). A syntax
+       error, or more than one statement (sqlglot splits on ``;`` the same
+       way the database driver would), is rejected outright — this alone
+       rejects every stacked-statement bypass as a class, rather than
+       relying on recognising each statement's individual keyword.
+    4. **Root node is a read-only query** — only ``SELECT``/``WITH`` (a
+       ``WITH`` attaches to the ``Select`` root, so no separate check is
+       needed) and top-level ``UNION``/``INTERSECT``/``EXCEPT`` are allowed.
+       Every other statement kind (``INSERT``, ``UPDATE``, ``DELETE``,
+       ``DROP``, ``CREATE``, ``ALTER``, ``MERGE``, ``TRUNCATE``, ``GRANT``,
+       ``REVOKE``, ``EXEC``/``EXECUTE``, ...) is refused by its node type.
+    5. **No dangerous construct anywhere in the tree** — the whole AST is
+       walked (not just the root) so a dangerous node nested inside an
+       otherwise-allowed ``SELECT`` is still caught: ``SELECT ... INTO``
+       (creates a table), ``OPENROWSET``/``OPENQUERY``/``OPENDATASOURCE``
+       (remote/file access), and any ``xp_*``/``sp_*``-prefixed function or
+       table reference.
+    6. **No SQL comments, of any content** — a comment is refused outright
+       because it is present, not because its text was scanned for a
+       keyword (that would just relocate the substring-matching mistake
+       rule 5 exists to avoid — see the module docstring). A model
+       generating SQL for this application has no legitimate reason to
+       emit one.
+    7. **No system catalogue references** — *dialect*'s own system
+       catalogues (per
+       :attr:`security.dialects.DialectProfile.system_schemas` /
+       :attr:`~security.dialects.DialectProfile.system_name_prefixes` —
+       ``INFORMATION_SCHEMA``/``SYS`` for tsql, ``pg_catalog``/``pg_*`` for
+       postgres, ``mysql``/``performance_schema`` for mysql,
+       ``sqlite_master``/``sqlite_*`` for sqlite) are blocked (by
+       schema/table AST node, not substring) to prevent schema enumeration.
+    8. **Table allowlist** — every table reference must resolve to a known
+       table (case-insensitively, per
+       :data:`schema_data.columns.TABLE_COLUMNS`, schema/db qualifier
+       ignored) or be a reference to a CTE defined earlier in the same
+       query; anything else — a hallucinated, out-of-domain, or malicious
+       table name — is refused. Unlike the column check below, this is
+       *not* lenient: an unresolvable table name is a rejection, not a
+       pass.
+    9. **Column allowlist** — every *qualified* column reference against a
+       table resolved in rule 8 is checked against that table's known
+       columns; an unqualified column, or one qualified by a CTE name or a
+       derived-table alias, is allowed rather than rejected — resolving
+       those correctly in the general case (joins, computed aliases in
+       ORDER BY/GROUP BY, ...) risks a false positive that breaks a
+       working query, which this module treats as the worse outcome.
+    10. **Denied-column policy** — if *denied_columns* is given: any column
+        reference by that name (qualified or not, resolvable or not) is
+        refused regardless of which table it belongs to, and ``*``/``alias.*``
+        cannot be used to read around the policy — each is expanded
+        against the table(s) it resolves to and checked column-by-column,
+        or refused outright if it cannot be resolved that way. This check
+        is intentionally *not* pragmatic like rule 9: a denied column
+        should never slip through just because this module couldn't prove
+        which table a reference came from. *denied_columns* may also hold
+        **scoped** entries (see :mod:`security.column_policy`), which make a
+        column join-only on one table, optionally only on one data source:
+        it may then appear solely as one side of ``a.col = b.col`` inside a
+        ``JOIN ... ON`` (directly or under ``AND``/parentheses). Any other
+        use -- the select list, ``WHERE``, ``GROUP BY``, ``ORDER BY``,
+        ``HAVING``, a function argument, ``ON`` against a literal,
+        ``USING (...)``, a comma join's ``WHERE`` predicate, a ``*`` that
+        expands to it -- is refused with ``reason="join_only_column"``.
+        A qualified reference is resolved through its alias (a CTE or
+        derived-table alias is not a restricted table: its body is checked
+        where it is written); an unqualified one counts as restricted when
+        any table of its own ``SELECT`` is restricted for that name.
+    11. **Forbidden state-reading nodes (ADR-001, run anywhere in the
+        tree)** — ``exp.Parameter`` (``@@version``, ``@@spid``, ...),
+        ``exp.CurrentUser``, ``exp.SessionUser``, ``exp.CurrentSchema``,
+        and ``exp.ObjectId`` are refused regardless of where they appear
+        (projection, ``WHERE``, ``ORDER BY``, a CTE body, a scalar
+        subquery) — these read server/session/connection *state*, not
+        warehouse data, and no rephrasing makes that an in-bounds
+        question. ``exp.CurrentTimestamp`` (``GETDATE()``/
+        ``CURRENT_TIMESTAMP``) is deliberately exempt — legitimate,
+        ordinary data-query syntax with no reconnaissance value.
+    12. **Anonymous function allowlist (ADR-001)** — every ``exp.Anonymous``
+        node's upper-cased name must be one of
+        :data:`_SAFE_ANONYMOUS_FUNCTIONS` (the measured legitimate
+        residue of T-SQL data functions sqlglot has no dedicated
+        ``exp.Func`` subclass for). Everything else parses to a typed
+        ``exp.Func`` and never reaches this check; what falls through as
+        ``exp.Anonymous`` and is not in the allowlist is exactly the shape
+        a metadata/reconnaissance function (``SERVERPROPERTY``,
+        ``OBJECT_NAME``, ``COL_NAME``, ``DB_NAME``, ...) takes — one that
+        produces an output column the table/column allowlist above was
+        never designed to inspect, even against a query that references a
+        real, allowlisted table. The existing ``xp_*``/``sp_*``/
+        :data:`_DANGEROUS_FUNCTION_NAMES` check (rule 5) still fires first
+        for its own specific names; this is the broader allowlist-based
+        catch-all behind it.
+    13. **Table reference required (ADR-001, R1 — checked last)** — the
+        tree must contain at least one non-CTE ``exp.Table``. Rule 8
+        already allowlist-checks every such table as it walks the tree, so
+        this rule does not re-check membership — it only asserts that "a
+        real table exists" at all. A table-less query (``SELECT 1``,
+        ``SELECT * FROM (SELECT 1 AS a) z``) escapes the table allowlist
+        entirely rather than passing it, which rule 8 alone cannot catch
+        since it has nothing to reject. Deliberately checked *after* rules
+        11/12 so a query that is both table-less and reads forbidden state
+        (``SELECT @@version``) is reported as ``forbidden_statement`` (the
+        more specific violation), not ``no_table_reference``.
+
+    Parameters
+    ----------
+    sql:
+        The SQL string to validate.  Should already have been processed by
+        :func:`clean_sql` so markdown artefacts and preamble are removed.
+    denied_columns:
+        Optional iterable of column names (case-insensitive) to refuse
+        outright wherever they are referenced. This is a seam for
+        column-level access control (e.g. multi-tenant row/column
+        policies) — no default policy is applied; pass ``None`` (the
+        default) to skip this check entirely. An entry containing ``.``
+        or ``:`` is a scoped, join-only restriction instead (rule 10,
+        :mod:`security.column_policy`); a malformed one is refused as a
+        :class:`PolicyRejection` rather than ignored. Surrounding
+        whitespace and invisible Unicode format characters at the start and
+        end of an entry are removed before it is compared with a column
+        name; one inside a plain entry is kept, and the entry is also
+        denied without it.
+    dialect:
+        A sqlglot dialect key (see
+        :data:`security.dialects.DIALECT_PROFILES`). Defaults to
+        ``"tsql"`` — every existing call site that never passes this is
+        completely unaffected by multi-dialect support. Pass
+        :data:`config.Settings.sql_dialect` to validate SQL already
+        transpiled to this deployment's target dialect (see
+        :func:`transpile_and_revalidate`).
+
+    Returns
+    -------
+    None
+        Returns silently when the query is safe.
+
+    Raises
+    ------
+    ValueError
+        Always one of the two typed subclasses below (never a bare
+        ``ValueError``), with a human-readable message describing the
+        specific violation. Messages for a security-relevant rejection
+        (forbidden statement kind, dangerous function, denied column, ...)
+        contain the substring ``"Forbidden keyword"`` — callers (see
+        ``api/runner.py``) rely on that substring to distinguish a
+        security block from an ordinary malformed-SQL error.
+    CorrectableRejection
+        A malformed-but-fixable candidate a corrected re-prompt can
+        plausibly resolve: bad syntax, a literal ``LIMIT``, an unresolvable
+        table or column name, or a disallowed comment.
+    PolicyRejection
+        A candidate no re-prompt can resolve because the query itself is
+        categorically out of bounds: a forbidden statement type or nested
+        construct, a system-catalogue reference, or a denied column. The
+        two self-correction loops (``llm/sql_agent.py``,
+        ``session/engine.py``) stop retrying immediately on this one
+        rather than spending the rest of their ``max_corrections`` budget
+        re-asking a model that has no way to change the outcome.
+
+    Examples
+    --------
+    >>> validate_sql("SELECT TOP 10 * FROM Customer")   # passes silently
+
+    >>> validate_sql("")
+    Traceback (most recent call last):
+        ...
+    security.sql_guard.CorrectableRejection: Empty SQL
+
+    >>> validate_sql("DELETE FROM Contract")
+    Traceback (most recent call last):
+        ...
+    security.sql_guard.PolicyRejection: Forbidden keyword detected: DELETE
+
+    >>> validate_sql("DROP TABLE Contract")
+    Traceback (most recent call last):
+        ...
+    security.sql_guard.PolicyRejection: Forbidden keyword detected: DROP
+
+    >>> validate_sql("UPDATE Contract SET Price = 0")
+    Traceback (most recent call last):
+        ...
+    security.sql_guard.PolicyRejection: Forbidden keyword detected: UPDATE
+
+    >>> validate_sql("SELECT Price FROM Contract; DROP TABLE Contract")
+    Traceback (most recent call last):
+        ...
+    security.sql_guard.PolicyRejection: Forbidden keyword detected: DROP
+
+    >>> validate_sql("SELECT * FROM INFORMATION_SCHEMA.TABLES")
+    Traceback (most recent call last):
+        ...
+    security.sql_guard.PolicyRejection: System catalogue forbidden: INFORMATION_SCHEMA
+
+    >>> validate_sql("SELECT * FROM Contract LIMIT 10")
+    Traceback (most recent call last):
+        ...
+    security.sql_guard.CorrectableRejection: LIMIT is not valid T-SQL — use TOP instead
+
+    A column name that merely *contains* a legacy blocklist substring is no
+    longer a false positive (contrast ``tests/test_sql_guard_bypass.py``,
+    which documents this as a bug at the pre-Phase-1 baseline):
+
+    >>> validate_sql("SELECT EXP_DATE FROM Customer")   # passes silently
+
+    ``SELECT ... INTO`` is a write disguised as a read:
+
+    >>> validate_sql("SELECT * INTO NewTbl FROM Contract")
+    Traceback (most recent call last):
+        ...
+    security.sql_guard.PolicyRejection: Forbidden keyword detected: INTO
+
+    A table this module does not recognise is refused, even though it
+    starts with an otherwise-harmless ``SELECT`` — this does not depend on
+    the database login also being scoped to just the known tables (see
+    ``docs/db-hardening.md``):
+
+    >>> validate_sql("SELECT * FROM HR_Payroll")
+    Traceback (most recent call last):
+        ...
+    security.sql_guard.CorrectableRejection: Forbidden keyword detected: unknown table 'HR_Payroll' is not in the schema allowlist
+
+    A comment is refused outright, regardless of what it says:
+
+    >>> validate_sql("SELECT Price FROM Contract -- looks harmless")
+    Traceback (most recent call last):
+        ...
+    security.sql_guard.CorrectableRejection: SQL comments are not allowed: a comment is not executable SQL syntax, so its content is never inspected for keywords -- the comment itself is refused outright.
+
+    The optional column-level ACL seam:
+
+    >>> validate_sql("SELECT Name FROM Customer", denied_columns={"Name"})
+    Traceback (most recent call last):
+        ...
+    security.sql_guard.PolicyRejection: Forbidden keyword detected: denied column 'Name'
+
+    ``*`` cannot be used to read around an active column policy:
+
+    >>> validate_sql("SELECT * FROM Customer", denied_columns={"Name"})
+    Traceback (most recent call last):
+        ...
+    security.sql_guard.PolicyRejection: Forbidden keyword detected: '*' would expose denied column(s): ['name']
+
+    A scoped entry makes a column join-only on one table: fine as a join
+    key, refused anywhere else (the retry can still answer the question):
+
+    >>> validate_sql(
+    ...     "SELECT a.Name FROM Customer a JOIN Customer b ON a.ID = b.ID",
+    ...     denied_columns={"Customer.ID"},
+    ... )
+    >>> validate_sql("SELECT ID FROM Customer", denied_columns={"Customer.ID"})
+    Traceback (most recent call last):
+        ...
+    security.sql_guard.CorrectableRejection: Forbidden keyword detected: column 'ID' of table 'Customer' is restricted (policy entry 'Customer.ID'): it may only be used in JOIN ... ON a.col = b.col (an equality between two columns); remove it from the SELECT list, WHERE, GROUP BY, ORDER BY, HAVING, function arguments and USING(); if this column belongs to another table, qualify it with that table's alias
+    """
+    if not sql or not sql.strip():
+        raise CorrectableRejection("Empty SQL", reason="other")
+
+    if dialect == "tsql" and _LIMIT_RE.search(sql):
+        raise CorrectableRejection("LIMIT is not valid T-SQL — use TOP instead", reason="other")
+
+    profile = get_dialect_profile(dialect)
+
+    try:
+        raw_statements = sqlglot.parse(sql, read=dialect)
+    except SqlglotError as exc:
+        raise CorrectableRejection(f"SQL syntax error: {exc}", reason="other") from exc
+
+    statements = [stmt for stmt in raw_statements if stmt is not None]
+    if not statements:
+        raise CorrectableRejection("Empty SQL", reason="other")
+
+    if len(statements) > 1:
+        # Stacking is refused as a class regardless of content -- a known
+        # SQL-injection bypass vector, not a formatting mistake a retry
+        # could plausibly avoid by chance -- so both branches below are a
+        # PolicyRejection. Prefer naming the specific offending statement
+        # kind when one of the extra statements is recognisably dangerous
+        # (matches the pre-Phase-1 message shape for these cases); fall
+        # back to a generic message when every statement individually
+        # looks benign (e.g. "SELECT 1; SELECT 2").
+        for stmt in statements:
+            label = _forbidden_label(stmt)
+            if label is not None:
+                raise PolicyRejection(
+                    f"Forbidden keyword detected: {label}",
+                    reason="forbidden_statement", subject=label,
+                )
+        raise PolicyRejection(
+            "Forbidden keyword detected: multiple SQL statements are not "
+            f"allowed ({len(statements)} statements found)",
+            reason="forbidden_statement",
+        )
+
+    tree = statements[0]
+
+    root_label = _forbidden_label(tree)
+    if root_label is not None:
+        raise PolicyRejection(
+            f"Forbidden keyword detected: {root_label}",
+            reason="forbidden_statement", subject=root_label,
+        )
+    if not isinstance(tree, _ALLOWED_ROOT_TYPES):
+        raise PolicyRejection(
+            "Forbidden keyword detected: only SELECT / WITH / set-operation "
+            f"queries are allowed, got {type(tree).__name__}",
+            reason="forbidden_statement", subject=type(tree).__name__,
+        )
+
+    cte_names = _cte_names(tree)
+
+    for node in tree.walk():
+        label = _forbidden_label(node)
+        if label is not None:
+            raise PolicyRejection(
+                f"Forbidden keyword detected: {label}",
+                reason="forbidden_statement", subject=label,
+            )
+
+        # A comment is refused because it is present, not for what it
+        # says — scanning its text for keywords would just relocate the
+        # substring-matching mistake this module exists to get away from
+        # (see the module docstring). This intentionally does not reuse
+        # the "Forbidden keyword" phrasing: no keyword was found, the
+        # comment itself is the thing being refused. Classified as
+        # CorrectableRejection, not PolicyRejection: unlike a denied
+        # column or a forbidden statement, nothing about the *question*
+        # is out of bounds here -- the model can drop the comment and
+        # answer the exact same question on the very next attempt.
+        if node.comments:
+            raise CorrectableRejection(
+                "SQL comments are not allowed: a comment is not "
+                "executable SQL syntax, so its content is never inspected "
+                "for keywords -- the comment itself is refused outright.",
+                reason="other",
+            )
+
+        # T-SQL national-character literal (N'...') on a dialect that
+        # rejects it -- the finding that shapes this entire phase, found
+        # by direct execution against a real SQLite engine, not by
+        # reading: sqlglot's transpile leaves N'...' COMPLETELY UNCHANGED
+        # for every target dialect (it is not converted to a plain string
+        # literal), and its own parser silently ACCEPTS N'...' as valid
+        # input regardless of the `read=` dialect given -- so a naive
+        # "does the transpiled text still parse" check (this module's
+        # original re-validation plan) does not actually catch this at
+        # all; only an explicit rule does. Essentially every query this
+        # deployment generates filters on a Persian name, so essentially
+        # every query carries one of these -- this is not a rare edge
+        # case. See security.dialects.DialectProfile.supports_national_literal
+        # for exactly which dialects accept it (tsql, MySQL) and which
+        # reject it as a syntax error (PostgreSQL, SQLite).
+        if isinstance(node, exp.National) and not profile.supports_national_literal:
+            raise CorrectableRejection(
+                f"Forbidden keyword detected: T-SQL national-character "
+                f"literal ({node.sql(dialect=dialect)!r}) is not valid "
+                f"{dialect} syntax -- sqlglot leaves N'...' unchanged "
+                "under transpilation and its parser accepts it regardless "
+                "of dialect, so this is refused explicitly rather than "
+                "left to fail at the database",
+                reason="other",
+            )
+
+        # T-SQL string-concatenation-via-`+`, transpiled unchanged into a
+        # dialect where `+` is exclusively numeric addition -- found by
+        # direct execution against SQLite, not by reading: sqlglot parses
+        # `Name + ' (' + NationalID + ')'` as a generic arithmetic
+        # ``exp.Add`` expression in every dialect (T-SQL overloads `+` for
+        # both addition and concatenation with no distinct AST node), so
+        # transpiling it produces *identical*, syntactically valid-looking
+        # `+` text on the target dialect -- which then either raises a
+        # runtime type error (PostgreSQL) or, worse, silently coerces a
+        # non-numeric string operand to ``0`` and returns a plausible
+        # number instead of failing (confirmed for SQLite:
+        # ``'foo' + 'bar'`` evaluates to ``0``, not an error) -- exactly
+        # the "looks right, means something different" failure class this
+        # phase's verification exists to catch. Refusing every ``+`` is
+        # not viable (ordinary numeric addition, e.g. ``TotalPrice + Fee``,
+        # is common and legitimate), so this refuses only the *unambiguous*
+        # case: a ``+`` with a string-literal operand, which is never a
+        # legitimate numeric expression regardless of dialect. This does
+        # NOT catch the harder case of concatenating two *columns* typed
+        # as text with no literal present (``Name + NationalID``) --
+        # schema.yaml carries no column-type metadata this module could
+        # use to distinguish that from real numeric addition; that residual
+        # gap is reported, not silently left undocumented, in this phase's
+        # report. Scoped to non-tsql dialects only: this is exactly valid,
+        # correct T-SQL and must not be refused when *dialect* is "tsql".
+        if (
+            dialect != "tsql"
+            and isinstance(node, exp.Add)
+            and (_is_string_literal_operand(node.this) or _is_string_literal_operand(node.expression))
+        ):
+            raise CorrectableRejection(
+                "Forbidden keyword detected: '+' with a string-literal "
+                f"operand ({node.sql(dialect=dialect)!r}) is T-SQL string "
+                f"concatenation, which does not transpile to {dialect} -- "
+                "this dialect's '+' is exclusively numeric addition and "
+                "would silently coerce a string operand instead of "
+                "concatenating it",
+                reason="other",
+            )
+
+        if isinstance(node, exp.Anonymous) and _is_dangerous_identifier(node.name or "", dialect):
+            label = (node.name or "").upper()
+            raise PolicyRejection(
+                f"Forbidden keyword detected: {label}",
+                reason="forbidden_statement", subject=label,
+            )
+
+        if isinstance(node, exp.Table):
+            raw_name = node.name
+            if _is_dangerous_identifier(raw_name or "", dialect):
+                label = raw_name.upper()
+                raise PolicyRejection(
+                    f"Forbidden keyword detected: {label}",
+                    reason="forbidden_statement", subject=label,
+                )
+            db = (node.db or "").upper()
+            name_upper = (raw_name or "").upper()
+            # System-catalogue check for *this* dialect: an exact-match
+            # schema/db qualifier (INFORMATION_SCHEMA, pg_catalog, mysql,
+            # sqlite_master, ...) or a by-convention name PREFIX
+            # (postgres' pg_*, sqlite's sqlite_*) -- see
+            # security.dialects.DialectProfile's docstring for why these
+            # are two separate fields rather than one.
+            if db in profile.system_schemas:
+                raise PolicyRejection(
+                    f"System catalogue forbidden: {db}",
+                    reason="system_catalogue", subject=db,
+                )
+            if not db and name_upper in profile.system_schemas:
+                raise PolicyRejection(
+                    f"System catalogue forbidden: {name_upper}",
+                    reason="system_catalogue", subject=name_upper,
+                )
+            if any(db.startswith(prefix) for prefix in profile.system_name_prefixes):
+                raise PolicyRejection(
+                    f"System catalogue forbidden: {db}",
+                    reason="system_catalogue", subject=db,
+                )
+            if any(name_upper.startswith(prefix) for prefix in profile.system_name_prefixes):
+                raise PolicyRejection(
+                    f"System catalogue forbidden: {name_upper}",
+                    reason="system_catalogue", subject=name_upper,
+                )
+
+            # Table allowlist: unlike the column check below, this is not
+            # lenient. A raw_name of "" (an exp.Anonymous table-valued
+            # function, e.g. OPENROWSET(...) or sp_who()) is skipped here
+            # -- it is already refused above, either by the dangerous
+            # function-name checks or because it can never match
+            # TABLE_COLUMNS anyway once it does something real.
+            #
+            # A table's SCHEMA/DATABASE QUALIFIER, when the reference gives
+            # one, is now part of this check too (see docs/design/TABLE-NAMES.md
+            # and _match_table_ref's own docstring for the full rule):
+            # a query that writes some OTHER schema in front of an
+            # allowlisted table's bare name (``[hr].[Customer]`` when only
+            # ``sales.Customer`` is allowlisted) used to sail through this
+            # check unexamined -- the qualifier was simply never looked at
+            # -- which let a query reach a table NOT in the allowlist merely
+            # by naming a different schema. :func:`_match_table_ref` closes
+            # that hole: a qualified reference must match a known qualifier
+            # exactly (a candidate with no db_schema set at all still
+            # accepts any qualifier -- a documented, residual gap; see that
+            # function's docstring).
+            if raw_name and raw_name.lower() not in cte_names:
+                _, sql_qualifier = _table_ref_name_and_qualifier(node)
+                match = _match_table_ref(raw_name, sql_qualifier)
+                if match.status == "resolved":
+                    pass
+                elif match.status == "unknown":
+                    # CorrectableRejection: a hallucinated or misspelled
+                    # table name is exactly the kind of small-model mistake
+                    # a retry can plausibly fix by naming a real table --
+                    # unlike a denied column, nothing here says the
+                    # question itself may not be asked. It is, however,
+                    # STILL a refusal on the other axis (is_refusal): the
+                    # allowlist violation, not the SQL's shape, is why this
+                    # was rejected, so this specific instance overrides the
+                    # class default -- see SqlGuardRejection's docstring.
+                    exc = CorrectableRejection(
+                        f"Forbidden keyword detected: unknown table "
+                        f"'{raw_name}' is not in the schema allowlist",
+                        reason="unknown_table", subject=raw_name,
+                    )
+                    exc.is_refusal = True
+                    raise exc
+                elif match.status in ("qualifier_mismatch", "multi_part_only"):
+                    # The bare name IS a real table (or more than one), but
+                    # none of them is reachable the way this reference wrote
+                    # it -- either the given qualifier names no known
+                    # candidate, or the one candidate that exists lives in
+                    # another database and an unqualified reference would
+                    # read the wrong one. Reported as unknown_table (a
+                    # retry can plausibly fix it by writing the right
+                    # qualifier) with a "did you mean" naming every
+                    # candidate's actual reference.
+                    suggestions = ", ".join(
+                        table_reference_sql(key, _QUALIFIER_STR.get(key, ""))
+                        for key in match.candidates
+                    )
+                    written = (
+                        f"{'.'.join(sql_qualifier)}.{raw_name}" if sql_qualifier else raw_name
+                    )
+                    exc = CorrectableRejection(
+                        f"Forbidden keyword detected: table '{written}' is "
+                        f"not in the schema allowlist; did you mean "
+                        f"{suggestions}?",
+                        reason="unknown_table", subject=raw_name,
+                    )
+                    exc.is_refusal = True
+                    raise exc
+                elif match.status == "ambiguous":
+                    # More than one candidate and no way to tell which one
+                    # this reference means -- an unqualified mention of a
+                    # bare name more than one schema.yaml key shares. A
+                    # retry can plausibly fix this by writing one of the
+                    # qualified references named in the message, so this is
+                    # correctable, not a PolicyRejection (the question
+                    # itself is answerable, just not phrased unambiguously
+                    # yet).
+                    suggestions = ", ".join(
+                        table_reference_sql(key, _QUALIFIER_STR.get(key, ""))
+                        for key in match.candidates
+                    )
+                    exc = CorrectableRejection(
+                        f"Forbidden keyword detected: table '{raw_name}' "
+                        f"exists in more than one schema; write one of "
+                        f"{suggestions} to say which",
+                        reason="ambiguous_table", subject=raw_name,
+                    )
+                    exc.is_refusal = True
+                    raise exc
+
+    _require_single_datasource(tree, cte_names)
+
+    try:
+        policy = cached_column_policy(denied_columns)
+    except ColumnPolicyError as exc:
+        # Unreachable for a key that passed load-time checking; reached for a
+        # malformed entry that got into storage some other way. Refuse rather
+        # than ignore it: an entry that cannot be read is an entry that
+        # restricts nothing, and nothing is the wrong default for an ACL.
+        logger.error("column policy unreadable: %s", exc)
+        raise PolicyRejection(
+            f"Forbidden keyword detected: the column policy for this key is invalid ({exc})",
+            reason="other",
+        ) from None
+    denied = policy.denied
+    alias_map = _collect_table_alias_map(tree, cte_names)
+
+    for col in tree.find_all(exp.Column):
+        name = col.name
+        if not name or name == "*":
+            continue
+        if name.upper() in denied:
+            raise PolicyRejection(
+                f"Forbidden keyword detected: denied column '{name}'",
+                reason="denied_column", subject=name,
+            )
+
+        qualifier = (col.table or "").lower()
+        if not qualifier:
+            # An unqualified column can't be safely resolved to a single
+            # table in the general case (joins, CTEs, computed aliases in
+            # ORDER BY/GROUP BY) — allow rather than risk a false positive.
+            continue
+        canonical = alias_map.get(qualifier)
+        if canonical is None:
+            # Qualifier is a CTE name or a derived-table alias --
+            # unresolvable, so allow. (It cannot be an unrecognised table
+            # name: every non-CTE exp.Table was already checked against
+            # the allowlist above.)
+            continue
+        if name.lower() not in _COLUMNS_BY_TABLE[canonical]:
+            # CorrectableRejection: same reasoning as the unknown-table
+            # case above -- a hallucinated column name, plausibly fixed
+            # by a retry that names a real one.
+            unknown_column = CorrectableRejection(
+                f"Unknown column '{name}' on table '{canonical}'",
+                reason="other", subject=name,
+            )
+            unknown_column.table = canonical
+            raise unknown_column
+
+    if denied:
+        # "*" must not be usable to silently read around an active
+        # column-denial policy -- expand it against whatever it resolves
+        # to and check the expansion, or refuse it outright if it can't be
+        # resolved with confidence (see _resolve_star_tables). Both
+        # branches enforce the same denied-column policy as the named-
+        # column check above, so both are PolicyRejection: no rewrite of
+        # the query can make the underlying question answerable without
+        # touching the denied column.
+        for star in tree.find_all(exp.Star):
+            parent = star.parent
+            if isinstance(parent, exp.Column) and parent.table:
+                canonical = alias_map.get(parent.table.lower())
+                table_names = [canonical] if canonical else None
+                ref_label = f"{parent.table}.*"
+            else:
+                table_names = _resolve_star_tables(_enclosing_select(star), cte_names)
+                ref_label = "*"
+
+            if table_names is None:
+                # `subject` stays `None`: no single column can be named
+                # here at all -- that is exactly *why* this branch fires
+                # (an unresolvable `*`/`alias.*`), so there is nothing for
+                # a caller to build a targeted "ask without that column"
+                # action around; the generic rephrase action is the only
+                # honest one for this specific rejection.
+                raise PolicyRejection(
+                    f"Forbidden keyword detected: cannot verify whether "
+                    f"'{ref_label}' exposes a denied column -- name the "
+                    "columns explicitly instead of using '*'",
+                    reason="denied_column",
+                )
+
+            exposed_denied = sorted(
+                col
+                for table_name in table_names
+                for col in _COLUMNS_BY_TABLE[table_name]
+                if col.upper() in denied
+            )
+            if exposed_denied:
+                # `subject` names the one column a caller can offer to drop
+                # only when exactly one is exposed -- when `*` unmasks
+                # several at once there is no single column whose removal
+                # would fix the question, so `subject` is left `None`
+                # rather than picking one of several arbitrarily.
+                raise PolicyRejection(
+                    f"Forbidden keyword detected: '{ref_label}' would "
+                    f"expose denied column(s): {exposed_denied}",
+                    reason="denied_column",
+                    subject=exposed_denied[0] if len(exposed_denied) == 1 else None,
+                )
+
+    if policy.join_only:
+        # Scoped entries: join-only columns, for the data source this query
+        # will run on. Resolving the entries checks them against the schema
+        # and the configured sources again (cheap), so a key whose entries
+        # were never checked at load fails here, loudly, instead of
+        # restricting nothing.
+        try:
+            restrictions = resolve_join_only(
+                policy,
+                SchemaView(columns_by_table=_COLUMNS_BY_TABLE, qualifiers=_QUALIFIER_STR),
+                _executing_source(tree, cte_names),
+            )
+        except ColumnPolicyError as exc:
+            logger.error("column policy invalid: %s", exc)
+            raise PolicyRejection(
+                f"Forbidden keyword detected: the column policy for this key is invalid ({exc})",
+                reason="other",
+            ) from None
+        if restrictions:
+            _enforce_join_only(tree, cte_names, restrictions, alias_map)
+
+    # -------------------------------------------------------------------
+    # ADR-001 -- the projection-allowlist rule (R1/R2/R3, run last)
+    # -------------------------------------------------------------------
+    # Every rule above this point gates on the query's *shape* (statement
+    # kind) or on tables/columns it references *by name* -- but the table
+    # and column allowlists (rules 8/9) are keyed off ``exp.Table``/
+    # ``exp.Column`` nodes only. A query with no table reference at all
+    # (``SELECT @@version``, ``SELECT 1``) never touches that allowlist in
+    # either direction, and a query that DOES reference a real, allowlisted
+    # table can still smuggle a server/session-state read or a metadata
+    # function (``SERVERPROPERTY``, ``OBJECT_NAME``, ``COL_NAME``, ...) into
+    # its SELECT list -- an output column the allowlist was never designed
+    # to inspect, since it's neither a column reference nor a table
+    # reference. Functions/session-variables were, until this rule, the one
+    # construct still governed by a denylist (the dangerous-function-name
+    # check above) rather than the allowlist model the rest of this module
+    # committed to -- and a denylist is exactly the "guess every bad
+    # spelling" posture this module's own rewrite (see the module
+    # docstring) replaced everywhere else. These three rules close that
+    # gap: the guard now enforces warehouse-reading queries only --
+    # allowlisted tables/columns read through ordinary data functions -- not
+    # merely "no destructive statement, no unknown table".
+    #
+    # R2/R3 run BEFORE R1 so a forbidden construct is reported as
+    # ``forbidden_statement`` rather than ``no_table_reference`` when a
+    # query is guilty of both (``SELECT @@version`` has no table reference
+    # AND reads session state -- it is reported for the state read, the
+    # more specific violation).
+    for node in tree.walk():
+        # R2 -- server/session/connection *state* nodes, anywhere in the
+        # tree (a WHERE clause, an ORDER BY, a CTE body, a scalar
+        # subquery -- not just the projection). Each of these has its own
+        # typed sqlglot node; deliberately excludes exp.CurrentTimestamp,
+        # which is ordinary, legitimate GETDATE()/CURRENT_TIMESTAMP syntax
+        # with no reconnaissance value. This is a PolicyRejection: no
+        # rephrasing makes reading server/session state an in-bounds
+        # question for this application.
+        if isinstance(node, _FORBIDDEN_STATE_NODE_TYPES):
+            # The label is the node's own rendered SQL, not its Python
+            # class name (``type(node).__name__`` would give ``PARAMETER``
+            # for ``@@version`` or ``CURRENTUSER`` for ``SYSTEM_USER``) --
+            # ``GuardVerdict.subject`` is contractually analyst-facing (see
+            # its docstring in session/models.py) and a sqlglot class name
+            # is internal implementation detail, meaningless to an analyst
+            # and never something they typed. The argument list is cut at
+            # the first ``(`` so a model-generated literal argument (e.g.
+            # ``SCHEMA_NAME(1)``, ``OBJECT_ID('x')``) never ends up
+            # embedded in the structured ``subject`` field.
+            label = node.sql(dialect=dialect).split("(", 1)[0].strip().upper()
+            raise PolicyRejection(
+                f"Forbidden keyword detected: {label}",
+                reason="forbidden_statement", subject=label,
+            )
+
+        # R3 -- Anonymous function allowlist. Every T-SQL function
+        # sqlglot gives a dedicated exp.Func subclass to (SUM, CAST,
+        # DATEADD, ROW_NUMBER, ...) never reaches this branch; what's left
+        # as exp.Anonymous is exactly the measured legitimate data-function
+        # residue in _SAFE_ANONYMOUS_FUNCTIONS, or a metadata/
+        # reconnaissance function this rule exists to catch
+        # (SERVERPROPERTY, OBJECT_NAME, COL_NAME, DB_NAME, ...). The
+        # dangerous-function-name / xp_*/sp_* check above already fires
+        # first for its own specific names; this is the broader catch-all
+        # behind it, keyed on an allowlist rather than another denylist.
+        if isinstance(node, exp.Anonymous):
+            name = (node.name or "").upper()
+            if name not in _SAFE_ANONYMOUS_FUNCTIONS:
+                raise PolicyRejection(
+                    f"Forbidden keyword detected: {name or 'ANONYMOUS'}",
+                    reason="forbidden_statement", subject=name or None,
+                )
+
+    # R1 -- table reference required. By this point every non-CTE
+    # exp.Table in the tree has already been allowlist-checked above (rule
+    # 8), so finding at least one is sufficient proof "a real table exists"
+    # -- this rule does not re-check allowlist membership. A query with no
+    # non-CTE table reference at all (SELECT 1, or SELECT * FROM a derived
+    # table with no real source) has escaped the table allowlist entirely
+    # rather than passed it, which is a distinct failure mode from an
+    # unknown table name. CorrectableRejection + is_refusal=True, matching
+    # the unknown_table raise site's shape: naming a real table is a fix a
+    # retry can plausibly make, but the allowlist violation -- not the
+    # SQL's shape -- is why this was rejected.
+    if not any(
+        isinstance(node, exp.Table) and (node.name or "").lower() not in cte_names
+        for node in tree.walk()
+    ):
+        exc = CorrectableRejection(
+            "Forbidden keyword detected: query has no table reference -- "
+            "a warehouse-reading query must select from at least one "
+            "allowlisted table",
+            reason="no_table_reference",
+        )
+        exc.is_refusal = True
+        raise exc
+
+
+def extract_touched_tables(sql: str, dialect: str = _DIALECT) -> list[str]:
+    """Return the canonical, known table names *sql* references, sorted.
+
+    This is the read-only observability counterpart to
+    :func:`validate_sql`'s rule 8 table allowlist: that check already
+    walks the whole AST resolving every ``exp.Table`` node against
+    :data:`schema_data.columns.TABLE_COLUMNS` (via :func:`_resolve_table_name`)
+    in order to reject an unknown one. This function reuses the exact
+    same resolution to *report* what it found instead of gating on it —
+    the intended caller (``api/runner.py``'s audit trail, per
+    ``docs/api-contract-v2.md`` §4's ``guard.tables_touched``) needs "which
+    known tables did this query read", not a second validation pass.
+
+    Deliberately lenient rather than a guard: a CTE reference is excluded
+    (it is not a real table), and anything this function cannot resolve —
+    including *sql* failing to parse at all — is silently skipped rather
+    than raised. Calling this on SQL that has already passed
+    :func:`validate_sql` is the common case and never hits that leniency;
+    it is also safe to call on a *rejected* candidate query (e.g. to
+    report which known tables a forbidden query still touched), where
+    some references may legitimately be unresolvable.
+
+    Parameters
+    ----------
+    sql:
+        Any SQL string — typically SQL that already passed or was
+        rejected by :func:`validate_sql`.
+    dialect:
+        A sqlglot dialect key. Defaults to ``"tsql"``. Pass the target
+        dialect when calling this on already-transpiled SQL (see
+        :func:`transpile_and_revalidate`, which uses this function on
+        *both* the source and transpiled text to confirm transpilation
+        did not silently change which tables a query touches).
+
+    Returns
+    -------
+    list[str]
+        Canonical table names (as they appear in ``TABLE_COLUMNS``),
+        de-duplicated and sorted. Empty if *sql* fails to parse, is
+        empty, or references no table this module recognises.
+
+    Examples
+    --------
+    >>> extract_touched_tables("SELECT * FROM Customer")
+    ['Customer']
+
+    >>> extract_touched_tables(
+    ...     "SELECT c.Name FROM Customer c JOIN [Order] o ON o.CustomerId = c.Id"
+    ... )
+    ['Customer', 'Order']
+
+    A CTE reference is not a table:
+
+    >>> extract_touched_tables("WITH cte AS (SELECT * FROM Customer) SELECT * FROM cte")
+    ['Customer']
+
+    Unparsable or table-free SQL degrades to an empty list, never raises:
+
+    >>> extract_touched_tables("not valid sql at all")
+    []
+    >>> extract_touched_tables("")
+    []
+    """
+    try:
+        raw_statements = sqlglot.parse(sql, read=dialect)
+    except SqlglotError:
+        return []
+
+    statements = [stmt for stmt in raw_statements if stmt is not None]
+    if not statements:
+        return []
+
+    touched: set[str] = set()
+    for tree in statements:
+        cte_names = _cte_names(tree)
+        for node in tree.find_all(exp.Table):
+            canonical = _resolve_table_name(node, cte_names)
+            if canonical:
+                touched.add(canonical)
+    return sorted(touched)
+
+
+def _setop_branches(node: exp.Expression) -> list[exp.Expression]:
+    """Flatten a (possibly nested) set-operation tree into its immediate branches.
+
+    ``a UNION b UNION c`` parses as a left-leaning tree of nested
+    :class:`exp.Union` nodes (``Union(this=Union(this=a, expression=b),
+    expression=c)``); this returns ``[a, b, c]`` — the query's own
+    top-level ``SELECT`` branches — without descending into a branch's
+    *own* ``FROM`` source, so a derived table's inner query (which sits at
+    a real nesting level, inside a :class:`exp.Subquery`) is never
+    mistaken for one of the set operation's own branches. Used by
+    :func:`ensure_top` to correctly distinguish a top-level trailing
+    ``ORDER BY`` (attaches to the last branch reached this way) from one
+    that belongs to a branch's own subquery (invisible to this walk,
+    exactly as it should be).
+    """
+    if isinstance(node, (exp.Union, exp.Intersect, exp.Except)):
+        return _setop_branches(node.this) + _setop_branches(node.expression)
+    return [node]
+
+
+def _ensure_top_ast(sql: str, n: int, dialect: str) -> str:
+    """AST-based row cap for every dialect except tsql — see :func:`ensure_top`.
+
+    Parses *sql* with sqlglot pinned to *dialect*, reads whether a
+    row-limiting clause already exists directly off the tree's own
+    ``limit`` argument (covers ``TOP``/``LIMIT``/etc. uniformly — no
+    per-dialect clause name to hardcode), and — when one is missing — adds
+    it via ``exp.Select.limit()`` and renders the **whole** tree with
+    ``Expression.sql(dialect=dialect)``. This is unsafe to use for tsql
+    (see :func:`ensure_top`'s docstring for why) but is exactly right for
+    every other dialect: there is no pre-existing byte-exact production
+    text to preserve for a dialect this deployment never targeted before,
+    and a full, correct AST render is strictly better than a second
+    hand-written paren-depth scanner per dialect.
+    """
+    try:
+        tree = sqlglot.parse_one(sql, read=dialect)
+    except SqlglotError as exc:
+        # CorrectableRejection: a parse failure here is a mismatch between
+        # this function and what validate_sql's own parser already
+        # accepted as well-formed *dialect* SQL -- not a policy call about
+        # the question itself, so a differently-structured (but still
+        # valid) retry can plausibly get past it.
+        raise CorrectableRejection(
+            f"ensure_top: {sql[:200]!r} does not parse as {dialect} SQL "
+            f"({exc}) — refusing to guess where to inject a row cap",
+            reason="other",
+        ) from exc
+
+    if isinstance(tree, exp.Select):
+        if tree.args.get("limit") is not None:
+            return sql  # outermost query already capped -- untouched, byte-identical
+        capped = tree.copy()
+        capped.limit(n, copy=False)
+        return capped.sql(dialect=dialect)
+
+    if isinstance(tree, (exp.Union, exp.Intersect, exp.Except)):
+        if tree.args.get("limit") is not None:
+            return sql  # outermost query already capped -- untouched, byte-identical
+
+        # A trailing top-level ORDER BY attaches to different nodes
+        # depending on dialect -- confirmed by direct parsing, not
+        # assumed: tsql attaches it to the rightmost branch's own Select
+        # (see the tsql-only text-splicing path's _has_top_level_order_by
+        # helper), while postgres/mysql/sqlite attach it directly to the
+        # Union/Intersect/Except node itself (`tree.args["order"]`). Both
+        # locations must be checked -- checking only one silently missed
+        # the other for exactly the dialects this function is used for.
+        branches = _setop_branches(tree)
+        has_order_by = tree.args.get("order") is not None or any(
+            isinstance(branch, exp.Select) and branch.args.get("order")
+            for branch in branches
+        )
+        if has_order_by:
+            # CorrectableRejection: same reasoning as the parse-failure
+            # branch above -- a query shaped without a top-level ORDER BY
+            # on the set operation would sail through unaffected, so this
+            # is a fixable structural limitation of this function, not a
+            # refusal of the question.
+            raise CorrectableRejection(
+                "ensure_top: cannot safely cap a UNION/INTERSECT/EXCEPT "
+                "query that also has a top-level ORDER BY (wrapping it in "
+                "a derived table would make that ORDER BY invalid) — "
+                "refusing to emit unsafe SQL",
+                reason="other",
+            )
+
+        # Detach any CTEs before wrapping (they belong on the new OUTER
+        # query, not re-attached to the inner derived table -- sqlglot
+        # would happily render either, but only the former is valid SQL:
+        # a CTE must be visible to the query that references its alias).
+        with_ = tree.args.get("with")
+        core = tree.copy()
+        core.set("with", None)
+        wrapped = exp.select("*").from_(core.subquery("_ensure_top_capped")).limit(n)
+        if with_ is not None:
+            wrapped.set("with", with_.copy())
+        return wrapped.sql(dialect=dialect)
+
+    # CorrectableRejection: validate_sql's own root-type check already
+    # refuses anything that isn't SELECT/set-operation before this
+    # function is ever reached in the real pipeline -- reaching this
+    # branch means a caller invoked ensure_top() directly on something
+    # validate_sql never approved, which is a caller mistake a retry with
+    # correctly-shaped SQL can plausibly fix.
+    raise CorrectableRejection(
+        f"ensure_top: {sql[:200]!r} is not a SELECT/WITH/set-operation "
+        f"query in {dialect} (parsed as {type(tree).__name__ if tree else 'nothing'}) "
+        "— refusing to guess where to inject a row cap",
+        reason="other",
+    )
+
+
+def ensure_top(sql: str, n: int = 100, dialect: str = _DIALECT) -> str:
+    """Inject a row cap into *sql* if no row-limiting clause is already present.
+
+    This is a safety net applied **after** :func:`validate_sql` to guarantee
+    the database never returns an unbounded result set to the API layer,
+    regardless of whether the model's own SQL included one.
+
+    Two implementations, chosen by *dialect* — and why
+    -------------------------------------------------------
+    This function was rewritten for multi-dialect support to use a genuine
+    sqlglot AST cap (``exp.Select.limit()``, rendered with
+    ``Expression.sql(dialect=...)``) instead of the original hand-written
+    paren-depth / string-literal-aware scanner — that scanner is real,
+    tested, and correct, but it is also "a parser with extra steps" (see
+    the module docstring), and it would need to grow a second, per-dialect
+    opinion about row-limiting syntax to serve any target besides tsql.
+
+    That AST rewrite was verified — by running it, not by reading it —
+    against every existing test in ``tests/test_sql_guard.py`` and
+    ``tests/test_sql_guard_bypass.py``, and it changes the **rendered
+    text** of any query that (a) actually needs a cap injected (not
+    already capped) **and** (b) contains an unaliased CTE/derived-table
+    column (``SELECT 1`` inside a CTE becomes ``SELECT 1 AS [1]``) **or**
+    any operator sqlglot re-spaces on render (``Active=1`` becomes
+    ``Active = 1``). For *tsql specifically*, that is not a narrow edge
+    case confined to this function's own tests: ``clean_sql``'s
+    LIMIT-to-TOP conversion also calls this function, so the same
+    reformatting leaked into ordinary ``clean_sql`` output too (e.g.
+    ``WHERE Active=1`` silently became ``WHERE Active = 1``) — semantically
+    identical SQL, but a **different string**, for what is the common case
+    in production (any generated query that doesn't already carry its own
+    ``TOP``). That is a real behavioural change for this deployment's
+    default and only dialect before this phase, with consequences beyond
+    this module's own tests (cache keys, audit-log SQL text, golden-set
+    fixtures) — not something "keep the existing tests passing unchanged
+    for tsql" can be read to permit.
+
+    So: **tsql keeps the original text-splicing implementation, completely
+    unchanged** (delegated to the module-private helpers this function
+    used before this phase — see their docstrings), and the new AST-based
+    cap (:func:`_ensure_top_ast`) is used for every *other* dialect, where
+    there is no pre-existing byte-exact production text to protect and a
+    full AST render is unambiguously the right tool. This is the same
+    shape of exception as the tsql-only ``LIMIT`` rejection in
+    :func:`validate_sql`: one condition on *dialect*, not a per-dialect
+    branching ladder, kept deliberately narrow and explained at the one
+    place it exists.
+
+    Behaviour (both implementations)
+    ------------------------------------
+    * **Plain query** — a row cap is added to the outermost query.
+    * **CTE** (``WITH x AS (...) SELECT ...``) — the cap lands on the
+      outer query following the CTE definition(s), not the CTE body's own
+      ``SELECT``.
+    * **Subquery** (``SELECT ... FROM (SELECT TOP n ...) z``) — the outer
+      query is still capped even though a subquery already has its own
+      row-limiting clause.
+    * **Already capped** — if the outermost query already has a
+      row-limiting clause, *sql* is returned **completely unchanged**,
+      preserving both an existing limit even if higher than *n* and the
+      input's exact original text.
+    * **Top-level** ``UNION``/``INTERSECT``/``EXCEPT`` — a cap on only the
+      first branch would cap that branch, not the combined result
+      actually returned, so the whole (post-CTE) query is wrapped in a
+      capped outer ``SELECT * FROM (...) AS _ensure_top_capped`` instead.
+
+    Parameters
+    ----------
+    sql:
+        A validated SELECT (or WITH/CTE, or set-operation) query string in
+        *dialect*.
+    n:
+        The row cap to inject when no row-limiting clause is present.
+        Defaults to ``100``. Pass ``cfg.settings.default_top_n`` to use the
+        application-level default.
+    dialect:
+        A sqlglot dialect key (see
+        :data:`security.dialects.DIALECT_PROFILES`). Defaults to
+        ``"tsql"`` — every call site that never passes this argument is
+        completely unaffected by multi-dialect support, byte-for-byte.
+
+    Returns
+    -------
+    str
+        *sql*, either unchanged (the outermost query already has a
+        row-limiting clause) or with a cap injected — or, for a top-level
+        set operation, wrapped in a new capped outer query.
+
+    Raises
+    ------
+    CorrectableRejection
+        A :class:`ValueError` subclass (see the module docstring's
+        exception taxonomy) — neither case below is a policy refusal of
+        the question, just a structural limit of this function, so a
+        differently-shaped retry can plausibly get past it:
+
+        * If no top-level query can be found/parsed at all.
+        * If *sql* is a top-level ``UNION``/``INTERSECT``/``EXCEPT`` that
+          also has a top-level ``ORDER BY`` — wrapping it in a derived
+          table would make that ``ORDER BY`` invalid, and correctly
+          hoisting it out of the wrapper is out of scope for a row-cap
+          injector.
+
+    Examples
+    --------
+    >>> ensure_top("SELECT * FROM Contract", n=50)
+    'SELECT TOP 50 * FROM Contract'
+
+    >>> ensure_top("SELECT TOP 10 * FROM Contract", n=50)
+    'SELECT TOP 10 * FROM Contract'
+
+    >>> ensure_top("SELECT DISTINCT Name FROM Customer", n=20)
+    'SELECT DISTINCT TOP 20 Name FROM Customer'
+
+    >>> ensure_top("WITH cte AS (SELECT 1) SELECT * FROM cte", n=20)
+    'WITH cte AS (SELECT 1) SELECT TOP 20 * FROM cte'
+
+    >>> ensure_top("SELECT * FROM (SELECT TOP 1 a FROM t) z", n=10)
+    'SELECT TOP 10 * FROM (SELECT TOP 1 a FROM t) z'
+
+    >>> ensure_top("SELECT a FROM t1 UNION SELECT b FROM t2", n=5)
+    'SELECT TOP 5 * FROM (SELECT a FROM t1 UNION SELECT b FROM t2) AS _ensure_top_capped'
+
+    >>> ensure_top("SELECT a FROM t1 LIMIT 5", n=50, dialect="postgres")
+    'SELECT a FROM t1 LIMIT 5'
+
+    >>> ensure_top("SELECT a FROM t1", n=5, dialect="postgres")
+    'SELECT a FROM t1 LIMIT 5'
+    """
+    if dialect != "tsql":
+        return _ensure_top_ast(sql, n, dialect)
+
+    matches = _top_level_select_matches(sql)
+    if not matches:
+        # CorrectableRejection: this is a mismatch between the regex-based
+        # scanner here and what validate_sql's parser already accepted as
+        # a well-formed query -- not a policy call about the question
+        # itself, so a differently-structured (but still valid) retry can
+        # plausibly get past it.
+        raise CorrectableRejection(
+            f"ensure_top: no top-level SELECT found in {sql[:200]!r} — "
+            "refusing to guess where to inject TOP",
+            reason="other",
+        )
+
+    if len(matches) > 1:
+        # Top-level UNION / INTERSECT / EXCEPT: two or more SELECTs at
+        # paren depth 0. TOP after only the first branch would cap that
+        # branch, not the combined result actually returned — wrap the
+        # whole (post-CTE) query in a capped outer SELECT instead.
+        prefix = sql[: matches[0].start()]
+        body = sql[matches[0].start():]
+        if _has_top_level_order_by(body):
+            # CorrectableRejection: same reasoning as above -- a query
+            # shaped without a top-level ORDER BY on the set operation
+            # would sail through, so this is a fixable structural
+            # limitation of this function, not a refusal of the question.
+            raise CorrectableRejection(
+                "ensure_top: cannot safely cap a UNION/INTERSECT/EXCEPT "
+                "query that also has a top-level ORDER BY without a full "
+                "SQL parser (wrapping it in a derived table would make "
+                "that ORDER BY invalid T-SQL) — refusing to emit unsafe SQL",
+                reason="other",
+            )
+        return f"{prefix}SELECT TOP {n} * FROM ({body}) AS _ensure_top_capped"
+
+    match = matches[0]
+    pos = match.end()
+    rest = sql[pos:]
+
+    distinct_match = _DISTINCT_AFTER_SELECT_RE.match(rest)
+    if distinct_match:
+        after = distinct_match.end()
+        if _TOP_AFTER_RE.match(rest[after:]):
+            return sql  # already 'SELECT DISTINCT TOP n ...'
+        return sql[:pos] + rest[:after] + f" TOP {n}" + rest[after:]
+
+    if _TOP_AFTER_RE.match(rest):
+        return sql  # outermost SELECT already capped
+
+    return sql[:pos] + f" TOP {n}" + rest
+
+
+# ---------------------------------------------------------------------------
+# Multi-dialect pipeline: transpile the model's tsql output, then re-verify
+# it in the dialect it will actually run in.
+# ---------------------------------------------------------------------------
+
+def _strip_unsupported_national_literals(node: exp.Expression, dialect: str) -> exp.Expression:
+    """Rewrite ``exp.National`` (T-SQL's ``N'...'``) to a plain string literal.
+
+    Used by :func:`transpile_sql` as a targeted fix for this phase's
+    headline finding: sqlglot's transpile leaves ``N'...'`` **completely
+    unchanged** for every target dialect — it is not converted to a plain
+    string literal — even though a national-character literal is
+    semantically *just a string* on a natively-Unicode database that has
+    no separate national character set to distinguish it from (PostgreSQL,
+    SQLite both store ``TEXT``/``VARCHAR`` as UTF-8 natively; there is
+    nothing for the ``N`` prefix to opt into). Dropping the prefix is
+    therefore not a lossy approximation, it is the *correct* rendering —
+    unlike the ``+``-concatenation gap (also found in this phase; see
+    :func:`validate_sql`), there is no ambiguity here to preserve by
+    refusing instead of rewriting.
+
+    Only applied when :attr:`~security.dialects.DialectProfile.supports_national_literal`
+    is ``False`` for *dialect* (PostgreSQL, SQLite) — leaves the tree
+    completely alone for a dialect that accepts ``N'...'`` natively (tsql,
+    MySQL), so this function is a no-op there by construction, not by a
+    special-cased early return.
+    """
+    if get_dialect_profile(dialect).supports_national_literal:
+        return node
+    if isinstance(node, exp.National):
+        inner = node.this
+        value = inner.this if isinstance(inner, exp.Literal) else str(inner)
+        return exp.Literal.string(value)
+    return node
+
+
+def transpile_sql(sql: str, *, target_dialect: str, source_dialect: str = _DIALECT) -> str:
+    """Transpile *sql* from *source_dialect* to *target_dialect* with sqlglot.
+
+    Parses *sql* with sqlglot pinned to *source_dialect*, applies exactly
+    one targeted rewrite — :func:`_strip_unsupported_national_literals`,
+    converting a T-SQL national-character literal to a plain string
+    literal when *target_dialect* cannot parse the former (see that
+    function's docstring for why this is a correct rewrite, not a lossy
+    one) — and renders the result with *target_dialect*'s own syntax.
+    Every other construct is handled entirely by sqlglot's own dialect
+    support (see the module docstring's "Do not build a dialect layer"
+    principle): this function does not implement a second, hand-written
+    opinion about SQL shape, it adds one narrow, config-keyed correction
+    for a gap sqlglot itself does not close.
+
+    Every rejection is a typed :class:`CorrectableRejection`, not a bare
+    :class:`SqlglotError`, matching every other guard function in this
+    module, so a caller (see :func:`transpile_and_revalidate`) does not
+    need a second exception type to catch.
+
+    Parameters
+    ----------
+    sql:
+        SQL text in *source_dialect*. Should already have passed
+        :func:`validate_sql` (pinned to *source_dialect*) and
+        :func:`ensure_top` — this function has no opinion about whether
+        *sql* is safe, only about whether it transpiles.
+    target_dialect:
+        The sqlglot dialect key to render *sql* as.
+    source_dialect:
+        The sqlglot dialect key *sql* is written in. Defaults to
+        ``"tsql"`` — the one dialect the model ever generates (see
+        :data:`config.Settings.sql_dialect`'s docstring).
+
+    Returns
+    -------
+    str
+        *sql* re-rendered in *target_dialect*'s own syntax.
+
+    Raises
+    ------
+    CorrectableRejection
+        If *sql* fails to parse as *source_dialect*. This is a
+        :class:`CorrectableRejection`, not a :class:`PolicyRejection`: a
+        transpilation failure is a property of this *specific* SQL shape,
+        not of the question being categorically out of bounds — a
+        differently-phrased retry that happens to generate an equivalent
+        but more portable query can plausibly succeed where this one
+        failed.
+
+    Examples
+    --------
+    >>> transpile_sql("SELECT TOP 10 * FROM t", target_dialect="postgres")
+    'SELECT * FROM t LIMIT 10'
+
+    >>> transpile_sql("SELECT [Name] FROM [Customer]", target_dialect="sqlite")
+    'SELECT "Name" FROM "Customer"'
+
+    A national-character literal is rewritten to a plain string literal
+    for a dialect that would otherwise reject it as a syntax error:
+
+    >>> transpile_sql("SELECT * FROM t WHERE x = N'abc'", target_dialect="sqlite")
+    "SELECT * FROM t WHERE x = 'abc'"
+
+    ...but left completely untouched for a dialect that accepts it
+    natively:
+
+    >>> transpile_sql("SELECT * FROM t WHERE x = N'abc'", target_dialect="mysql")
+    "SELECT * FROM t WHERE x = N'abc'"
+    """
+    try:
+        tree = sqlglot.parse_one(sql, read=source_dialect)
+    except SqlglotError as exc:
+        raise CorrectableRejection(
+            f"transpile_sql: failed to parse {sql[:200]!r} as "
+            f"{source_dialect}: {exc}",
+            reason="other",
+        ) from exc
+
+    if tree is None:
+        raise CorrectableRejection(
+            f"transpile_sql: parsing {sql[:200]!r} as {source_dialect} "
+            "produced no statement",
+            reason="other",
+        )
+
+    rewritten = tree.transform(_strip_unsupported_national_literals, target_dialect)
+
+    try:
+        return rewritten.sql(dialect=target_dialect)
+    except SqlglotError as exc:
+        raise CorrectableRejection(
+            f"transpile_sql: failed to render {sql[:200]!r} as "
+            f"{target_dialect}: {exc}",
+            reason="other",
+        ) from exc
+
+
+def transpile_and_revalidate(
+    sql: str,
+    *,
+    target_dialect: str,
+    source_dialect: str = _DIALECT,
+    denied_columns: Iterable[str] | None = None,
+) -> str:
+    """Transpile *sql* to *target_dialect* and refuse it unless re-verified.
+
+    This is the multi-dialect phase's central safety rule, stated in the
+    phase report as: *never execute anything the guard has not approved in
+    the dialect it will actually run in*. Looking "transpiled and correct"
+    is not enough — sqlglot transpiles the vast majority of this
+    project's generated SQL flawlessly (``TOP`` → ``LIMIT``/``FETCH FIRST``,
+    bracketed identifiers → the target's own quoting, ``ISNULL`` →
+    ``COALESCE``, ...) but was found, by direct execution against a real
+    SQLite engine, to leave a T-SQL national-character literal
+    (``N'...'``) completely untouched in every dialect — syntactically
+    invalid on PostgreSQL/SQLite, silently accepted (but not necessarily
+    meaning the same thing) on MySQL/Oracle. A transpiled string that
+    merely *parses* is not evidence it is safe or correct; only a second
+    pass through the guard, pinned to the dialect that will actually
+    execute it, is.
+
+    Three steps, each of which can refuse
+    -------------------------------------------
+    1. **Transpile** — :func:`transpile_sql` from *source_dialect* to
+       *target_dialect*. A parse/transpile failure raises
+       :class:`CorrectableRejection` (see that function's docstring).
+    2. **Re-validate in the target dialect** — :func:`validate_sql` runs
+       again, this time pinned to *target_dialect* (its own system
+       catalogues, its own dangerous-function names, and — critically —
+       *not* rejecting a literal ``LIMIT``, which is *target_dialect*'s
+       own correct syntax whenever it is not ``"tsql"``). Anything the
+       guard would refuse in the source dialect that somehow survived
+       transpilation unrecognisable, or any construct the transpile step
+       introduced that the target dialect's own rules forbid, is caught
+       here exactly as it would be for freshly-generated SQL.
+    3. **Touched-table set must be identical** — :func:`extract_touched_tables`
+       is compared between *sql* (in *source_dialect*) and the transpiled
+       text (in *target_dialect*). A mismatch means transpilation silently
+       changed which tables the query reads — the single scenario this
+       module considers worse than an outright error (a plausible-looking
+       result computed over the wrong data) — and is refused.
+
+    When *target_dialect* equals *source_dialect* (this deployment's
+    default, ``"tsql"``), this function is a **no-op passthrough**: it
+    returns *sql* completely unchanged, without calling
+    :func:`transpile_sql` or re-running :func:`validate_sql` at all. This
+    is deliberate, not an optimisation shortcut — see the module
+    docstring's "Multi-dialect" section and
+    :data:`config.Settings.sql_dialect`'s docstring: a tsql-only
+    deployment (this project's only target before this phase, and still
+    its default) must see *zero* behavioural change from this function
+    existing. ``tests/test_sql_guard.py``/``tests/test_sql_guard_bypass.py``
+    passing unchanged, and the tsql guard allowlist diffing empty
+    before/after this phase, both depend on that no-op path being taken
+    unconditionally for ``target_dialect == "tsql"`` — never merely
+    "usually produces the same result".
+
+    Parameters
+    ----------
+    sql:
+        Guard-approved, capped SQL in *source_dialect* — the output of
+        :func:`validate_sql` + :func:`ensure_top` on the model's own
+        response.
+    target_dialect:
+        The sqlglot dialect key this deployment's database actually
+        speaks — :data:`config.Settings.sql_dialect`.
+    source_dialect:
+        The sqlglot dialect key *sql* is written in. Defaults to
+        ``"tsql"`` — the one dialect the model ever generates.
+    denied_columns:
+        Forwarded to the target-dialect :func:`validate_sql` call
+        unchanged — see that function's own docstring.
+
+    Returns
+    -------
+    str
+        *sql* unchanged (``target_dialect == source_dialect``), or the
+        transpiled, re-validated, table-set-checked equivalent in
+        *target_dialect*.
+
+    Raises
+    ------
+    CorrectableRejection
+        If transpilation fails, if the transpiled SQL fails re-validation
+        with a rejection class that is itself a ``CorrectableRejection``,
+        or if the touched-table set changed under transpilation.
+    PolicyRejection
+        If the transpiled SQL fails re-validation with a rejection class
+        that is itself a ``PolicyRejection`` (propagated as-is — a
+        forbidden construct is exactly as terminal post-transpile as it
+        was pre-transpile).
+    """
+    if target_dialect == source_dialect:
+        return sql
+
+    transpiled = transpile_sql(
+        sql, source_dialect=source_dialect, target_dialect=target_dialect
+    )
+
+    # Re-validate in the dialect this will actually execute in -- never
+    # trust that "parses" means "safe" (see this function's own docstring
+    # for the N'...' finding that makes this step non-negotiable).
+    validate_sql(transpiled, denied_columns=denied_columns, dialect=target_dialect)
+
+    source_tables = set(extract_touched_tables(sql, dialect=source_dialect))
+    transpiled_tables = set(extract_touched_tables(transpiled, dialect=target_dialect))
+    if source_tables != transpiled_tables:
+        # CorrectableRejection, not PolicyRejection: this is a property of
+        # this specific SQL shape's transpilation, not a categorical
+        # policy violation -- a differently-phrased retry that generates
+        # an equally-valid but more portable query can plausibly transpile
+        # cleanly where this one did not.
+        raise CorrectableRejection(
+            f"transpile_and_revalidate: transpiling from {source_dialect} "
+            f"to {target_dialect} changed the set of tables this query "
+            f"touches ({sorted(source_tables)} -> {sorted(transpiled_tables)}) "
+            "— refusing to execute SQL whose meaning may have changed under "
+            "transpilation",
+            reason="other",
+        )
+
+    return transpiled
+
+def pretty_sql(sql: str, dialect: str = _DIALECT) -> str:
+    """Lay *sql* out in the house style, for **display only**.
+
+    The SQL a client shows is whatever the model happened to emit. Models
+    are inconsistent about it: the same deployment produces a clean
+    multi-line statement for one question and a single 300-character line
+    for the next, and the reader has no way to tell that this says nothing
+    about the query -- it looks like the system formats sometimes and not
+    others. Formatting here makes the presentation a property of this
+    codebase rather than of the model's mood.
+
+    For T-SQL the layout is :func:`security.sql_format.format_sql`'s (``SELECT``
+    alone on a line, one item per line with a leading comma, aligned aliases
+    and joins; its module docstring lists the rules), checked to parse back to
+    the same statement. Any other dialect, and any statement that layout
+    declines, gets sqlglot's pretty printer, but only when its output parses
+    back to the same tree as the input: that printer rewrites some
+    expressions (``DATEDIFF(day, a, b)`` gains ``CAST`` calls, ``dbo.fn(1)``
+    becomes ``dbo.FN(1)``), and the reader must never be shown SQL that
+    differs from what ran. Otherwise the input is returned unchanged.
+
+    Display only, and deliberately not applied to the string that runs.
+    ``Turn.sql`` stays byte-for-byte what the guard validated and the
+    database executed; ``Turn.sql_display`` is what the UI renders and the
+    copy button copies. Re-rendering the executed SQL would mean the audit
+    trail recorded a statement nobody ran.
+
+    Never raises. A statement that cannot be re-rendered is returned
+    unchanged: this is cosmetic, and there is no version of "the SQL could
+    not be prettified" worth failing a successful query over. The same
+    reasoning applies to the empty case.
+
+    Parameters
+    ----------
+    sql:
+        The statement to format.
+    dialect:
+        sqlglot dialect to parse and render in. Defaults to :data:`_DIALECT`
+        and is passed explicitly by callers that know the deployment's
+        configured one -- this module reads no configuration of its own,
+        the same way :func:`validate_sql` and :func:`extract_touched_tables`
+        take theirs as a parameter.
+
+    Examples
+    --------
+    >>> print(pretty_sql("SELECT a, b FROM t WHERE a = 1", dialect="tsql"))
+    SELECT
+         a
+        ,b
+    <BLANKLINE>
+    FROM t
+    WHERE a = 1
+
+    Unparseable input comes back untouched rather than raising:
+
+    >>> pretty_sql("this is not sql at all ((", dialect="tsql")
+    'this is not sql at all (('
+
+    So does a statement the pretty printer would rewrite (here it would
+    upper-case the function name):
+
+    >>> pretty_sql("SELECT a FROM dbo.fn(1) AS f, u", dialect="tsql")
+    'SELECT a FROM dbo.fn(1) AS f, u'
+    """
+    if not sql or not sql.strip():
+        return sql
+    # Imported here; the layout module imports nothing from this one.
+    from security.sql_format import format_sql
+
+    return format_sql(sql, dialect)

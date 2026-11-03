@@ -1,0 +1,53 @@
+/* web/assets/vendor/prism-sql-theme.css
+ *
+ * Token colours for the generated-SQL block (web/js/render/turn.js),
+ * highlighted with the vendored Prism core + SQL language component in
+ * this same directory (prism.min.js, prism-sql.min.js — see
+ * web/README.md's offline-requirement note; no CDN, ever).
+ *
+ * This file is NOT Prism's official theme CSS. The SQL box (.sql-box)
+ * is an always-dark code surface in BOTH UI themes — same as most code
+ * editors — so the token colours below are a fixed editor palette, not
+ * aliases of the chrome brand tokens. Brand teal is right for a button;
+ * it is the wrong hue family for reading a SELECT list against near-black.
+ *
+ * Palette (aligned to a conventional dark editor / terminal SQL look):
+ *   keyword   — cool blue   (SELECT, FROM, WHERE, TOP, AS, DESC, …)
+ *   number    — gold        (TOP 10, year literals, …)
+ *   function  — violet      (SUM, COUNT, …)
+ *   string    — sky         (N'…', '…')
+ *   operator  — grey        (=, <, +, …)
+ *   comment   — grey italic
+ *
+ * These values are declared on bare :root in styles/style.css as
+ * --sql-* custom properties so both this file and any future code surface
+ * share one place. Dark mode does NOT redefine them: the SQL box stays
+ * dark either way.
+ */
+
+.sql-box .token.keyword {
+  color: var(--sql-keyword, #79c0ff);
+  font-weight: 600;
+}
+.sql-box .token.string,
+.sql-box .token.identifier {
+  color: var(--sql-string, #a5d6ff);
+}
+.sql-box .token.number,
+.sql-box .token.boolean {
+  color: var(--sql-number, #e3b341);
+}
+.sql-box .token.comment {
+  color: var(--sql-comment, #8b949e);
+  font-style: italic;
+}
+.sql-box .token.function {
+  color: var(--sql-function, #d2a8ff);
+}
+.sql-box .token.variable {
+  color: var(--sql-string, #a5d6ff);
+}
+.sql-box .token.operator,
+.sql-box .token.punctuation {
+  color: var(--sql-operator, #8b949e);
+}

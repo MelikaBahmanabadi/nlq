@@ -1,0 +1,1062 @@
+/* web/js/render/turn.js — one turn card.
+ *
+ * Anatomy (DESIGN.md §5.2, api-contract §5/§7 — trust surface stays
+ * visible; DESIGN-INVARIANTS.md §8 — failure gets the same three-part
+ * treatment as success; §9 — what the analyst opted into stays in this
+ * list, never inside the collapsed section at the end):
+ *
+ *   question
+ *   resolved_question          (when present)
+ *   basis                      (when refines)
+ *   assumption chips + clarifications
+ *   stage strip                (slim; the rest is one item down)
+ *   outcome line               (rows · guard · top)
+ *   failure state              (what happened · why · a control to press)
+ *   SQL                        (collapsible; expanded on first/failure)
+ *   result                     (+ a «پاسخ درست است» footer, successful answers only)
+ *   interpretation             (when requested — opted into, so main flow)
+ *   pipeline / LLM / warnings / flag   (collapsed; opt in to expand)
+ *
+ * Partial/null Turn data is tolerated throughout (contract §6).
+ * SQL display: web/js/sql-display.js. Copy: copySourceOfTruth(turn).
+ */
+
+"use strict";
+
+import { fmt } from "../num.js";
+import { copySourceOfTruth, displaySqlForTurn, formatSqlForDisplay, highlightSql } from "../sql-display.js";
+
+import { renderPipeline, renderStageStrip } from "./pipeline.js";
+import { renderBasis, renderAssumptions, renderClarifications } from "./assumptions.js";
+import { renderResult, renderWarnings } from "./table.js";
+import { renderLlmStatus, answerWasTruncated, renderTruncationQualifier } from "./llm-status.js";
+import { renderFeedbackControl } from "./feedback.js";
+
+function el(tag, className, text) {
+  const e = document.createElement(tag);
+  if (className) e.className = className;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+/**
+ * @param {import("../api.js").Turn} turn
+ * @param {{
+ *   onJumpToTurn: (turnId: string) => void,
+ *   onEditAssumption: (turnId: string, field: string, value: string) => void,
+ *   onClarify: (turnId: string, field: string, option: string) => void,
+ *   onPin?: (turnId: string, field: string, value: string) => void,
+ *   onRerun?: (turnId: string) => void,
+ *   onRephrase?: (turnId: string) => void,
+ *   onAskWithoutColumn?: (turnId: string, column: string) => void,
+ *   onRequestAccess?: (turnId: string, column: string) => Promise<{already_pending: boolean}>,
+ *   onFlag?: (turnId: string, category: string, note: string) => Promise<void>,
+ *   renderConfirmation?: (turn: object, hooks: {onReplacedFlag: () => void}) => HTMLElement | null,
+ *   progressive?: boolean,
+ * }} ctx
+ */
+export function createTurnCard(turn, ctx) {
+  const progressive = !!(ctx && ctx.progressive);
+  const earlyEls = [];
+  const lateEls = [];
+  function tagEarly(node) { if (progressive) { node.hidden = true; earlyEls.push(node); } return node; }
+  function tagLate(node) { if (progressive) { node.hidden = true; lateEls.push(node); } return node; }
+
+  const root = el("article", "turn");
+  root.id = `turn-${turn.turn_id}`;
+  root.dataset.turnId = turn.turn_id;
+
+  // 1. Question bubble.
+  const qBubble = el("div", "turn-question");
+  const qIndex = el("span", "turn-index", `پرسش ${turn.index}`);
+  qBubble.appendChild(qIndex);
+  qBubble.appendChild(document.createTextNode(turn.question));
+  root.appendChild(qBubble);
+
+  // Collapse control + one-line summary (shown only while collapsed).
+  const collapseBtn = el("button", "turn-collapse-btn", "جمع کردن ▴");
+  collapseBtn.type = "button";
+  collapseBtn.setAttribute("aria-expanded", "true");
+  root.appendChild(collapseBtn);
+
+  const summaryLine = el("div", "turn-summary-line");
+  summaryLine.textContent = summarize(turn);
+  root.appendChild(summaryLine);
+
+  const body = el("div", "turn-body");
+  root.appendChild(body);
+
+  // 2. Resolved question — trust surface, always in the main flow. Shown
+  // when it says something the question bubble above does not: a follow-up
+  // rewritten as a full question. A resolved question that only repeats
+  // the question (spacing aside) would be the same sentence twice.
+  if (turn.resolved_question && !sameText(turn.resolved_question, turn.question)) {
+    const card = el("div", "resolved-card");
+    const label = el("div", "resolved-label");
+    label.textContent = "برداشت سامانه از پرسش";
+    const text = el("div", "resolved-text", turn.resolved_question);
+    card.appendChild(label);
+    card.appendChild(text);
+    body.appendChild(tagEarly(card));
+  }
+
+  // 3. Basis.
+  const basisRow = renderBasis(turn.basis, ctx.onJumpToTurn);
+  if (basisRow) body.appendChild(tagEarly(basisRow));
+
+  // 4. Assumption chips + clarifications — contract §5/§7, above the result.
+  const assumptions = renderAssumptions(
+    turn.ambiguity && turn.ambiguity.assumptions,
+    (field, value) => ctx.onEditAssumption(turn.turn_id, field, value),
+    ctx.onPin ? (field, value) => ctx.onPin(turn.turn_id, field, value) : undefined,
+  );
+  if (assumptions) body.appendChild(tagEarly(assumptions));
+
+  const clarifications = renderClarifications(
+    turn.ambiguity && turn.ambiguity.clarifications,
+    (field, option) => ctx.onClarify(turn.turn_id, field, option),
+  );
+  if (clarifications) body.appendChild(tagEarly(clarifications));
+
+  // 5. Slim stage strip (progress while streaming; summary after).
+  const strip = renderStageStrip();
+  body.appendChild(strip.el);
+  if (progressive) earlyEls.push(strip.el);
+
+  // Full pipeline list lives in the collapsed section below; setStage drives both.
+  const pipelineList = renderPipeline();
+  function setStage(key, state) {
+    strip.setStage(key, state);
+    pipelineList.setStage(key, state);
+  }
+
+  // Failure state (DESIGN-INVARIANTS.md §8) — checked before the result
+  // card below so a guard rejection, which sets neither `turn.error` nor
+  // a populated `turn.result`, still gets its own rendering instead of
+  // silently producing nothing here and a "0 rows" card there.
+  const failure = renderFailureState(turn, ctx);
+  if (failure) body.appendChild(tagLate(failure));
+
+  // 6. Outcome line — always after a settled turn.
+  const outcome = buildOutcomeLine(turn);
+  if (outcome) body.appendChild(outcome);
+
+  // 7. SQL — collapsible; expanded when there is no result yet or on failure.
+  const sqlSection = el("div", "card sql-card-inner");
+  if (turn.sql) {
+    const titleRow = el("div", "card-title-row");
+    const sqlTitle = el("span", "card-title");
+    sqlTitle.textContent = turn.guard && turn.guard.verdict === "allowed"
+      ? "SQL تولیدشده · گارد ✓"
+      : turn.guard && turn.guard.verdict === "rejected"
+        ? "SQL تولیدشده · گارد ✕"
+        : "SQL تولیدشده";
+    titleRow.appendChild(sqlTitle);
+
+    const acts = el("div", "sql-title-acts");
+    const copyBtn = el("button", "btn-copy", "کپی");
+    copyBtn.type = "button";
+    copyBtn.addEventListener("click", () => copyToClipboard(copySourceOfTruth(turn), copyBtn));
+    acts.appendChild(copyBtn);
+
+    const toggleBtn = el("button", "btn-copy sql-collapse", "پنهان");
+    toggleBtn.type = "button";
+    toggleBtn.setAttribute("aria-expanded", "true");
+    acts.appendChild(toggleBtn);
+    titleRow.appendChild(acts);
+    sqlSection.appendChild(titleRow);
+
+    const pre = document.createElement("pre");
+    pre.className = "sql-box";
+    pre.dir = "ltr";
+    const code = document.createElement("code");
+    code.className = "language-sql";
+    highlightSql(code, displaySqlForTurn(turn));
+    pre.appendChild(code);
+    sqlSection.appendChild(pre);
+
+    const meta = el("div", "sql-meta");
+    if (turn.guard) {
+      const guardPill = el("span", `guard-pill ${turn.guard.verdict}`,
+        turn.guard.verdict === "allowed" ? "✓ مجاز" : "✕ رد شد");
+      meta.appendChild(guardPill);
+      if (turn.guard.injected_top !== null && turn.guard.injected_top !== undefined) {
+        meta.appendChild(el("span", "meta-tag", `TOP ${turn.guard.injected_top}`));
+      }
+      if (turn.guard.tables_touched && turn.guard.tables_touched.length) {
+        meta.appendChild(el("span", "meta-tag", turn.guard.tables_touched.join(", ")));
+      }
+    }
+    sqlSection.appendChild(meta);
+
+    if (turn.guard && turn.guard.verdict === "rejected" && turn.guard.rule) {
+      // `dir="ltr"` -- the rule is the guard's own free-text English
+      // (kept verbatim for the audit trail), and this is now its only
+      // home in the UI (the failure banner above no longer shows it, see
+      // `renderFailureState`'s guard branch): without an explicit
+      // direction it would scramble inside the surrounding
+      // right-to-left page.
+      const guardRule = el("div", "guard-rule", turn.guard.rule);
+      guardRule.dir = "ltr";
+      sqlSection.appendChild(guardRule);
+    }
+
+    // Collapse after a successful result is already on screen (DESIGN §5.2).
+    const startCollapsed = !!(turn.result && turn.guard && turn.guard.verdict === "allowed");
+    if (startCollapsed) {
+      pre.hidden = true;
+      meta.hidden = true;
+      toggleBtn.setAttribute("aria-expanded", "false");
+      toggleBtn.textContent = "نمایش SQL";
+    }
+    toggleBtn.addEventListener("click", () => {
+      const open = pre.hidden;
+      pre.hidden = !open;
+      meta.hidden = !open;
+      toggleBtn.setAttribute("aria-expanded", String(open));
+      toggleBtn.textContent = open ? "پنهان" : "نمایش SQL";
+    });
+
+    body.appendChild(tagLate(sqlSection));
+  } else if (!turn.error) {
+    // A guard rejection also has no `turn.sql` (session/engine.py never
+    // puts the rejected statement there -- see session/models.py's
+    // GuardVerdict.rejected_sql docstring for why: `Turn.sql` means "the
+    // statement that ran" to every consumer, and this field would blur
+    // that). When the guard DID capture the refused statement
+    // (`turn.guard.rejected_sql`), offer it behind a collapsed "دیدن SQL"
+    // reveal instead of the flat "not retained" sentence, labelled
+    // unmistakably as never having run and rendered through the exact
+    // same safe display path (formatSqlForDisplay + highlightSql) as any
+    // other generated SQL -- it is exactly as untrusted. Falls back to
+    // the pre-existing message when there is nothing to reveal (an older
+    // persisted turn predating this field, or a non-guard SQL-less turn).
+    const rejectedSql = isGuardRejected(turn) ? turn.guard.rejected_sql : null;
+    if (rejectedSql) {
+      const reveal = el("div", "rejected-sql-reveal");
+      const toggleBtn = el("button", "rejected-sql-toggle", "دیدن SQL");
+      toggleBtn.type = "button";
+      toggleBtn.setAttribute("aria-expanded", "false");
+      reveal.appendChild(toggleBtn);
+
+      const revealBody = el("div", "rejected-sql-body");
+      revealBody.hidden = true;
+      reveal.appendChild(revealBody);
+
+      // Built lazily, on first activation, rather than up front and
+      // merely hidden: until the analyst presses the control, the refused
+      // statement is nowhere in the DOM at all -- not just visually
+      // collapsed -- matching "collapsed by default" as literally as
+      // possible for text this section goes out of its way to label as
+      // never having run.
+      let built = false;
+      toggleBtn.addEventListener("click", () => {
+        if (!built) {
+          revealBody.appendChild(el("div", "rejected-sql-heading", "SQL ردشده — اجرا نشد"));
+          const pre = document.createElement("pre");
+          pre.className = "sql-box rejected-sql-box";
+          pre.dir = "ltr";
+          const code = document.createElement("code");
+          code.className = "language-sql";
+          // Same safe display path as the normal SQL box above: `highlightSql`
+          // always assigns `textContent` first and only ever OVERLAYS Prism
+          // markup on top -- the refused statement is untrusted model output,
+          // like any generated SQL, and must never reach `innerHTML` unescaped.
+          //
+          // What is shown is the server's display form
+          // (`guard.rejected_sql_display`, laid out like `Turn.sql_display`)
+          // when it sent one, else the refused text through the client
+          // formatter as before. `rejected_sql` itself is never altered.
+          highlightSql(code, formatSqlForDisplay(turn.guard.rejected_sql_display || rejectedSql));
+          pre.appendChild(code);
+          revealBody.appendChild(pre);
+          built = true;
+        }
+        const open = revealBody.hidden;
+        revealBody.hidden = !open;
+        toggleBtn.setAttribute("aria-expanded", String(open));
+        toggleBtn.textContent = open ? "پنهان" : "دیدن SQL";
+      });
+
+      sqlSection.appendChild(reveal);
+    } else {
+      const noSqlMessage = isGuardRejected(turn)
+        ? "SQL تولیدشده توسط گارد رد شد و برای نمایش نگه‌داری نمی‌شود."
+        : "SQL تولید نشد.";
+      sqlSection.appendChild(el("div", "empty-result", noSqlMessage));
+    }
+    body.appendChild(tagLate(sqlSection));
+  }
+
+  // 8. Result — skipped for a guard rejection. The failure state above
+  // already says this query never ran; a card titled "نتیجه" ("result")
+  // directly under it, even with rejection-specific wording, is the exact
+  // "did not run" vs. "returned nothing" confusion §8 rules out.
+  //
+  // `resultEl` (returned below as `result`) is D3-hidden-chart's hook for
+  // main.js's settle-time scroll: the card as a whole runs on well past
+  // this point (more opted-into content, then everything collapsed behind
+  // a click further down), so scrolling the *card* into view once it
+  // settles can leave the actual chart/table scrolled past, off the top —
+  // the result card itself is the right, much shorter target.
+  let resultEl = null;
+  // The two ways of rating an answer undo each other on the server (the
+  // later action wins); each control mirrors that in the UI through these.
+  let confirmation = null;
+  let feedback = null;
+  let flagShortcut = null;
+  if (!turn.error && !isGuardRejected(turn)) {
+    const resultCard = el("div", "card");
+    resultCard.appendChild(el("div", "card-title", "نتیجه"));
+    resultCard.appendChild(renderResult(turn.result, {
+      assumptions: turn.ambiguity && turn.ambiguity.assumptions,
+      guardRejected: false,
+      onRerun: ctx.onRerun ? () => ctx.onRerun(turn.turn_id) : undefined,
+    }));
+    // «پاسخ درست است»: visible on the answer itself, in a footer under the
+    // table or chart -- not in the collapsed section further down, where a
+    // one-click confirmation would barely be used. The page (main.js) builds the
+    // control, which owns the request and the confirmed-turns record, and
+    // returns null for a turn that is not a successful answer. The footer
+    // exists when it holds this control or the one below.
+    confirmation = ctx.renderConfirmation
+      ? ctx.renderConfirmation(turn, {
+        onReplacedFlag: () => {
+          if (feedback) feedback.reopen();
+          if (flagShortcut) flagShortcut.setFlagged(false);
+        },
+      })
+      : null;
+    // «پاسخ نادرست است»: the wrong-answer twin of the toggle, on the answer
+    // too. It sends nothing itself; it opens the flag form further down the
+    // card (openFlagForm, under "9."), which keeps its category and note.
+    if (turn.result && ctx.onFlag) flagShortcut = renderFlagShortcut(() => openFlagForm());
+    if (confirmation || flagShortcut) {
+      const footer = el("div", "result-footer");
+      if (confirmation) footer.appendChild(confirmation);
+      if (flagShortcut) footer.appendChild(flagShortcut);
+      resultCard.appendChild(footer);
+    }
+    body.appendChild(tagLate(resultCard));
+    resultEl = resultCard;
+  }
+
+  // 8.5 Interpretation — rendered here, in the main flow, never inside
+  // the collapsed section below. The analyst opted into this explicitly
+  // (the toggle's own label states its cost: up to twenty rows sent to
+  // the model), so hiding it behind a click would contradict the very
+  // request it answers. Progressive disclosure is for what the product
+  // chose to show, never for what the analyst chose to ask for.
+  if (turn.interpretation) {
+    const interpCard = el("div", "card");
+    if (answerWasTruncated(turn.llm)) interpCard.appendChild(renderTruncationQualifier());
+    interpCard.appendChild(el("div", "card-title", "تفسیر"));
+    interpCard.appendChild(el("p", "interpretation-text", turn.interpretation));
+    body.appendChild(tagLate(interpCard));
+  }
+
+  // 9. Everything else settles behind one click: pipeline timings and the
+  // LLM status strip are shown BY THE PRODUCT, never asked for, which is
+  // what makes collapsing them fine — unlike the interpretation above.
+  const drawer = el("details", "turn-details");
+  const drawerSummary = el("summary", "turn-details-summary", "جزئیات — pipeline، مدل، بازخورد");
+  drawer.appendChild(drawerSummary);
+  const drawerBody = el("div", "turn-details-body");
+
+  const pipeWrap = el("div", "card pipeline-card");
+  pipeWrap.appendChild(el("div", "card-title", "مراحل پردازش"));
+  pipeWrap.appendChild(pipelineList.el);
+  drawerBody.appendChild(pipeWrap);
+
+  const warningsEl = renderWarnings(turn.warnings);
+  if (warningsEl) drawerBody.appendChild(warningsEl);
+
+  const llmCard = el("div", "card");
+  llmCard.appendChild(renderLlmStatus(turn.llm));
+  drawerBody.appendChild(llmCard);
+
+  if (turn.result && ctx.onFlag) {
+    // The wrong-answer flag stays here, in the drawer. Flagging an answer
+    // the analyst had confirmed resets the toggle on the answer above.
+    const flagWrap = el("div", "card");
+    feedback = renderFeedbackControl(turn, async (category, note) => {
+      await ctx.onFlag(turn.turn_id, category, note);
+      if (confirmation) confirmation.setConfirmed(false);
+      if (flagShortcut) flagShortcut.setFlagged(true);
+    });
+    flagWrap.appendChild(feedback);
+    drawerBody.appendChild(flagWrap);
+  }
+
+  drawer.appendChild(drawerBody);
+  body.appendChild(tagLate(drawer));
+
+  /** What «پاسخ نادرست است» on the answer does: open the drawer, expand
+   * the flag form in it and bring the form into view. */
+  function openFlagForm() {
+    if (!feedback) return;
+    drawer.open = true;
+    feedback.openForm();
+    if (typeof feedback.scrollIntoView === "function") feedback.scrollIntoView({ block: "nearest" });
+  }
+
+  collapseBtn.addEventListener("click", () => {
+    const collapsed = root.classList.toggle("collapsed");
+    collapseBtn.setAttribute("aria-expanded", String(!collapsed));
+    collapseBtn.textContent = collapsed ? "باز کردن ▾" : "جمع کردن ▴";
+  });
+
+  function revealEarly() { earlyEls.forEach((n) => { n.hidden = false; }); }
+  function revealLate() { lateEls.forEach((n) => { n.hidden = false; }); }
+  if (!progressive) { revealEarly(); revealLate(); }
+
+  return {
+    el: root,
+    pipeline: { setStage, el: pipelineList.el, steps: pipelineList.steps },
+    revealEarly,
+    revealLate,
+    // null for a turn with no result to show (an error, or a guard
+    // rejection) — main.js falls back to `el` (the whole card) then.
+    result: resultEl,
+  };
+}
+
+/** True when the guard refused this turn's SQL before it ever ran.
+ *
+ * Checked ahead of `turn.error` everywhere in this file that renders a
+ * failure, because a rejection does not set `turn.error` at all on this
+ * (SSE) path — `session/engine.py`'s `_GenOutcome` sites attach it as
+ * `guard=GuardVerdict(verdict="rejected", ...)` together with
+ * `result=TurnResult()`, an EMPTY result. Read by shape alone that is
+ * indistinguishable from a query that ran and matched nothing, which is
+ * the exact confusion DESIGN-INVARIANTS.md §8 calls out: "did not run"
+ * and "returned nothing" must never look the same. */
+/** True when *a* and *b* are the same text once runs of whitespace are
+ * collapsed and the ends trimmed. */
+function sameText(a, b) {
+  const norm = (x) => String(x ?? "").replace(/\s+/g, " ").trim();
+  return norm(a) === norm(b);
+}
+
+function isGuardRejected(turn) {
+  return !!(turn.guard && turn.guard.verdict === "rejected");
+}
+
+/**
+ * The «پاسخ نادرست است» button in the result footer, beside «پاسخ درست
+ * است». Pressing it calls *onOpen*, which opens the flag form further down
+ * the card; the report itself is still sent from that form. Once a report is sent
+ * the button says so with a check mark (text, not colour alone); a later
+ * confirmation that replaces the report clears it again.
+ *
+ * @param {() => void} onOpen
+ * @returns {HTMLButtonElement} carrying `setFlagged(boolean)`.
+ */
+function renderFlagShortcut(onOpen) {
+  const button = el("button", "flag-shortcut");
+  button.type = "button";
+  function setFlagged(flagged) {
+    button.className = flagged ? "flag-shortcut is-flagged" : "flag-shortcut";
+    button.textContent = flagged ? "✓ گزارش شد" : "پاسخ نادرست است";
+  }
+  button.addEventListener("click", () => onOpen());
+  setFlagged(false);
+  button.setFlagged = setFlagged;
+  return button;
+}
+
+/**
+ * One Persian, analyst-facing lead sentence per `GuardVerdict.reason`
+ * (session/models.py -- the same closed literal set enumerated there:
+ * "denied_column", "join_only_column", "forbidden_statement",
+ * "unknown_table", "system_catalogue", "no_table_reference",
+ * "cross_datasource", "ambiguous_table", "other").
+ * `denied_column` is built dynamically below (it names the specific
+ * `subject` column when one is known) and so is NOT in this table; every
+ * other reason maps straight to its sentence here, and a reason this table does not recognise --
+ * "other", or a missing/unrecognised value from an older persisted turn --
+ * falls back to `GENERIC_GUARD_LEAD`, the same generic sentence this file
+ * always showed for every non-`denied_column` rejection before this table
+ * existed.
+ */
+const GUARD_REASON_LEADS = Object.freeze({
+  join_only_column:
+    "این پرسش اجرا نشد — پرس‌وجوی تولیدشده از ستونی استفاده کرد که برای حساب شما فقط برای اتصال جدول‌ها " +
+    "(JOIN) مجاز است، نه برای نمایش، فیلتر، گروه‌بندی یا مرتب‌سازی. این به معنای «نتیجه‌ای یافت نشد» نیست.",
+  forbidden_statement:
+    "این پرسش اجرا نشد — پرس‌وجوی تولیدشده کاری می‌خواست که این سامانه اجازه نمی‌دهد: " +
+    "تغییر داده، یا خواندن اطلاعات خودِ سرور به‌جای داده‌های انبار.",
+  system_catalogue:
+    "این پرسش اجرا نشد — پرس‌وجوی تولیدشده می‌خواست جدول‌های سیستمی پایگاه داده را بخواند، " +
+    "نه داده‌های انبار را.",
+  unknown_table:
+    "این پرسش اجرا نشد — پرس‌وجوی تولیدشده به جدولی اشاره کرد که در داده‌های این سامانه وجود ندارد.",
+  no_table_reference:
+    "این پرسش اجرا نشد — پرس‌وجوی تولیدشده از هیچ جدول داده‌ای نمی‌خواند؛ هر پاسخ باید از داده‌های انبار بیاید.",
+  cross_datasource:
+    "این پرسش اجرا نشد — پاسخ به آن به داده‌های دو منبع جدا (دو سرور متفاوت) نیاز دارد و " +
+    "این سامانه هر پرسش را فقط روی یک منبع اجرا می‌کند. پرسش را طوری بپرسید که فقط به یکی از آن‌ها نیاز داشته باشد.",
+  ambiguous_table:
+    "این پرسش اجرا نشد — پرس‌وجوی تولیدشده جدولی را نام برد که در بیش از یک اسکیما هست " +
+    "و مشخص نکرد منظورش کدام است.",
+});
+const GENERIC_GUARD_LEAD = "این پرسش اصلاً اجرا نشد — لایهٔ نگهبانی امنیتی پیش از اجرا آن را رد کرد.";
+
+/**
+ * The exact client-facing text `database/errors.py`'s
+ * `_GENERIC_STATEMENT_MESSAGE` sends when a statement failure could not be
+ * positively recognised (that module's "fail closed" note). It must stay
+ * byte-for-byte identical to the backend constant -- `tests/
+ * test_failure_copy_parity.py` imports `database.errors` at test time and
+ * asserts the two match, so a change on either side that drifts is caught
+ * there, not discovered as a rendering bug. `QUERY_EXECUTION_ERROR` below
+ * compares `turn.error.message` against this constant to decide whether
+ * there is anything database-specific worth showing as technical detail.
+ */
+const DB_GENERIC_REJECTION = "The database rejected the query.";
+
+/**
+ * Frozen `TurnErrorInfo.code` → `{lead, actions}` table -- the ONE place
+ * that maps a backend error code to the Persian, analyst-facing sentence
+ * DESIGN-INVARIANTS.md §8 requires ("what happened, in the analyst's
+ * terms, not the system's"). Before this table existed, every code
+ * without its own bespoke `case` below fell through to `default:`, whose
+ * lead sentence WAS `turn.error.message` -- raw English straight from
+ * `session/engine.py`/`api/errors.py` inside an otherwise entirely
+ * Persian UI. Every entry here supplies its own sentence instead, so
+ * `turn.error.message` is never read as a lead (or anywhere else in a
+ * banner) for any code listed here -- it stays in the server log/audit,
+ * per this table's contract.
+ *
+ * `actions` lists the action KINDS this code offers, in the order they
+ * render -- turned into real `[label, onClick]` pairs by `actionsFor`
+ * below, and only when the matching callback (`ctx.onRerun` for "retry",
+ * `ctx.onRephrase` for "rephrase") was actually supplied, same "offer
+ * only what is wired" rule this file already followed before this table
+ * existed.
+ *
+ * `MODEL_UNAVAILABLE` keeps its own `case` below (a different severity,
+ * "warn" not "crit") but reads its lead from here too, so there is still
+ * exactly one place per code. `LLM_OUTPUT_TRUNCATED` and `FORBIDDEN_SQL`
+ * are deliberately NOT here: each keeps its own `case`, unchanged, below.
+ * `QUERY_EXECUTION_ERROR` also keeps its own `case` -- its lead is fixed,
+ * like every code here, but `turn.error.message` (the database's own
+ * sentence for the rejected statement) is worth showing as technical
+ * detail when the database gave a specific reason, so that `case` renders
+ * it as a labelled, `dir="ltr"` detail line instead of reading a lead from
+ * this table (see `DB_GENERIC_REJECTION` above and `buildFailureBanner`'s
+ * `detail` parameter below).
+ *
+ * Any code NOT listed here (including `INTERNAL_ERROR` itself) falls back
+ * to the `INTERNAL_ERROR` entry -- see the `default:` case below.
+ */
+export const FAILURE_BY_CODE = Object.freeze({
+  MODEL_UNAVAILABLE: {
+    lead: "پرسش شما نگه داشته شد — سامانهٔ مدل در دسترس نبود. این یک مشکل سیستمی است، نه ایرادی در پرسش شما.",
+    actions: ["retry"],
+  },
+  MODEL_TIMEOUT: {
+    lead: "مدل در زمان مجاز پاسخ نداد. پرسش شما نگه داشته شد.",
+    actions: ["retry"],
+  },
+  OUT_OF_SCOPE: {
+    lead: "این پرسش به داده‌هایی که این سامانه در اختیار دارد مربوط نیست.",
+    actions: ["rephrase"],
+  },
+  NO_PREVIOUS_TURN: {
+    lead:
+      "این پرسش ادامهٔ پرسش قبلی به نظر می‌رسد، اما در این گفتگو پرسش قبلی‌ای برای ادامه نیست. " +
+      "آن را به‌صورت یک پرسش کامل بنویسید.",
+    actions: ["rephrase"],
+  },
+  EMPTY_SQL_RESPONSE: {
+    lead: "مدل برای این پرسش هیچ پرس‌وجویی تولید نکرد.",
+    actions: ["rephrase", "retry"],
+  },
+  INVALID_SQL_RESPONSE: {
+    lead: "پاسخ مدل یک پرس‌وجوی معتبر نبود.",
+    actions: ["retry"],
+  },
+  QUERY_TIMEOUT: {
+    lead:
+      "اجرای پرس‌وجو بیش از زمان مجاز طول کشید و متوقف شد. پرسش را محدودتر کنید — " +
+      "بازهٔ زمانی کوتاه‌تر یا فیلتر بیشتر.",
+    actions: ["rephrase"],
+  },
+  DATABASE_UNAVAILABLE: {
+    lead: "پایگاه داده در دسترس نبود — این یک مشکل سیستمی است، نه ایرادی در پرسش شما.",
+    actions: ["retry"],
+  },
+  SERVER_OVERLOAD: {
+    lead: "سامانه الان پرمشغله است. چند ثانیه بعد دوباره تلاش کنید.",
+    actions: ["retry"],
+  },
+  MAINTENANCE_MODE: {
+    lead: "سامانه موقتاً برای نگهداری در دسترس نیست.",
+    actions: [],
+  },
+  TRANSPORT_ERROR: {
+    lead: "ارتباط با سرور برقرار نشد. اتصال شبکه را بررسی کنید و دوباره تلاش کنید.",
+    actions: ["retry"],
+  },
+  INJECTION_ATTEMPT: {
+    lead:
+      "این پرسش شامل دستورهایی خطاب به خودِ سامانه بود و پردازش نشد. لطفاً فقط پرسش تحلیلی خود را بنویسید.",
+    actions: ["rephrase"],
+  },
+  UNAUTHENTICATED: {
+    lead: "کلید API معتبر نیست یا دیگر فعال نیست.",
+    actions: [],
+  },
+  INTERNAL_ERROR: {
+    lead: "خطای داخلی سامانه. اگر تکرار شد، شناسهٔ درخواست را به مدیر سامانه بدهید.",
+    actions: ["retry"],
+  },
+  // Neither is raised as this code in production today (api/errors.py's
+  // own docstring: Pydantic rejects a too-short/too-long question before
+  // the pipeline sees it, as a generic "VALIDATION_ERROR", not this code)
+  // -- kept here, in the same Persian register as the rest, purely so a
+  // future direct raise of QuestionTooShortError/QuestionTooLongError (or
+  // a validation-layer change that starts using these codes) never shows
+  // English by default. Flagged for owner review per this task's brief.
+  QUESTION_TOO_SHORT: {
+    lead: "پرسش خیلی کوتاه است — کمی بیشتر توضیح دهید.",
+    actions: [],
+  },
+  QUESTION_TOO_LONG: {
+    lead: "پرسش از حداکثر طول مجاز بلندتر است — آن را کوتاه‌تر کنید.",
+    actions: [],
+  },
+});
+
+/** Turns `FAILURE_BY_CODE`'s action KINDS ("retry"/"rephrase") into real
+ * `[label, onClick]` pairs, in order, skipping any kind whose callback
+ * was not supplied -- the same "offer only what is wired" rule
+ * `renderFailureState`'s guard branch already followed before this table
+ * existed. */
+function actionsFor(kinds, ctx, turnId) {
+  const out = [];
+  for (const kind of kinds) {
+    if (kind === "retry" && ctx.onRerun) {
+      out.push(["تلاش دوباره", () => ctx.onRerun(turnId)]);
+    } else if (kind === "rephrase" && ctx.onRephrase) {
+      out.push(["ویرایش پرسش", () => ctx.onRephrase(turnId)]);
+    }
+  }
+  return out;
+}
+
+/**
+ * Renders the §8 failure anatomy: what happened (in the analyst's terms,
+ * not the system's), why when the reason is known, and a next action as
+ * a control — never a sentence telling them to go do something. The
+ * machine-readable code rides along, small, after the sentence, for the
+ * operator correlating it against a log; it is never the whole message.
+ *
+ * Guard rejection is resolved first, via `isGuardRejected`, before this
+ * function ever looks at `turn.error` — see that helper's docstring for
+ * why the ordering matters. The same underlying
+ * `security.sql_guard.PolicyRejection` that produces a rejected
+ * `GuardVerdict` here reaches an HTTP client as the `FORBIDDEN_SQL` error
+ * code on the non-streaming route (`api/errors.py`'s `ForbiddenSQLError`
+ * — see e.g. `tests/test_correction_loop_policy_rejection.py`), so the
+ * `FORBIDDEN_SQL` case below is kept for that shape too, even though
+ * `session/engine.py` does not produce it on the turn stream this UI
+ * consumes today.
+ *
+ * @param {import("../api.js").Turn} turn
+ * @param {{
+ *   onRerun?: (turnId: string) => void,
+ *   onRephrase?: (turnId: string) => void,
+ *   onAskWithoutColumn?: (turnId: string, column: string) => void,
+ *   onRequestAccess?: (turnId: string, column: string) => Promise<{already_pending: boolean}>,
+ * }} ctx
+ * @returns {HTMLElement|null}
+ */
+function renderFailureState(turn, ctx) {
+  if (isGuardRejected(turn)) {
+    // `reason`/`subject` (session/models.py::GuardVerdict, populated from
+    // security.sql_guard's own typed rejection -- see that module's
+    // docstring) exist so THIS branch never has to regex `turn.guard.rule`
+    // (free text kept verbatim for the audit trail and its own tests) to
+    // find the column name a denied-column refusal is about. Without
+    // them the only honest option was one generic action for every guard
+    // rejection, which is what shipped before this field existed.
+    const { reason, subject } = turn.guard;
+    // `denied_column` keeps its own dedicated sentence (built here, not in
+    // `GUARD_REASON_LEADS`, since it never varies by `subject` -- the
+    // column name itself only ever appears in the targeted action button
+    // below). Every other named reason gets its own sentence from that
+    // table; "other", a missing `reason`, or any value the table does not
+    // recognise (an older persisted turn) falls back to the same generic
+    // sentence this file always showed here before the table existed.
+    const lead = reason === "denied_column"
+      ? "این پرسش اجرا نشد — یکی از ستون‌های لازم برای پاسخ به آن برای حساب شما محدود شده است. این به معنای «نتیجه‌ای یافت نشد» نیست."
+      : GUARD_REASON_LEADS[reason] || GENERIC_GUARD_LEAD;
+
+    const actions = [];
+    // The targeted action DESIGN-INVARIANTS.md §8's table names for this
+    // row ("Ask without that column") -- offered only when there is one
+    // specific column to name (`subject`); a `*` that could expose more
+    // than one denied column at once carries no single `subject` (see
+    // security.sql_guard.validate_sql's star-expansion raise sites), so
+    // there is nothing honest to put in this button's label there.
+    if (reason === "denied_column" && subject && ctx.onAskWithoutColumn) {
+      actions.push([
+        `پرسش بدون «${subject}»`,
+        () => ctx.onAskWithoutColumn(turn.turn_id, subject),
+      ]);
+    }
+    // "Request access" (ADR-004 part 1) -- the second action
+    // DESIGN-INVARIANTS.md §8's table names for this row, right beside
+    // "Ask without that column". Unlike every other action in this
+    // banner (all synchronous: they only put an edited question back in
+    // the input box), this one is a real network call, so it cannot be a
+    // plain onClick -- see handleRequestAccessClick for how it shows its
+    // own outcome inline instead of silently doing something elsewhere on
+    // the page.
+    // A join-only rejection (`join_only_column`) is correctable, so the
+    // server normally retries it before this banner is ever shown; when it
+    // does surface, `subject` is the whole `denied_columns` entry (e.g.
+    // `sales.Order.ID`), which "request access" sends back unchanged. There
+    // is no "ask without that column" for it: the entry is not a bare name.
+    if ((reason === "denied_column" || reason === "join_only_column") && subject && ctx.onRequestAccess) {
+      actions.push([
+        "درخواست دسترسی",
+        (evt) => handleRequestAccessClick(evt, turn.turn_id, subject, ctx.onRequestAccess),
+      ]);
+    }
+    // The generic action stays as a fallback for every OTHER guard
+    // rejection (forbidden statement, an unresolvable `*`, ...) and as a
+    // second, less specific option even when the targeted one above is
+    // offered -- an analyst may want to change more than just drop one
+    // column.
+    if (ctx.onRephrase) {
+      actions.push(["ویرایش پرسش", () => ctx.onRephrase(turn.turn_id)]);
+    }
+
+    // `turn.guard.rule` is NOT passed as `why` here. It is the guard's
+    // own free-text English rule, kept verbatim for the audit trail (see
+    // `security.sql_guard`'s docstring) -- exactly the kind of raw,
+    // system-side English DESIGN-INVARIANTS.md §8 keeps out of the
+    // analyst-facing banner, and `lead`/`GUARD_REASON_LEADS` above already
+    // give the Persian sentence for every reason. The rule stays visible
+    // where technical detail belongs instead: the SQL panel's
+    // `.guard-rule` element below, marked `dir="ltr"` so the embedded
+    // English does not scramble inside the right-to-left page.
+    return buildFailureBanner({
+      severity: "crit",
+      lead,
+      code: "FORBIDDEN_SQL",
+      // A guard rejection never populates `turn.error` on this (SSE) path
+      // (see `isGuardRejected`'s own docstring) -- `request_id` lives on
+      // `TurnErrorInfo`, not `GuardVerdict`, so there is genuinely none to
+      // show here, not one this file forgot to read.
+      requestId: null,
+      actions,
+    });
+  }
+
+  if (!turn.error) return null;
+
+  const retry = ctx.onRerun ? () => ctx.onRerun(turn.turn_id) : null;
+  const requestId = turn.error.request_id || null;
+
+  switch (turn.error.code) {
+    // Severity follows docs/design/mockups/completions.html's own two
+    // examples for these exact codes: a system hiccup an automatic retry
+    // can plausibly fix reads as "warn" (amber); a statement that never
+    // ran or a database that actively refused one reads as "crit" (red)
+    // — both are a harder stop than "try again in a moment".
+    case "MODEL_UNAVAILABLE":
+      // Lead stays what it always was; the English "why" line (the raw
+      // `session/engine.py::_classify_router_failure` message) is gone —
+      // it stays in the server log/audit, same rule as every code in
+      // `FAILURE_BY_CODE`.
+      return buildFailureBanner({
+        severity: "warn",
+        lead: FAILURE_BY_CODE.MODEL_UNAVAILABLE.lead,
+        why: null,
+        code: turn.error.code,
+        requestId,
+        actions: actionsFor(FAILURE_BY_CODE.MODEL_UNAVAILABLE.actions, ctx, turn.turn_id),
+      });
+
+    case "LLM_OUTPUT_TRUNCATED":
+      return buildFailureBanner({
+        severity: "warn",
+        lead: "مدل پیش از تمام‌کردن تولید پرس‌وجو متوقف شد.",
+        why: turn.error.message,
+        code: turn.error.code,
+        requestId,
+        actions: retry ? [["دوباره با پرسش کوتاه‌تر", retry]] : [],
+      });
+
+    // Kept for the HTTP shape this same rejection can take elsewhere —
+    // see this function's docstring. `session/engine.py` never sets this
+    // as `turn.error.code` today; `isGuardRejected` above is what fires
+    // in practice for the turn stream this file renders.
+    case "FORBIDDEN_SQL":
+      return buildFailureBanner({
+        severity: "crit",
+        lead: "این پرسش اصلاً اجرا نشد — لایهٔ نگهبانی امنیتی پیش از اجرا آن را رد کرد.",
+        why: turn.error.message,
+        code: turn.error.code,
+        requestId,
+        actions: ctx.onRephrase
+          ? [["ویرایش پرسش", () => ctx.onRephrase(turn.turn_id)]]
+          : [],
+      });
+
+    case "QUERY_EXECUTION_ERROR": {
+      // `turn.error.message` is either the database's own sentence for a
+      // bad statement (identifying, but not a secret -- worth showing) or
+      // `DB_GENERIC_REJECTION`, the backend's fallback for a statement
+      // failure it could not positively recognise (which says nothing the
+      // lead sentence above has not already said). A generic or empty
+      // message renders no detail line at all; a specific one renders as a
+      // labelled technical detail, kept out of the "why" line so an
+      // English sentence never sits directly under the Persian lead
+      // without at least the `dir="ltr"` isolation `buildFailureBanner`
+      // gives it below.
+      const message = turn.error.message;
+      const detail = message && message !== DB_GENERIC_REJECTION
+        ? { label: "پیام پایگاه داده:", text: message }
+        : null;
+      return buildFailureBanner({
+        severity: "crit",
+        lead: "پرس‌وجو اجرا شد، اما پایگاه داده آن را با خطا رد کرد.",
+        code: turn.error.code,
+        requestId,
+        detail,
+        actions: retry ? [["تلاش دوباره", retry]] : [],
+      });
+    }
+
+    default: {
+      // Every other code (MODEL_TIMEOUT, OUT_OF_SCOPE, DATABASE_UNAVAILABLE,
+      // ...) still gets the anatomy — a code-specific Persian sentence from
+      // `FAILURE_BY_CODE`, code subordinate, and whatever action(s) that
+      // table lists — `turn.error.message` (the backend's English text) is
+      // never read here. A code this table does not recognise falls back
+      // to its `INTERNAL_ERROR` entry, same as an unlisted code would.
+      const entry = FAILURE_BY_CODE[turn.error.code] || FAILURE_BY_CODE.INTERNAL_ERROR;
+      return buildFailureBanner({
+        severity: "crit",
+        lead: entry.lead,
+        why: null,
+        code: turn.error.code,
+        requestId,
+        actions: actionsFor(entry.actions, ctx, turn.turn_id),
+      });
+    }
+  }
+}
+
+/**
+ * "درخواست دسترسی" click handler (ADR-004 part 1). Reads the button from
+ * the click event itself (`evt.currentTarget`) rather than a closed-over
+ * reference, since `buildFailureBanner` builds the actual `<button>`
+ * element after this handler is constructed in `renderFailureState`.
+ *
+ * Shows its own outcome inline, in the banner, right after the actions
+ * row: a pending confirmation on success (worded differently for a fresh
+ * request vs. one that merged into an already-open request -- the
+ * `already_pending` flag `Api.submitAccessRequest` returns), or the
+ * failure message with the control re-enabled to retry, mirroring
+ * render/feedback.js's own recovery pattern for a rejected submission.
+ *
+ * `column` is untrusted (`GuardVerdict.subject`, server-supplied) and is
+ * rendered only through `.textContent` assignment below -- never
+ * interpolated into markup -- per DESIGN-INVARIANTS.md §1.3's rendering
+ * rule.
+ *
+ * @param {MouseEvent} evt
+ * @param {string} turnId
+ * @param {string} column
+ * @param {(turnId: string, column: string) => Promise<{already_pending: boolean}>} onRequestAccess
+ */
+function handleRequestAccessClick(evt, turnId, column, onRequestAccess) {
+  const btn = /** @type {HTMLButtonElement} */ (evt.currentTarget);
+  const banner = btn.closest(".failure-state");
+  if (!banner) return;
+
+  btn.disabled = true;
+  const originalLabel = btn.textContent;
+  btn.textContent = "در حال ارسال…";
+
+  let status = banner.querySelector(".request-access-status");
+  if (!status) {
+    status = el("p", "request-access-status");
+    const actionsRow = btn.closest(".failure-actions");
+    if (actionsRow && actionsRow.parentNode) {
+      actionsRow.parentNode.insertBefore(status, actionsRow.nextSibling);
+    } else {
+      banner.appendChild(status);
+    }
+  }
+  status.textContent = "";
+  status.classList.remove("ok", "error");
+
+  onRequestAccess(turnId, column).then((result) => {
+    btn.textContent = "درخواست ارسال شد ✓";
+    const alreadyPending = !!(result && result.already_pending);
+    status.textContent = alreadyPending
+      ? `درخواست دسترسی به «${column}» پیش‌تر ثبت شده و در انتظار بررسی است.`
+      : `درخواست دسترسی به «${column}» ثبت شد و در انتظار بررسی است.`;
+    status.classList.add("ok");
+  }).catch((err) => {
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+    status.textContent = (err && err.message) || "ثبت درخواست دسترسی ناموفق بود.";
+    status.classList.add("error");
+  });
+}
+
+/**
+ * One failure banner, styled after docs/design/mockups/completions.html's
+ * `.fail` pattern: a left (logical-start) accent border in the severity
+ * colour, a bold lead sentence, an optional lighter "why", the
+ * machine-readable code (and, when there is one, the `request_id` beside
+ * it) as a small monospace line — present but visually the least
+ * important thing here, per DESIGN-INVARIANTS.md §8's copy discipline
+ * ("Keep the machine-readable code and the request_id visible but
+ * subordinate — an operator needs them; the sentence is not for them") —
+ * and real `<button>` controls, the first one filled in brand teal (the
+ * actual next step), any further one a plain outline (an alternative, not
+ * the recommended path). `actions` is a list of `[label, onClick]` pairs
+ * rather than objects, matching this file's `el(tag, className, text)`
+ * helper's own positional style.
+ *
+ * `detail` is an optional `{label, text}` pair for a labelled technical
+ * detail line -- currently only `QUERY_EXECUTION_ERROR` uses it, for the
+ * database's own message about a rejected statement. Rendered as a `<p
+ * class="failure-detail">` holding the Persian label, a single space, then
+ * `text` inside a `<bdi dir="ltr" class="failure-detail-text">` -- `<bdi>`
+ * plus an explicit `dir` isolates the embedded English/mixed-direction
+ * text from the surrounding right-to-left Persian, the same reason
+ * `sql-display.js`'s SQL box and this file's own `.guard-rule` element get
+ * `dir="ltr"`. Built only with `createElement`/`textContent` (via `el()`
+ * and direct DOM calls below) -- `text` is an untrusted, server-supplied
+ * string (the database's own error text) and must never reach `innerHTML`.
+ *
+ * @param {{
+ *   severity: "crit"|"warn",
+ *   lead: string,
+ *   why?: string|null,
+ *   code?: string|null,
+ *   requestId?: string|null,
+ *   detail?: {label: string, text: string}|null,
+ *   actions: [string, () => void][],
+ * }} spec
+ */
+function buildFailureBanner({ severity, lead, why, code, requestId, detail, actions }) {
+  const banner = el("div", `failure-state failure-${severity}`);
+  banner.setAttribute("role", "alert");
+
+  banner.appendChild(el("p", "failure-lead", lead));
+
+  if (why && why !== lead) {
+    banner.appendChild(el("p", "failure-why", why));
+  }
+
+  if (detail && detail.label && detail.text) {
+    const detailLine = document.createElement("p");
+    detailLine.className = "failure-detail";
+    const label = document.createElement("span");
+    label.className = "failure-detail-label";
+    label.textContent = detail.label;
+    detailLine.appendChild(label);
+    detailLine.appendChild(document.createTextNode(" "));
+    const text = document.createElement("bdi");
+    text.dir = "ltr";
+    text.className = "failure-detail-text";
+    text.textContent = detail.text;
+    detailLine.appendChild(text);
+    banner.appendChild(detailLine);
+  }
+
+  if (code || requestId) {
+    const meta = el("p", "failure-meta");
+    if (code) meta.appendChild(el("span", "failure-code", code));
+    // `requestId` is server-supplied text (session/models.py's
+    // TurnErrorInfo.request_id) rendered with `el()`'s `textContent`
+    // assignment, same as every other field on this page — never
+    // interpolated into an HTML string (DESIGN-INVARIANTS.md §1.3).
+    if (requestId) meta.appendChild(el("span", "failure-request-id", `req: ${requestId}`));
+    banner.appendChild(meta);
+  }
+
+  if (actions && actions.length) {
+    const actionsRow = el("div", "failure-actions");
+    actions.forEach(([label, onClick], i) => {
+      const btn = el("button", i === 0 ? "failure-action-btn primary" : "failure-action-btn", label);
+      btn.type = "button";
+      btn.addEventListener("click", onClick);
+      actionsRow.appendChild(btn);
+    });
+    banner.appendChild(actionsRow);
+  }
+
+  return banner;
+}
+
+/** One-line outcome: rows · guard · TOP. Always after a settled turn. */
+function buildOutcomeLine(turn) {
+  if (turn.error && !turn.guard && !turn.result) return null;
+  const row = el("div", "turn-outcome");
+  if (turn.guard) {
+    const ok = turn.guard.verdict === "allowed";
+    row.appendChild(el("span", ok ? "outcome-ok" : "outcome-bad",
+      ok ? "✓ گارد مجاز" : "✕ گارد رد شد"));
+  }
+  if (turn.result && turn.result.row_count !== undefined && turn.result.row_count !== null) {
+    row.appendChild(el("span", "outcome-sep", "·"));
+    row.appendChild(el("span", "", `${fmt(turn.result.row_count)} ردیف`));
+  }
+  if (turn.guard && turn.guard.injected_top !== null && turn.guard.injected_top !== undefined) {
+    row.appendChild(el("span", "outcome-sep", "·"));
+    row.appendChild(el("span", "num", `TOP ${turn.guard.injected_top}`));
+  }
+  if (turn.timings && turn.timings.total_ms) {
+    row.appendChild(el("span", "outcome-sep", "·"));
+    const secs = turn.timings.total_ms / 1000;
+    row.appendChild(el("span", "num", `${secs.toFixed(1)}s`));
+  }
+  if (turn.ambiguity && turn.ambiguity.is_ambiguous) {
+    row.appendChild(el("span", "outcome-sep", "·"));
+    row.appendChild(el("span", "outcome-warn", "مبهم — با مفروضات"));
+  }
+  if (!row.childNodes.length) return null;
+  return row;
+}
+
+function summarize(turn) {
+  const parts = [`#${turn.index}`];
+  if (turn.basis && turn.basis.kind === "refines") parts.push(`ادامهٔ ${turn.basis.refines_turn_id}`);
+  if (turn.error) parts.push(`خطا: ${turn.error.code}`);
+  else if (turn.guard && turn.guard.verdict === "rejected") parts.push("رد شده توسط نگهبان امنیتی");
+  else if (turn.result) parts.push(`${fmt(turn.result.row_count)} ردیف`);
+  if (turn.ambiguity && turn.ambiguity.is_ambiguous) parts.push("مبهم — با مفروضات پاسخ داده شد");
+  return parts.join(" · ");
+}
+
+async function copyToClipboard(text, btn) {
+  const originalLabel = btn.textContent;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+    } catch { /* clipboard unavailable — button label stays "کپی" */ }
+  }
+  btn.textContent = "کپی شد ✓";
+  setTimeout(() => { btn.textContent = originalLabel; }, 1600);
+}

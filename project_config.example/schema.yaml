@@ -1,0 +1,265 @@
+# schema.yaml — TEMPLATE (copy to project_config/schema.yaml and fill in real data)
+#
+# Warehouse schema read by schema_data/registry.py. This is the single
+# source of truth for:
+#   * the schema block rendered into the LLM prompt (SchemaRegistry.build_schema_context)
+#   * the JOIN hints offered for a set of tables (SchemaRegistry.get_relationships)
+#   * the SQL guard's table/column allowlist (security/sql_guard.py) — every
+#     table a generated query references must resolve to a table listed
+#     below WITH a `columns` key, or it is rejected outright.
+#
+# tables:
+#   Each top-level key is a table KEY: bare (as it appears in FROM/JOIN
+#   clauses with no qualifier, e.g. "Customer") or QUALIFIED with 1-3
+#   leading parts ("sales.Customer", "OtherDb.dbo.Customer") when your
+#   warehouse has the SAME table name in more than one schema -- see
+#   docs/design/TABLE-NAMES.md. Brackets and a doubled `]]` escape are
+#   understood the same way they would be in a real query. Whichever form
+#   you use, the key AS WRITTEN is that table's identity everywhere --
+#   in the prompt's schema block, the guard's audit trail, and this
+#   file's own `relationships` list.
+#
+#   A table's EFFECTIVE qualifier (what the guard actually checks a query's
+#   own qualifier against) is the key's own leading parts when it has any,
+#   else `db_schema` below. Recommended: give EVERY table a `db_schema`,
+#   even a bare-keyed one in a single-schema deployment -- a table with NO
+#   qualifier at all (neither in its key nor in `db_schema`) cannot have
+#   its qualifier checked by the guard, so a query naming any schema (or
+#   none) for it still resolves; setting `db_schema` is what turns that
+#   check on. If a key IS qualified and `db_schema` is also given, the two
+#   must agree, case-insensitively -- `schema.yaml` validation fails
+#   otherwise. Two keys that resolve to the same (qualifier, bare name)
+#   also fail validation; two DIFFERENT qualifiers sharing a bare name
+#   (this file's own `sales.*`/`ref.*` pattern) do not.
+#     description : human-readable summary shown in the prompt's schema
+#                   block. Include the fully-qualified name (schema.table)
+#                   and any native-language synonyms your users might type.
+#     columns     : (optional) map of column name -> description. A table
+#                   with NO `columns` key is still described in the prompt
+#                   (useful for a lookup/status dimension you want the model
+#                   to know exists) but the SQL guard will refuse any query
+#                   that references it directly — add a `columns` map, even
+#                   a partial one, once you want that table queryable.
+#     db_schema   : (optional) this table's schema/database qualifier, e.g.
+#                   "sales" -- used to build a `[db_schema].[table]`
+#                   reference in retrieval.value_resolver / retrieval.dimension_vocabulary
+#                   (via schema_data.registry.table_reference_sql, using
+#                   the table's BARE name regardless of whether its key is
+#                   qualified). Required whenever resolvable_columns or
+#                   prefetchable_columns is non-empty AND the key itself is
+#                   bare (a qualified key's own qualifier already satisfies
+#                   that requirement without db_schema). A warehouse with
+#                   more than one schema (this example has two: "sales" and
+#                   "ref") just gives each table its own value -- there is
+#                   no single global schema constant anywhere in the code.
+#                   May be MULTI-PART ("OtherDb.dbo") for a table in a
+#                   second database on the SAME SQL Server instance --
+#                   renders the three-part `[OtherDb].[dbo].[Table]`
+#                   reference SQL Server expects
+#                   (security.dialects.quote_tsql_qualifier). Up to three
+#                   parts (server.database.schema). A table on a genuinely
+#                   different SERVER is not a db_schema at all -- see
+#                   `datasource` below. An UNQUALIFIED reference to a
+#                   table whose only known qualifier is multi-part is
+#                   refused, not guessed -- see docs/design/TABLE-NAMES.md
+#                   for why.
+#     datasource  : (optional) which entry of `datasources.yaml` this table
+#                   lives in (see datasources.example.yaml and
+#                   docs/design/DATASOURCES.md). Absent (the default) means
+#                   the deployment's default source -- harmless, and the
+#                   only meaningful value, for a deployment with no
+#                   datasources.yaml at all. Table names stay globally
+#                   unique across every source; this key is what tells
+#                   `database.routing` which server a query touching this
+#                   table must run against, and a query that references
+#                   tables from two different sources is refused.
+#                   A LIST names every source a table exists in, with the
+#                   same shape in each (a date dimension replicated into
+#                   several databases):  datasource: [sales, inventory]
+#                   (the names are those of datasources.yaml, with the same
+#                   letter case)
+#                   A statement may then run on any source that has ALL
+#                   the tables it reads: the default source if it is one,
+#                   otherwise the first in datasources.yaml order. A
+#                   statement that reads only that table runs on the
+#                   default source. Names must be distinct.
+#                   `python scripts/sync_schema.py` reads each
+#                   source's catalogue and writes these lines for you,
+#                   with the rest of the structure (schema.synced.yaml,
+#                   for review); scripts/assign_datasources.py writes
+#                   only these lines.
+#     column_units : (optional) map of column name -> `rial` or `none`, for
+#                   the columns whose answer-summary wording the column name
+#                   alone does not settle. `rial` says a number in the column
+#                   is an amount of money (the summary writes it with the
+#                   unit Rial/ریال); `none` says it is not (a count, a
+#                   volume, a percentage, an identifier: no currency unit).
+#                   A column not listed is judged from its name (price,
+#                   value, amount, cost, fee, ارزش, قیمت, مبلغ, کارمزد ... are
+#                   money; count, quantity, volume, weight, percent, id, code,
+#                   date, حجم, تعداد, درصد, کد ... are not) and, when the name
+#                   says nothing, by the model. Keys must be columns of
+#                   `columns`. Used only for the wording of the summary;
+#                   the sync leaves it alone (`--prune` removes the entry of
+#                   a column it removes). Write `none`, not `no`: YAML reads
+#                   a bare `no` as false.
+#     resolvable_columns  : (optional) subset of `columns`' keys that
+#                   retrieval.value_resolver.resolve_value is allowed to
+#                   query -- name-bearing dimension columns a free-text
+#                   mention could plausibly resolve to (a customer or
+#                   product name, not a foreign key or amount).
+#     prefetchable_columns : (optional) subset of `columns`' keys that
+#                   retrieval.dimension_vocabulary is allowed to prefetch
+#                   the entire distinct value set of -- small-cardinality
+#                   dimensions only; deliberately excluded for any table
+#                   whose row count could be large (see that module's
+#                   docstring for why this example's own Customer/Supplier
+#                   are resolvable but NOT prefetchable).
+#
+# relationships:
+#   A list of JOIN hints between two tables. Both directions do NOT need to
+#   be listed separately — SchemaRegistry.get_relationships() only includes
+#   an edge when both from_table and to_table are among the tables selected
+#   for a given question, so list each real foreign key once.
+#     from_table : source table name (must match a key under `tables`)
+#     to_table   : target table name (must match a key under `tables`)
+#
+# NOTE: this file is also a test fixture. tests/test_sql_guard_schema.py's
+# TestRealSchemaJoinsValidate::test_order_reserved_word_table_with_date_join
+# specifically needs tables literally named "Order" and "Date" (both T-SQL
+# reserved words) to exist here WITH a `columns` key, to keep exercising
+# the guard's bracketed-reserved-word-identifier handling in CI (which runs
+# against this file, not the real schema). Keep both tables, under these
+# exact names, if you edit this file.
+#     join_sql   : the literal JOIN clause text inserted into generated SQL
+
+tables:
+  # Example 1: a fact/transaction table with a full column list
+  Order:
+    description: "sales.Order — customer purchase orders"
+    db_schema: "sales"
+    columns:
+      ID: "Primary key"
+      CustomerID: "FK → Customer"
+      OrderDate_ID: "FK → Date"
+      TotalAmount: "Order total, in the store's base currency"
+      RingID: "FK → ref.Ring — sales channel the order was placed through"
+      BrokerID: "FK → ref.Broker — selling agent for the order"
+      SymbolID: "FK → ref.Symbol — product symbol the order is for"
+    # Optional: which numbers are money, for the wording of the answer summary.
+    column_units:
+      TotalAmount: rial
+
+  # Example 2: a dimension table
+  #
+  # NOTE: this table's column set (ID, Name, NationalID, IsActive) is also
+  # relied on, unchanged, by doctests in security/sql_guard.py and
+  # session/composer.py that illustrate column-expansion / denied-column
+  # behaviour against a table literally named "Customer" -- keep these
+  # four column names if you edit this entry.
+  Customer:
+    description: "sales.Customer — customer master data"
+    db_schema: "sales"
+    columns:
+      ID: "Primary key"
+      Name: "Customer full name"
+      NationalID: "National ID / national code"
+      IsActive: "Active flag"
+    # Deliberately resolvable but NOT prefetchable -- Customer can be a
+    # very large table; see retrieval/dimension_vocabulary.py's docstring.
+    resolvable_columns: ["Name"]
+
+  # Example 3: a small date dimension
+  Date:
+    description: "sales.Date — calendar date dimension"
+    db_schema: "sales"
+    columns:
+      ID: "Primary key"
+      CalendarDate: "Gregorian calendar date"
+      Year: "4-digit calendar year"
+      Month: "Month number 1-12"
+
+  # Example 4: a lookup/status table described for prompt context only —
+  # note it has NO `columns` key, so the SQL guard will not accept it as a
+  # queryable table until one is added.
+  OrderStatus:
+    description: "sales.OrderStatus — order lifecycle status lookup"
+    db_schema: "sales"
+
+  # Examples 5-9: small reference/lookup dimensions, in a SECOND schema
+  # ("ref", distinct from "sales" above) -- demonstrating that db_schema is
+  # genuinely per-table, and that resolvable_columns/prefetchable_columns
+  # are ordinary schema.yaml data like everything else here. Also what
+  # exercises retrieval.value_resolver / retrieval.dimension_vocabulary
+  # under this example config in CI.
+  Broker:
+    description: "ref.Broker — selling-agent reference data"
+    db_schema: "ref"
+    columns:
+      ID: "Primary key"
+      PersianName: "Agent display name"
+      Code: "Agent code"
+    resolvable_columns: ["PersianName"]
+    prefetchable_columns: ["PersianName"]
+  Currency:
+    description: "ref.Currency — currency reference data"
+    db_schema: "ref"
+    columns:
+      ID: "Primary key"
+      PersianName: "Currency display name"
+      Code: "ISO currency code"
+    resolvable_columns: ["PersianName"]
+    prefetchable_columns: ["PersianName"]
+  Location:
+    description: "ref.Location — delivery location reference data"
+    db_schema: "ref"
+    columns:
+      ID: "Primary key"
+      PersianName: "Delivery location display name"
+    resolvable_columns: ["PersianName"]
+    prefetchable_columns: ["PersianName"]
+  Ring:
+    description: "ref.Ring — sales channel reference data"
+    db_schema: "ref"
+    columns:
+      ID: "Primary key"
+      Name: "Channel display name"
+      Code: "Channel code"
+    resolvable_columns: ["Name"]
+    prefetchable_columns: ["Name"]
+  Symbol:
+    description: "ref.Symbol — product symbol reference data"
+    db_schema: "ref"
+    columns:
+      ID: "Primary key"
+      Commodity_PersianName: "Product display name"
+      Commodity_Symbol: "Product symbol"
+    resolvable_columns: ["Commodity_PersianName", "Commodity_Symbol"]
+    prefetchable_columns: ["Commodity_PersianName", "Commodity_Symbol"]
+  Supplier:
+    description: "ref.Supplier — supplier master data"
+    db_schema: "ref"
+    columns:
+      ID: "Primary key"
+      Customer_Name: "Supplier display name"
+      NationalCode: "Supplier national identifier; NULL until KYC is complete, so non-NULL is used as an 'active supplier' proxy"
+    # Deliberately resolvable but NOT prefetchable -- same reasoning as
+    # Customer above.
+    resolvable_columns: ["Customer_Name"]
+
+relationships:
+  - from_table: "Order"
+    to_table: "Customer"
+    join_sql: "JOIN [sales].[Customer] c ON o.CustomerID = c.ID"
+  - from_table: "Order"
+    to_table: "Date"
+    join_sql: "JOIN [sales].[Date] d ON o.OrderDate_ID = d.ID"
+  - from_table: "Order"
+    to_table: "Ring"
+    join_sql: "JOIN [ref].[Ring] r ON o.RingID = r.ID"
+  - from_table: "Order"
+    to_table: "Broker"
+    join_sql: "JOIN [ref].[Broker] b ON o.BrokerID = b.ID"
+  - from_table: "Order"
+    to_table: "Symbol"
+    join_sql: "JOIN [ref].[Symbol] s ON o.SymbolID = s.ID"

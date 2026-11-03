@@ -1,0 +1,623 @@
+/* web/js/api.js
+ *
+ * Live-mode transport against the real backend, per docs/api-contract-v2.md.
+ * As of this writing the backend does NOT implement /v2/* yet (only /query
+ * and /health exist — see api/server.py, api/models.py). Every function
+ * here is written against the frozen contract so it is ready the moment the
+ * backend lands, but callers MUST treat a 404 on /v2/sessions as "backend
+ * doesn't support v2 yet", not as a generic error — see main.js.
+ *
+ * No fabricated results: on any failure we throw or return a tagged error
+ * object; we never synthesize a fake Turn to paper over an unreachable API.
+ *
+ * Authentication (Phase 8, docs/api-contract-v2.md §11): every route here
+ * except GET /health requires `Authorization: Bearer <key>`. The key comes
+ * from apikey.js (one per analyst, stored in that analyst's own browser —
+ * see that module's docstring for why a single baked-in key is wrong for
+ * this UI) and is attached in exactly one place, `_fetchV2`, so every v2
+ * call site inherits it automatically. `health()` attaches it too when one
+ * is already stored (it unlocks the `model` field — see api/server.py's
+ * `/health` handler) but never requires it: liveness probes must keep
+ * working with no credentials at all.
+ */
+
+"use strict";
+
+import { getApiKey } from "./apikey.js";
+
+/* ── Contract types (JSDoc only, no runtime effect) ───────────────────
+ * Mirrors docs/api-contract-v2.md §4 and §6 so editors can typecheck
+ * render code against the frozen shape without a build step.
+ *
+ * @typedef {Object} Assumption
+ * @property {string} field
+ * @property {string} value
+ * @property {"question"|"session"|"default"|"policy"|"memory"} source
+ * @property {boolean} editable
+ *
+ * @typedef {Object} Clarification
+ * @property {string} field
+ * @property {string} prompt
+ * @property {string[]} options
+ *
+ * @typedef {Object} Ambiguity
+ * @property {boolean} is_ambiguous
+ * @property {Assumption[]} assumptions
+ * @property {Clarification[]} clarifications
+ *
+ * @typedef {Object} Basis
+ * @property {"fresh"|"refines"} kind
+ * @property {string|null} refines_turn_id
+ * @property {"cte"|"none"} composition
+ * @property {string[]} inherited
+ *
+ * @typedef {Object} Guard
+ * @property {"allowed"|"rejected"} verdict
+ * @property {string|null} rule
+ * @property {string|null} [rejected_sql]
+ * @property {string|null} [rejected_sql_display]
+ * @property {number|null} injected_top
+ * @property {string[]} tables_touched
+ *
+ * @typedef {Object} ResultColumn
+ * @property {string} name
+ * @property {string} type
+ *
+ * @typedef {Object} Result
+ * @property {ResultColumn[]} columns
+ * @property {Object[]} rows
+ * @property {number} row_count
+ * @property {boolean} truncated
+ * @property {boolean} [rows_omitted] -- true when this turn was loaded from
+ *   a reopened conversation (GET /v2/sessions/{sid}) rather than just
+ *   executed: the transcript endpoint does not persist result rows, so
+ *   `rows` is empty here even though `row_count` is the real, accurate
+ *   count. See render/table.js's `omitted` shape -- this must never be
+ *   confused with an actual 0-row result.
+ *
+ * @typedef {Object} LlmStatus
+ * @property {string} backend
+ * @property {string} model
+ * @property {string|null} endpoint
+ * @property {boolean} trusted
+ * @property {number} endpoint_status
+ * @property {number} attempts
+ * @property {"stop"|"length"|"content_filter"|"tool_calls"|"schema_violation"|"error"|string} finish_reason
+ *   -- literal values per docs/api-contract-v2.md §6, or an "other:<raw>"
+ *   passthrough for a value none of them anticipated.
+ * @property {boolean} structured_output
+ * @property {number} prompt_tokens
+ * @property {number} completion_tokens
+ * @property {number|null} prefill_ms
+ * @property {number|null} decode_ms
+ * @property {number|null} total_ms
+ * @property {number|null} tokens_per_second
+ * @property {boolean} prefix_cache_hit
+ * @property {number} temperature
+ * @property {number|null} seed
+ * @property {boolean|null} seed_honored
+ * @property {number} corrections
+ * @property {string} provider
+ * @property {boolean} fallback_used
+ * @property {boolean} reasoning_detected
+ * @property {number|null} ttft_ms
+ * @property {number|null} generation_ms
+ * @property {number|null} reasoning_tokens
+ * @property {boolean} reasoning_tokens_estimated
+ *
+ * @typedef {Object} SessionSummary
+ * @property {string} session_id
+ * @property {string} title
+ * @property {string} created_at
+ * @property {string} last_active_at
+ * @property {number} turn_count
+ * @property {string} expires_at
+ *
+ * @typedef {Object} MemoryEntry
+ * @property {string} key
+ * @property {string} field
+ * @property {string} value
+ * @property {string} updated_at
+ * @property {boolean} applicable
+ *
+ * @typedef {Object} RememberableField
+ * @property {string} key
+ * @property {string} field
+ * @property {string[]} options
+ * @property {number} max_length
+ *
+ * @typedef {Object} Turn
+ * @property {string} turn_id
+ * @property {string} session_id
+ * @property {number} index
+ * @property {string} question
+ * @property {string|null} resolved_question
+ * @property {Basis} basis
+ * @property {string|null} sql
+ * @property {string} [sql_display]
+ * @property {Ambiguity} ambiguity
+ * @property {Guard|null} guard
+ * @property {Result|null} result
+ * @property {string|null} interpretation
+ * @property {"T0"|"T1"|"T2"|"T3"|null} tier
+ * @property {string[]} warnings
+ * @property {LlmStatus} llm
+ * @property {Object} timings
+ * @property {{code: string, message: string}|null} error
+ */
+
+export class V2NotSupportedError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "V2NotSupportedError";
+  }
+}
+
+/** `code` is the server's `error.code` (api/errors.py's `_error_response`
+ * envelope — `MAINTENANCE_MODE`, `SERVER_OVERLOAD`, `INJECTION_ATTEMPT`,
+ * ...) when this came back from a real HTTP response, or `null` when it
+ * did not (an unparseable body, or a response this class was constructed
+ * for without one). Threading it through here — rather than discarding it
+ * the way this class used to — is what lets a catch site downstream (e.g.
+ * main.js's `askTurnStream`) recover the REAL failure reason instead of
+ * relabelling every non-transport ApiError as a generic transport
+ * failure; see render/turn.js's `FAILURE_BY_CODE`, the one table that
+ * turns a code into the Persian sentence an analyst actually reads. */
+export class ApiError extends Error {
+  constructor(message, status, code = null) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+/** A 401: missing or invalid API key. Distinguished from a generic
+ * ApiError so the UI can show "your key was rejected, enter a new one"
+ * and re-prompt instead of a generic error banner (docs/api-contract-v2.md
+ * §11.3 — the server returns the same UNAUTHENTICATED code whether the
+ * key was never sent or was sent and rejected, so this UI does not try to
+ * tell those two cases apart either). */
+export class UnauthorizedError extends ApiError {
+  constructor(message, code = "UNAUTHENTICATED") {
+    super(message, 401, code);
+    this.name = "UnauthorizedError";
+  }
+}
+
+/** A 429: client-side rate limiting, not a query or model failure — see
+ * api/middleware.py's RateLimitMiddleware. Carries the structured fields
+ * from the error body (`retry_after_seconds`) so the UI can surface a
+ * useful, specific message instead of a generic error. */
+export class RateLimitError extends ApiError {
+  constructor(message, retryAfterSeconds, code = "RATE_LIMIT_EXCEEDED") {
+    super(message, 429, code);
+    this.name = "RateLimitError";
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+/** Turn a fetch rejection into something a reader can act on.
+ *
+ * A browser reports every pre-response failure as the same opaque
+ * "Failed to fetch": connection refused, DNS failure, and a blocked
+ * cross-origin request are indistinguishable to the page, deliberately —
+ * telling a page *why* a cross-origin call was refused would itself leak
+ * information about the other origin.
+ *
+ * That indistinguishability cost a real deployment an afternoon. The API
+ * was healthy and the CLI was answering questions against it, while this
+ * UI showed API, LLM and DB all down: the server's CORS allowlist was
+ * empty, so the preflight came back "400 Disallowed CORS origin" and the
+ * browser handed the page nothing but "Failed to fetch".
+ *
+ * So when the UI is talking to a different origin than the page it is
+ * served from, say so and name the setting. The guess is stated as a
+ * guess — a refused connection produces the identical error, and claiming
+ * certainty about which one it is would just be a different lie.
+ */
+export function describeTransportFailure(baseUrl, path, err) {
+  const base = `Network error calling ${path}: ${err.message}`;
+  let crossOrigin = false;
+  try {
+    crossOrigin = new URL(baseUrl, location.href).origin !== location.origin;
+  } catch { /* an unparseable baseUrl is its own, more obvious problem */ }
+  if (!crossOrigin) return base;
+  return (
+    `${base}
+
+` +
+    `این صفحه از ${location.origin} سرو شده ولی به ${baseUrl} درخواست می‌دهد — ` +
+    `یعنی cross-origin. مرورگر دلیل واقعی را به صفحه نمی‌گوید، ولی دو حالت ` +
+    `محتمل است: بک‌اند بالا نیست، یا این origin در CORS_ALLOWED_ORIGINS ` +
+    `بک‌اند مجاز نشده. برای دومی این را در .env بگذارید و سرور را ری‌استارت کنید:
+` +
+    `    CORS_ALLOWED_ORIGINS=${location.origin}`
+  );
+}
+
+export class Api {
+  /** @param {string} baseUrl */
+  constructor(baseUrl) {
+    this.baseUrl = baseUrl.replace(/\/+$/, "");
+  }
+
+  /* ── Health ──────────────────────────────────────────────────────── */
+  /* Reads the REAL field names from api/models.py::HealthResponse
+   * (status, openai, database, model). This drifted once already: an
+   * earlier revision of this file read `h.openai` when the backend's
+   * field was actually named `ollama`, then the backend was refactored
+   * to a single OpenAI-compatible provider (commit 59dbc77) and the
+   * field went back to `openai` — but this file had since been "fixed"
+   * to read `h.ollama` against that now-superseded name, so it silently
+   * went stale again and the LLM pill was permanently wrong in live mode
+   * a second time. Reads `h.openai` here, matching the field that
+   * actually exists on the response today. */
+  async health(timeoutMs = 4000) {
+    // Unauthenticated by design (docs/api-contract-v2.md §11.3 — GET
+    // /health is the one route that stays open with no key at all, so a
+    // liveness probe never depends on auth being configured correctly).
+    // A key IS attached when one happens to be stored, purely so an
+    // already-authenticated analyst sees the real `model` field instead
+    // of it being omitted for "anonymous" callers (api/server.py's
+    // `/health` handler) — its absence must never break this call.
+    const headers = {};
+    const key = getApiKey();
+    if (key) headers["Authorization"] = `Bearer ${key}`;
+    let res;
+    try {
+      res = await fetch(`${this.baseUrl}/health`, { signal: AbortSignal.timeout(timeoutMs), headers });
+    } catch (err) {
+      // No HTTP response at all -- unreachable host, DNS failure, or a
+      // refused cross-origin preflight (CORS). Same distinction
+      // `_fetchV2` draws for every other route, and the same reason: a
+      // 500/404 (caught below) is a live backend answering with a real
+      // problem, while THIS is the "three red lights on a healthy
+      // backend" symptom `describeTransportFailure` exists for -- see
+      // its own docstring for the real deployment incident.
+      throw new ApiError(describeTransportFailure(this.baseUrl, "/health", err), 0, "TRANSPORT_ERROR");
+    }
+    if (!res.ok) throw new ApiError(`HTTP ${res.status}`, res.status);
+    // `?? {}`: a body of JSON `null` must reach the shape check below as
+    // "not the API's response", not as a TypeError on the next line.
+    const h = (await res.json()) ?? {};
+    return {
+      api: true,
+      llm: !!h.openai,
+      db: !!h.database,
+      status: h.status,
+      model: h.model || null,
+      // Why each light is what it is. A red indicator with no reason is
+      // undiagnosable -- "unreachable host", "wrong key" and "this server
+      // does not implement /models" look identical, and the last is not
+      // even a fault. Optional: an older backend omits these.
+      llmDetail: h.openai_detail || null,
+      dbDetail: h.database_detail || null,
+      // The parsed body, untouched. Whatever answers at this address can
+      // return 200 and JSON that is not the API's health response (a
+      // different service on the port); the caller judges that with
+      // diagnosis.js's isApiHealthShape rather than this method throwing
+      // on a body it cannot know the shape of for every backend version.
+      raw: h,
+    };
+  }
+
+  /* ── Sessions (v2, not yet implemented server-side) ────────────────── */
+  async createSession() {
+    const res = await this._fetchV2(`/v2/sessions`, { method: "POST" });
+    return res.json();
+  }
+
+  /** The conversation list for the sidebar (contract §... "session
+   * index"): `{sessions: SessionSummary[], total}`. Ordering is NOT
+   * trusted from the server -- render/sessions.js re-sorts by
+   * `last_active_at` itself, so this just returns the raw body. */
+  async listSessions() {
+    const res = await this._fetchV2(`/v2/sessions`, { method: "GET" });
+    return res.json();
+  }
+
+  async getSession(sessionId) {
+    const res = await this._fetchV2(`/v2/sessions/${encodeURIComponent(sessionId)}`, { method: "GET" });
+    return res.json();
+  }
+
+  /** Inline rename from the sidebar. Returns the updated index entry
+   * (SessionSummary), per the frozen PATCH /v2/sessions/{sid} contract. */
+  async renameSession(sessionId, title) {
+    const res = await this._fetchV2(`/v2/sessions/${encodeURIComponent(sessionId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title }),
+    });
+    return res.json();
+  }
+
+  async deleteSession(sessionId) {
+    await this._fetchV2(`/v2/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
+  }
+
+  /**
+   * Ask a non-streaming turn. Returns a Turn (contract §4).
+   */
+  async askTurn(sessionId, question, { interpret = false } = {}) {
+    const res = await this._fetchV2(`/v2/sessions/${encodeURIComponent(sessionId)}/turns`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question, interpret }),
+    });
+    return res.json();
+  }
+
+  /**
+   * Ask a streaming turn (contract §7). Calls `onEvent(eventName, payload)`
+   * for every SSE frame in order: stage, resolved, assumptions, sql_delta,
+   * sql, rows, interpretation_delta, llm, done, error.
+   *
+   * fetch()+ReadableStream is used instead of EventSource because this is a
+   * POST with a body, which EventSource cannot express.
+   */
+  async askTurnStreaming(sessionId, question, onEvent, { signal, interpret = false } = {}) {
+    const res = await this._fetchV2(
+      `/v2/sessions/${encodeURIComponent(sessionId)}/turns?stream=1`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+        // `interpret` decides whether the server sends result rows to the
+        // language model for a summary. Always sent explicitly rather than
+        // omitted, so the request says what it wants instead of relying on
+        // whatever the server's default happens to be.
+        body: JSON.stringify({ question, interpret }),
+        signal,
+      },
+    );
+    if (!res.body) throw new ApiError("Streaming response has no body (browser or server issue).", res.status);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      let sepIndex;
+      // SSE frames are separated by a blank line ("\n\n").
+      while ((sepIndex = buffer.indexOf("\n\n")) !== -1) {
+        const frame = buffer.slice(0, sepIndex);
+        buffer = buffer.slice(sepIndex + 2);
+        const parsed = parseSseFrame(frame);
+        if (parsed) onEvent(parsed.event, parsed.data);
+      }
+    }
+  }
+
+  /** "این عدد درست نیست" (admin panel phase 4, spec §2) — flags one turn's
+   * answer as wrong. `category` must be one of the closed set
+   * appdb/feedback.py::FEEDBACK_CATEGORIES defines; `note` is optional
+   * free text. Never sends the question or the SQL — the server joins
+   * those from its own audit log by session/turn id, precisely so this
+   * request never has to carry them. */
+  async submitFeedback(sessionId, turnId, category, note) {
+    const res = await this._fetchV2(
+      `/v2/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/feedback`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ category, note }),
+      },
+    );
+    return res.json();
+  }
+
+  /** "پاسخ درست است" — confirms one turn's answer as correct. No request
+   * body: the principal is stamped server-side and the request id is
+   * resolved from the audit record. Idempotent. The server answers 409 for
+   * a turn that was not a successful answer. The response carries
+   * `removed_flags` (an open flag of the caller's on this turn is removed:
+   * the later action wins). */
+  async confirmAnswer(sessionId, turnId) {
+    const res = await this._fetchV2(
+      `/v2/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/confirmation`,
+      { method: "POST" },
+    );
+    return res.json();
+  }
+
+  /** Withdraws the caller's own confirmation of a turn. Safe to repeat. */
+  async withdrawConfirmation(sessionId, turnId) {
+    const res = await this._fetchV2(
+      `/v2/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/confirmation`,
+      { method: "DELETE" },
+    );
+    return res.json();
+  }
+
+  /** The turns of one session the caller has confirmed:
+   * `{ confirmations: [...], turn_ids: [...] }`. One request per session,
+   * so a reopened transcript shows each turn's confirmed state. */
+  async listConfirmations(sessionId) {
+    const res = await this._fetchV2(
+      `/v2/sessions/${encodeURIComponent(sessionId)}/confirmations`,
+      { method: "GET" },
+    );
+    return res.json();
+  }
+
+  /** Questions from the deployment's examples.yaml to start a conversation
+   * with: `{ examples: [{ question }] }`, question text only, already
+   * filtered by the server for this key's denied columns. */
+  async listExamples(limit = 6) {
+    const res = await this._fetchV2(`/v2/examples?limit=${encodeURIComponent(limit)}`, { method: "GET" });
+    return res.json();
+  }
+
+  /** "درخواست دسترسی" (ADR-004 part 1) -- requests access to the denied
+   * column that caused a guard rejection on this turn. No request body:
+   * the requester is stamped server-side from the authenticated
+   * principal, and the column is resolved server-side from the joined
+   * audit record -- this call has nothing to send but the turn's own
+   * identifiers. Returns the stored (or, on dedup, the already-open)
+   * request row plus `already_pending`. */
+  async submitAccessRequest(sessionId, turnId) {
+    const res = await this._fetchV2(
+      `/v2/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/access-request`,
+      { method: "POST" },
+    );
+    return res.json();
+  }
+
+  /** GET /v2/access-requests -- the caller's own access requests, across
+   * every session, with current status and (once resolved) a denial
+   * reason -- the minimal status read the account/menu UI shows. */
+  async listAccessRequests() {
+    const res = await this._fetchV2(`/v2/access-requests`, { method: "GET" });
+    return res.json();
+  }
+
+  async patchAssumptions(sessionId, turnId, assumptions) {
+    const res = await this._fetchV2(
+      `/v2/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/assumptions`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ assumptions }),
+      },
+    );
+    return res.json();
+  }
+
+  /* ── Memory (v2, standing preferences) ──────────────────────────────
+   * Memory is created EXPLICITLY (the "pin this" affordance on an
+   * editable assumption chip -- see render/assumptions.js), never
+   * inferred here. */
+
+  /** `{entries: MemoryEntry[], rememberable: RememberableField[]}` --
+   * what IS currently remembered, and the closed set of fields that CAN
+   * be. See render/memory.js's docstring for why both lists matter. */
+  async getMemory() {
+    const res = await this._fetchV2(`/v2/memory`, { method: "GET" });
+    return res.json();
+  }
+
+  /** Set (or overwrite) one standing preference. A 422 (value fails
+   * server-side validation -- length/options/control characters) comes
+   * back as a plain ApiError via `_fetchV2`'s generic non-2xx branch;
+   * its `message` is the server's real validation message, rendered
+   * as-is by the caller -- this module never invents its own wording to
+   * replace it. */
+  async putMemory(key, value) {
+    const res = await this._fetchV2(`/v2/memory/${encodeURIComponent(key)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ value }),
+    });
+    return res.json();
+  }
+
+  async deleteMemoryEntry(key) {
+    await this._fetchV2(`/v2/memory/${encodeURIComponent(key)}`, { method: "DELETE" });
+  }
+
+  /** Clears every standing preference at once (the memory panel's
+   * "پاک کردن همهٔ حافظه" control -- always behind a confirm in the UI). */
+  async clearMemory() {
+    await this._fetchV2(`/v2/memory`, { method: "DELETE" });
+  }
+
+  /** Wraps fetch for every /v2/* endpoint. All of these routes require
+   * auth (docs/api-contract-v2.md §11.3), so this is the single place
+   * that attaches `Authorization: Bearer <key>` — every v2 call site
+   * (createSession, getSession, deleteSession, askTurn, askTurnStreaming,
+   * patchAssumptions) goes through here and inherits it automatically.
+   *
+   * A 404 is promoted to V2NotSupportedError so callers can degrade to
+   * simulated mode instead of showing a generic error. A 401 and a 429
+   * are promoted to their own typed errors (see above) so the UI can
+   * treat "your key was rejected" and "you're being rate-limited" as the
+   * distinct, actionable situations they are instead of a generic error
+   * banner. Every v2 call site routes through here, including the
+   * session-index and memory endpoints added later (listSessions,
+   * renameSession, getMemory, putMemory, deleteMemoryEntry,
+   * clearMemory) -- same chokepoint, same auth guarantee. */
+  async _fetchV2(path, init) {
+    let res;
+    const headers = { ...(init && init.headers) };
+    const key = getApiKey();
+    if (key) headers["Authorization"] = `Bearer ${key}`;
+    try {
+      res = await fetch(`${this.baseUrl}${path}`, {
+        signal: AbortSignal.timeout(60000),
+        ...init,
+        headers,
+      });
+    } catch (err) {
+      // No HTTP response was ever received (host unreachable, DNS
+      // failure, a refused cross-origin preflight, ...) — the one
+      // genuinely transport-level failure this method can throw, so it
+      // is the one case that gets the "TRANSPORT_ERROR" code explicitly
+      // rather than reading one off a body that does not exist.
+      throw new ApiError(describeTransportFailure(this.baseUrl, path, err), 0, "TRANSPORT_ERROR");
+    }
+    if (res.status === 404) {
+      throw new V2NotSupportedError(
+        `${this.baseUrl} does not implement ${path} — the v2 conversational API is not deployed on this backend yet.`,
+      );
+    }
+    if (res.status === 401) {
+      const body = await _safeJson(res);
+      throw new UnauthorizedError(
+        body?.error?.message || body?.detail || "Missing or invalid API key.",
+        body?.error?.code || "UNAUTHENTICATED",
+      );
+    }
+    if (res.status === 429) {
+      const body = await _safeJson(res);
+      const message = body?.error?.message || body?.detail || `HTTP 429 calling ${path}`;
+      const retryAfterSeconds = body?.error?.retry_after_seconds ?? null;
+      throw new RateLimitError(message, retryAfterSeconds, body?.error?.code || "RATE_LIMIT_EXCEEDED");
+    }
+    if (!res.ok) {
+      const body = await _safeJson(res);
+      // The real error envelope (api/errors.py::_error_response) nests
+      // the message under `error.message`, not a top-level `detail` —
+      // `j.detail` alone (the previous shape of this fallback) never
+      // actually matched it, so every non-2xx response rendered as a
+      // bare "HTTP <status>" regardless of what the server said.
+      const detail = body?.error?.message || body?.detail || `HTTP ${res.status}`;
+      // `body?.error?.code` (e.g. "MAINTENANCE_MODE", "SERVER_OVERLOAD",
+      // "INJECTION_ATTEMPT") is carried on the thrown error so a catch
+      // site downstream can render the real reason instead of a generic
+      // one — see the `code` field's own docstring on `ApiError` above.
+      throw new ApiError(detail, res.status, body?.error?.code || null);
+    }
+    return res;
+  }
+}
+
+/** Best-effort JSON body read that never throws — an error response body
+ * is not guaranteed to be valid JSON (or present at all). */
+async function _safeJson(res) {
+  try {
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+function parseSseFrame(frame) {
+  let event = "message";
+  const dataLines = [];
+  for (const line of frame.split("\n")) {
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+  }
+  if (dataLines.length === 0) return null;
+  const raw = dataLines.join("\n");
+  try {
+    return { event, data: JSON.parse(raw) };
+  } catch {
+    return { event, data: raw };
+  }
+}
