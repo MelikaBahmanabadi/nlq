@@ -1125,17 +1125,6 @@ body {
 .status-item { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: var(--fs-sm); }
 .status-item-name { color: var(--muted); }
 .status-item-value { font-weight: 600; color: var(--ink); }
-.status-panel-foot {
-  margin-top: 12px;
-  padding-top: 10px;
-  border-block-start: 1px solid var(--border);
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--faint);
-  line-height: 1.7;
-  word-break: break-all;
-}
-
 /* ── Footer ─────────────────────────────────────────────────────────── */
 .foot {
   display: flex;

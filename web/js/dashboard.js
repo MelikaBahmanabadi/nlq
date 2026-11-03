@@ -425,9 +425,6 @@ function renderStatusPanel() {
   li.appendChild(el("span", "status-item-name", t("conversationTurns")));
   li.appendChild(el("span", "status-item-value", num(turns)));
   list.appendChild(li);
-
-  const foot = $("status-panel-foot");
-  if (foot) foot.textContent = `${hostLabel(view.baseUrl)} · ${view.mode === "simulated" ? t("modeSimulated") : t("modeLive")}`;
 }
 
 /* ── Public: paint everything from the app's current state ──────────── */
