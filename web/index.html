@@ -180,6 +180,40 @@
         <!-- ── Dashboard grid ───────────────────────────────────────── -->
         <div class="dash-grid">
 
+          <!-- AI assistant: the page's front door — ask first, read the
+               workspace numbers below it. -->
+          <section class="panel assistant" id="assistant" aria-labelledby="assistant-title">
+            <div class="assistant-glow" aria-hidden="true"></div>
+            <header class="assistant-head">
+              <span class="assistant-badge"><span class="assistant-badge-dot" aria-hidden="true"></span>NLQ</span>
+              <h2 id="assistant-title" data-i18n="assistantTitle">با داده‌های خود چه می‌خواهید بدانید؟</h2>
+              <p data-i18n="assistantSub">پرسش را به زبان طبیعی بنویسید؛ SQL پیش از اجرا اعتبارسنجی می‌شود.</p>
+            </header>
+
+            <div class="card composer">
+              <label class="card-title" for="question" data-i18n="askLabel">پرسش خود را به زبان طبیعی بنویسید</label>
+              <div class="ask-row">
+                <textarea id="question" rows="2" dir="auto" data-i18n-attr="placeholder:askPlaceholder" placeholder="مثلاً «معاملات مشتری‌های تالار سیمان را نشان بده»"></textarea>
+                <button class="btn-ask" id="btn-ask" type="button" data-i18n="ask">پرسش</button>
+              </div>
+              <!-- Per-analyst and persisted in this browser: it decides whether up to
+                   twenty rows of the analyst's own result go to the language model. -->
+              <div class="ask-options">
+                <label class="ask-toggle">
+                  <input type="checkbox" id="interpret-toggle">
+                  <span data-i18n="interpret">تفسیر نتیجه</span>
+                </label>
+                <span class="ask-toggle-hint" data-i18n="interpretHint">خلاصهٔ ساده‌شده، با فرستادن حداکثر ۲۰ ردیف نتیجه به مدل زبانی</span>
+              </div>
+              <div id="notice-area"></div>
+            </div>
+
+            <footer class="assistant-foot">
+              <span class="assistant-state"><span class="dot dot-unknown" id="assistant-dot"></span><span id="assistant-state-text" data-i18n="assistantReady">آمادهٔ پرسش</span></span>
+              <span class="assistant-hint" data-i18n="assistantHint">Enter برای ارسال · Shift+Enter برای خط جدید</span>
+            </footer>
+          </section>
+
           <!-- Analytics: the brightest object on screen -->
           <section class="panel analytics" id="analytics" aria-labelledby="analytics-title">
             <header class="panel-head">
@@ -228,39 +262,6 @@
             <p class="chart-foot" id="chart-foot" data-i18n="chartFoot">هر نقطه یک گفتگو است؛ بلندی آن شمار پرسش‌های همان گفتگو.</p>
           </section>
 
-          <!-- AI assistant: the NLQ engine's front door -->
-          <section class="panel assistant" id="assistant" aria-labelledby="assistant-title">
-            <div class="assistant-glow" aria-hidden="true"></div>
-            <header class="assistant-head">
-              <span class="assistant-badge"><span class="assistant-badge-dot" aria-hidden="true"></span>NLQ</span>
-              <h2 id="assistant-title" data-i18n="assistantTitle">با داده‌های خود چه می‌خواهید بدانید؟</h2>
-              <p data-i18n="assistantSub">پرسش را به زبان طبیعی بنویسید؛ SQL پیش از اجرا اعتبارسنجی می‌شود.</p>
-            </header>
-
-            <div class="card composer">
-              <label class="card-title" for="question" data-i18n="askLabel">پرسش خود را به زبان طبیعی بنویسید</label>
-              <div class="ask-row">
-                <textarea id="question" rows="2" dir="auto" data-i18n-attr="placeholder:askPlaceholder" placeholder="مثلاً «معاملات مشتری‌های تالار سیمان را نشان بده»"></textarea>
-                <button class="btn-ask" id="btn-ask" type="button" data-i18n="ask">پرسش</button>
-              </div>
-              <!-- Per-analyst and persisted in this browser: it decides whether up to
-                   twenty rows of the analyst's own result go to the language model. -->
-              <div class="ask-options">
-                <label class="ask-toggle">
-                  <input type="checkbox" id="interpret-toggle">
-                  <span data-i18n="interpret">تفسیر نتیجه</span>
-                </label>
-                <span class="ask-toggle-hint" data-i18n="interpretHint">خلاصهٔ ساده‌شده، با فرستادن حداکثر ۲۰ ردیف نتیجه به مدل زبانی</span>
-              </div>
-              <div id="notice-area"></div>
-            </div>
-
-            <footer class="assistant-foot">
-              <span class="assistant-state"><span class="dot dot-unknown" id="assistant-dot"></span><span id="assistant-state-text" data-i18n="assistantReady">آمادهٔ پرسش</span></span>
-              <span class="assistant-hint" data-i18n="assistantHint">Enter برای ارسال · Shift+Enter برای خط جدید</span>
-            </footer>
-          </section>
-
           <!-- Recent queries: the conversation's own turns -->
           <section class="panel recent" id="recent-queries" aria-labelledby="recent-title">
             <header class="panel-head">
@@ -283,21 +284,10 @@
 
         </div>
 
-        <!-- ── Conversation: turns rendered by render/* ─────────────── -->
-        <section class="panel conversation" aria-labelledby="conversation-title">
-          <header class="panel-head">
-            <div class="panel-head-text">
-              <h2 id="conversation-title" data-i18n="conversationTitle">گفتگو</h2>
-              <p id="conversation-sub" data-i18n="conversationSub">پرسش، SQL، نتیجه و تفسیر — همه در یک جریان</p>
-            </div>
-          </header>
-          <!-- Composer is ABOVE the transcript in DOM order (the panel) and the
-               transcript is this conversation's record. -->
-          <section id="transcript" aria-live="polite" aria-relevant="additions" data-i18n-attr="aria-label:transcript" aria-label="گفتگوی تحلیلی">
-            <!-- #transcript-empty is injected by renderTranscriptEmptyState() only
-                 while this session has zero turns. -->
-          </section>
-        </section>
+        <!-- ── Conversation: this session's turns, rendered by render/*.
+             The turns are the record; they carry their own card chrome, so
+             there is no title box or empty placeholder around them. ───── -->
+        <section id="transcript" aria-live="polite" aria-relevant="additions" data-i18n-attr="aria-label:transcript" aria-label="گفتگوی تحلیلی"></section>
 
       </main>
     </div>
