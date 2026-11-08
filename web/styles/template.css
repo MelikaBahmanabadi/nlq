@@ -614,14 +614,17 @@ body {
 .dash-grid {
   display: grid;
   gap: 20px;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(320px, 380px);
+  /* The ask card leads the page at full width; the workspace numbers follow
+   * at full width; the two side panels share the last row. */
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   grid-template-areas:
-    "analytics analytics assistant"
-    "recent    activity  assistant";
+    "assistant assistant"
+    "analytics analytics"
+    "recent    activity";
   align-items: start;
 }
 .analytics { grid-area: analytics; }
-.assistant { grid-area: assistant; position: sticky; top: 96px; }
+.assistant { grid-area: assistant; }
 .recent { grid-area: recent; }
 .activity { grid-area: activity; }
 
@@ -1002,7 +1005,6 @@ body {
 .activity-state { font-size: 11px; color: var(--muted); }
 
 /* ── Conversation & turns ───────────────────────────────────────────── */
-.conversation { padding-bottom: 18px; }
 #transcript { padding-block-end: 0; gap: 14px; }
 
 .turn {
@@ -1147,13 +1149,6 @@ body {
 
 /* ── Responsive ─────────────────────────────────────────────────────── */
 @media (max-width: 1240px) {
-  .dash-grid {
-    grid-template-columns: minmax(0, 1fr) minmax(300px, 340px);
-    grid-template-areas:
-      "analytics assistant"
-      "recent    assistant"
-      "activity  assistant";
-  }
   .layout { padding: 22px 20px 10px; }
   .topbar { padding: 12px 20px; }
   .kpi-row { grid-template-columns: repeat(3, minmax(0, 1fr)); row-gap: 14px; }
@@ -1172,12 +1167,11 @@ body {
   .dash-grid {
     grid-template-columns: minmax(0, 1fr);
     grid-template-areas:
-      "analytics"
       "assistant"
+      "analytics"
       "recent"
       "activity";
   }
-  .assistant { position: relative; top: 0; }
   .chart-host { height: 220px; }
 }
 

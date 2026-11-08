@@ -717,7 +717,9 @@ async function loadConfirmedTurns(sessionId) {
 
 /** Replaces the whole transcript pane with *turns*, already-resolved (no
  * pipeline animation — these are turns from switching sessions, not a
- * freshly asked question). */
+ * freshly asked question). The dashboard's ask card leads the page, so an
+ * empty transcript stays empty: no placeholder is rendered (the helpers
+ * below it remain for the composer's sample-story bookkeeping). */
 function renderTranscriptFromTurns(turns) {
   const host = $("transcript");
   host.innerHTML = "";
@@ -725,7 +727,6 @@ function renderTranscriptFromTurns(turns) {
     const card = createTurnCard(turn, turnCtx());
     host.appendChild(card.el);
   }
-  if (turns.length === 0) renderTranscriptEmptyState();
   refreshSampleButtonsDisabledState();
   syncDashboard({
     sessions: state.sessions,
@@ -742,9 +743,10 @@ function renderTranscriptFromTurns(turns) {
  * decision B5, have no business appearing in a live production session
  * at all. Rebuilt from scratch on every call rather than toggled with
  * `hidden`, since it must reflect whichever mode is CURRENT, not
- * whichever mode last rendered it. Only called while the active
- * session's transcript is empty — see renderTranscriptFromTurns and
- * appendTurnWithAnimation/askLive's removal of it once a turn lands. */
+ * whichever mode last rendered it. Not rendered any more: the dashboard's
+ * ask card leads the page, so an empty transcript shows nothing rather
+ * than a placeholder card (kept alongside the sample-chip bookkeeping
+ * that renderSamples/renderStartExamples still serve). */
 function renderTranscriptEmptyState() {
   const empty = document.createElement("div");
   empty.className = "transcript-empty";
