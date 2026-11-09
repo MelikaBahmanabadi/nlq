@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Runtime artifacts
+logs/*.jsonl
+logs/*.db
+logs/*.db-shm
+logs/*.db-wal
+
+# Environment
+.env
+.env.*
+!.env.example
