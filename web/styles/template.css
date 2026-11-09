@@ -8,8 +8,8 @@
  *   • a slim icon rail as the product's spine,
  *   • a glass top bar with conversation search and live system state,
  *   • a welcome band with the three primary actions,
- *   • a dashboard grid: analytics (KPIs + glowing chart),AI assistant,
- *     recent queries and connection activity,
+ *   • a dashboard grid: the ask card first, then analytics (KPIs +
+ *     glowing chart), then recent queries — one full-width card per row,
  *   • the conversation itself below the grid, and
  *   • an off-canvas conversation index.
  *
@@ -143,15 +143,6 @@ body {
 :root[data-theme="dark"] .rail-btn.is-active,
 :root:not([data-theme="light"]) .rail-btn.is-active { color: var(--accent-bright); }
 
-.rail-btn-accent {
-  background: linear-gradient(160deg, #2563eb, #1d4ed8);
-  border-color: rgba(255, 255, 255, .14);
-  color: #fff;
-  box-shadow: 0 12px 26px -14px rgba(37, 99, 235, .95);
-}
-.rail-btn-accent:hover,
-.rail-btn-accent:focus-visible { background: linear-gradient(160deg, #3b82f6, #2563eb); color: #fff; border-color: rgba(255, 255, 255, .22); }
-
 .rail-foot {
   margin-block-start: auto;
   display: flex;
@@ -164,6 +155,49 @@ body {
 :root:not([data-theme="light"]) .rail-foot .icon-sun { display: none; }
 :root[data-theme="dark"] .rail-foot .icon-moon,
 :root:not([data-theme="light"]) .rail-foot .icon-moon { display: block; }
+
+/* The rail's destinations: one popover beside the settings icon, so the
+ * spine carries two icons instead of seven. */
+.nav-menu {
+  position: absolute;
+  /* Above the settings/theme pair, opening toward the content along the
+   * inline axis — right of the rail in LTR, left of it in RTL. */
+  inset-block-end: 76px;
+  inset-inline-start: calc(100% + 10px);
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 208px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--card);
+  box-shadow: var(--shadow-lg);
+}
+.nav-menu[hidden] { display: none; }
+.nav-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: var(--fs-sm);
+  text-align: start;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+.nav-menu-item svg { width: 18px; height: 18px; color: var(--muted); flex: 0 0 auto; }
+.nav-menu-item:hover,
+.nav-menu-item:focus-visible { background: var(--card-2); outline: none; }
+.nav-menu-item.is-active { color: var(--accent); background: var(--accent-soft); }
+.nav-menu-item.is-active svg { color: var(--accent); }
+.nav-menu-item.is-accent { color: var(--accent); font-weight: 600; }
+.nav-menu-item.is-accent svg { color: var(--accent); }
 
 /* ── Workspace column ───────────────────────────────────────────────── */
 .workspace {
@@ -274,7 +308,7 @@ body {
 
 /* The three pills are now the bell's state: green when every dependency is
    up, a blinking red alarm when even one is not. The pills stay in the DOM
-   (hidden) because the status panel and activity list read them. */
+   (hidden) because the status panel reads them. */
 .health[hidden] { display: none; }
 #status-btn.is-ok {
   position: relative;
@@ -614,19 +648,19 @@ body {
 .dash-grid {
   display: grid;
   gap: 20px;
-  /* The ask card leads the page at full width; the workspace numbers follow
-   * at full width; the two side panels share the last row. */
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  /* The ask card leads the page at full width, the workspace numbers follow
+   * at full width, and the recent queries own the last row — one card per
+   * row, so nothing sits in a narrow column beside it. */
+  grid-template-columns: minmax(0, 1fr);
   grid-template-areas:
-    "assistant assistant"
-    "analytics analytics"
-    "recent    activity";
+    "assistant"
+    "analytics"
+    "recent";
   align-items: start;
 }
 .analytics { grid-area: analytics; }
 .assistant { grid-area: assistant; }
 .recent { grid-area: recent; }
-.activity { grid-area: activity; }
 
 .panel {
   position: relative;
@@ -894,6 +928,9 @@ body {
   resize: none;
 }
 .assistant #question::placeholder { color: #7f97b3; }
+/* Persian UI: the hint reads right-aligned like the rest of the page. The
+ * field keeps dir="auto", so an English question still types left-to-right. */
+[dir="rtl"] .assistant #question::placeholder { direction: rtl; text-align: right; }
 .assistant #question:focus {
   outline: none;
   border-color: rgba(50, 197, 255, .6);
@@ -946,7 +983,7 @@ body {
 .assistant-hint { font-size: 10.5px; color: #7f97b3; }
 
 /* ── Recent queries ─────────────────────────────────────────────────── */
-.recent-list, .activity-list { display: flex; flex-direction: column; gap: 4px; list-style: none; margin: 0; padding: 0; }
+.recent-list { display: flex; flex-direction: column; gap: 4px; list-style: none; margin: 0; padding: 0; }
 .recent-row {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
@@ -985,24 +1022,6 @@ body {
 .recent-dot.bad { background: var(--status-critical); }
 .recent-dot.running { background: var(--accent-bright); animation: pulse 1.4s var(--ease) infinite; }
 .empty-line { font-size: var(--fs-xs); color: var(--faint); line-height: 1.8; padding: 6px 2px; }
-
-/* ── Connection activity ────────────────────────────────────────────── */
-.activity-row {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 10px;
-  padding: 9px 10px;
-  border-radius: var(--radius-sm);
-}
-.activity-row + .activity-row { border-block-start: 1px solid var(--border); border-radius: 0; }
-.activity-dot { width: 8px; height: 8px; border-radius: 50%; }
-.activity-dot.ok { background: var(--status-good); box-shadow: 0 0 0 4px color-mix(in srgb, var(--status-good) 16%, transparent); }
-.activity-dot.down { background: var(--status-critical); box-shadow: 0 0 0 4px color-mix(in srgb, var(--status-critical) 16%, transparent); }
-.activity-dot.unknown { background: var(--status-warn); box-shadow: 0 0 0 4px color-mix(in srgb, var(--status-warn) 16%, transparent); }
-.activity-name { font-size: var(--fs-sm); font-weight: 600; color: var(--ink); }
-.activity-detail { font-family: var(--font-mono); font-size: 10px; color: var(--faint); margin-top: 2px; }
-.activity-state { font-size: 11px; color: var(--muted); }
 
 /* ── Conversation & turns ───────────────────────────────────────────── */
 #transcript { padding-block-end: 0; gap: 14px; }
@@ -1169,8 +1188,7 @@ body {
     grid-template-areas:
       "assistant"
       "analytics"
-      "recent"
-      "activity";
+      "recent";
   }
   .chart-host { height: 220px; }
 }
@@ -1197,6 +1215,8 @@ body {
   .rail-nav { flex-direction: row; gap: 4px; }
   .rail-btn { width: 42px; height: 42px; }
   .rail-foot { margin: 0; flex-direction: row; }
+  /* The rail is a bottom bar here, so its menu opens above it, edge to edge. */
+  .nav-menu { inset-inline: 8px; inset-block-end: calc(100% + 8px); min-width: 0; }
   .workspace { padding-bottom: 74px; }
   .topbar {
     flex-wrap: wrap;

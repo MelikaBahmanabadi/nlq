@@ -380,35 +380,6 @@ function hostLabel(url) {
   }
 }
 
-function renderActivity() {
-  const list = $("activity-list");
-  if (!list) return;
-  const health = healthFacts();
-  list.replaceChildren();
-
-  health.facts.forEach((fact) => {
-    const li = el("li", "activity-row");
-    li.appendChild(el("span", `activity-dot ${fact.state}`));
-    const text = el("span");
-    text.appendChild(el("span", "activity-name", fact.name));
-    text.appendChild(el("span", "activity-detail", t("serviceDetail")));
-    li.appendChild(text);
-    li.appendChild(el("span", "activity-state", fact.label || stateLabel(fact.state)));
-    list.appendChild(li);
-  });
-
-  const modeRow = el("li", "activity-row");
-  modeRow.appendChild(el("span", "activity-dot ok"));
-  const modeText = el("span");
-  modeText.appendChild(el("span", "activity-name", t("workspaceConnection")));
-  modeText.appendChild(el("span", "activity-detail", hostLabel(view.baseUrl)));
-  modeRow.appendChild(modeText);
-  modeRow.appendChild(el("span", "activity-state", view.mode === "simulated" ? t("modeSimulated") : t("modeLive")));
-  list.appendChild(modeRow);
-
-  $("activity-empty").hidden = true;
-}
-
 function renderStatusPanel() {
   const list = $("status-list");
   if (!list) return;
@@ -435,7 +406,6 @@ export function syncDashboard(next = {}) {
   renderKpis();
   renderChart();
   renderRecent();
-  renderActivity();
   renderStatusPanel();
   syncAssistantState();
 }
@@ -520,14 +490,13 @@ export function initDashboard() {
   const railMap = {
     dashboard: () => { setDrawer(false); window.scrollTo({ top: 0, behavior: "smooth" }); },
     analytics: () => scrollTo("analytics"),
-    connections: () => scrollTo("connections"),
   };
 
   document.querySelectorAll("[data-rail]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const action = railMap[btn.dataset.rail];
       if (action) action();
-      document.querySelectorAll(".rail-btn[data-rail]").forEach((other) => {
+      document.querySelectorAll("[data-rail]").forEach((other) => {
         other.classList.toggle("is-active", other === btn);
       });
     });
@@ -616,7 +585,6 @@ export function initDashboard() {
   if (health && typeof MutationObserver === "function") {
     new MutationObserver(() => {
       renderKpis();
-      renderActivity();
       renderStatusPanel();
       syncAssistantState();
     }).observe(health, { childList: true, subtree: true });

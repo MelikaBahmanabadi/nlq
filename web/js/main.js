@@ -167,6 +167,7 @@ const confirmedTurnIds = new Set();
 wireComposer();
 wireTopbar();
 wireSidebar();
+wireRailMenu();
 wireMemoryPanel();
 initDashboard();
 setMode(state.mode);
@@ -939,6 +940,37 @@ function wireSidebar() {
     const body = document.querySelector(".app-body");
     const open = body.classList.toggle("sidebar-open");
     $("sidebar-toggle").setAttribute("aria-expanded", String(open));
+  });
+}
+
+/* ── Rail settings menu ────────────────────────────────────────────────
+ * The rail is one icon; its destinations are rows in this popover. Each
+ * row IS the original control (same id), so the handlers above and in
+ * dashboard.js keep working untouched — this only opens and closes it. */
+function wireRailMenu() {
+  const btn = $("rail-settings");
+  const menu = $("nav-menu");
+  if (!btn || !menu) return;
+
+  const setMenu = (open) => {
+    menu.hidden = !open;
+    btn.setAttribute("aria-expanded", String(open));
+  };
+
+  btn.addEventListener("click", () => setMenu(menu.hidden));
+  // Choosing a destination closes the menu; the row's own handler runs first.
+  menu.addEventListener("click", (event) => {
+    if (event.target.closest(".nav-menu-item")) setMenu(false);
+  });
+  document.addEventListener("click", (event) => {
+    if (menu.hidden) return;
+    if (!event.target.closest("#nav-menu, #rail-settings")) setMenu(false);
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !menu.hidden) {
+      setMenu(false);
+      btn.focus();
+    }
   });
 }
 
