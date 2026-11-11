@@ -360,6 +360,10 @@ function wireUserMenu() {
         updateKeyStatus();
         updateThemeQuickToggle();
         setMode(state.mode); // refresh foot strings in the new language
+        // A turn card's chrome (panel titles, its buttons) is built once,
+        // reading the language at render time — rebuild the cards so every
+        // one of them follows the switch instead of keeping the old wording.
+        renderTranscriptFromTurns(state.turns);
       }
     });
   });
