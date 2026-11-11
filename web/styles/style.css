@@ -647,7 +647,6 @@ input:focus, textarea:focus, select:focus {
   flex: 0 0 auto;
 }
 .ask-toggle input:focus-visible { outline: none; box-shadow: var(--focus-ring); }
-.ask-toggle-hint { font-size: var(--fs-xs); color: var(--faint); line-height: 1.5; }
 
 /* ── Notices ─────────────────────────────────────────────────────── */
 .notice {

@@ -61,7 +61,6 @@ const STRINGS = {
     askPlaceholder: "مثلاً «معاملات مشتری‌های تالار سیمان را نشان بده»",
     ask: "پرسش",
     interpret: "تفسیر نتیجه",
-    interpretHint: "خلاصهٔ ساده‌شده، با فرستادن حداکثر ۲۰ ردیف نتیجه به مدل زبانی",
     samples: "داستان نمونه:",
     startExamples: "یا یکی از این‌ها را بپرسید:",
     transcriptEmptyTitle: "از داده‌ها بپرسید",
@@ -101,8 +100,7 @@ const STRINGS = {
     chartEmpty: "هنوز گفتگویی در این بازه ثبت نشده است.",
     chartEmptyHint: "اولین پرسش را بپرسید تا نمودار شکل بگیرد.",
     chartTipUnit: "پرسش",
-    assistantTitle: "با داده‌های خود چه می‌خواهید بدانید؟",
-    assistantSub: "پرسش را به زبان طبیعی بنویسید؛ SQL پیش از اجرا اعتبارسنجی می‌شود.",
+    assistantTitle: "از داده‌های خود چه می‌دانید؟",
     assistantReady: "آمادهٔ پرسش",
     assistantSimulated: "حالت نمایشی",
     assistantHint: "Enter برای ارسال · Shift+Enter برای خط جدید",
@@ -173,7 +171,6 @@ const STRINGS = {
     askPlaceholder: "e.g. “Top cement-ring customers by trade value”",
     ask: "Ask",
     interpret: "Interpret result",
-    interpretHint: "Plain-language summary; up to 20 result rows go to the model",
     samples: "Sample stories:",
     startExamples: "Or ask one of these:",
     transcriptEmptyTitle: "Ask your data",
@@ -214,7 +211,6 @@ const STRINGS = {
     chartEmptyHint: "Ask the first question to plot the trend.",
     chartTipUnit: "queries",
     assistantTitle: "What would you like to know about your data?",
-    assistantSub: "Ask in natural language — the generated SQL is validated before it runs.",
     assistantReady: "Ready",
     assistantSimulated: "Demo mode",
     assistantHint: "Enter to send · Shift+Enter for a new line",
@@ -301,6 +297,15 @@ export function applyLang(lang) {
   const root = document.documentElement;
   root.lang = current;
   root.dir = current === "fa" ? "rtl" : "ltr";
+
+  // The composer keeps `dir="auto"` so a Latin question typed into the
+  // Persian UI still reads left-to-right. But `auto` on an EMPTY textarea
+  // has no character to detect from and falls back to LTR, which left the
+  // caret blinking at the wrong edge of a right-aligned Persian composer
+  // until the first keystroke. An explicit starting direction gives it the
+  // page's own edge; bidi still orders whatever the analyst types next.
+  const composer = document.getElementById("question");
+  if (composer) composer.dir = root.dir;
 
   document.querySelectorAll("[data-i18n]").forEach((el) => {
     const key = el.getAttribute("data-i18n");

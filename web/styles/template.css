@@ -158,11 +158,16 @@ body {
 
 /* The rail's destinations: one popover beside the settings icon, so the
  * spine carries two icons instead of seven. */
+/* The popover's positioning context: the settings icon itself, so the menu
+ * opens LEVEL with that icon — beside it, top edges aligned — instead of
+ * somewhere down near the rail's foot. */
+.rail-menu-anchor { position: relative; display: flex; }
+
 .nav-menu {
   position: absolute;
-  /* Above the settings/theme pair, opening toward the content along the
+  /* The settings icon's own top edge, opening toward the content along the
    * inline axis — right of the rail in LTR, left of it in RTL. */
-  inset-block-end: 76px;
+  inset-block-start: 0;
   inset-inline-start: calc(100% + 10px);
   z-index: 50;
   display: flex;
@@ -954,7 +959,6 @@ body {
 }
 .assistant .ask-toggle { color: #c3d8ee; font-size: var(--fs-xs); }
 .assistant .ask-toggle input { accent-color: #34d399; }
-.assistant .ask-toggle-hint { color: #7f97b3; font-size: 10.5px; }
 .assistant .notice {
   margin-top: 10px;
   border-radius: var(--radius-xs);
@@ -1166,6 +1170,24 @@ body {
 .memory-panel-head h2 { font-size: var(--fs-lg); }
 .memory-overlay { backdrop-filter: blur(4px); }
 
+/* ── Persian typography ───────────────────────────────────────────────
+ * --font-mono names JetBrains Mono, which this build never vendors
+ * (fonts.css ships Inter and Vazirmatn only), so every mono readout fell
+ * through to whatever generic monospace the operating system offered. The
+ * footer clock and «حالت زندهٔ API», and the chart's axis words and value
+ * numbers, are where that showed: a foreign face wedged between two lines
+ * of Vazirmatn. In Persian those readouts take the UI stack instead —
+ * Vazirmatn sits right after Inter there, and it carries Persian digits.
+ * Latin mode keeps the mono rhythm, where the fallback only ever renders
+ * characters it actually has. */
+[lang="fa"] .foot,
+[lang="fa"] #foot-time,
+[lang="fa"] .chart-axis-label,
+[lang="fa"] .chart-value-label {
+  font-family: var(--font-sans);
+  letter-spacing: 0;
+}
+
 /* ── Responsive ─────────────────────────────────────────────────────── */
 @media (max-width: 1240px) {
   .layout { padding: 22px 20px 10px; }
@@ -1215,8 +1237,16 @@ body {
   .rail-nav { flex-direction: row; gap: 4px; }
   .rail-btn { width: 42px; height: 42px; }
   .rail-foot { margin: 0; flex-direction: row; }
-  /* The rail is a bottom bar here, so its menu opens above it, edge to edge. */
-  .nav-menu { inset-inline: 8px; inset-block-end: calc(100% + 8px); min-width: 0; }
+  /* The rail is a bottom bar here, so its menu opens above it, edge to edge
+   * — anchored to the bar (the popover's fixed containing block, see the
+   * rail's backdrop-filter), never to the 42px icon it hangs off on desktop. */
+  .nav-menu {
+    position: fixed;
+    inset-block-start: auto;
+    inset-block-end: 74px;
+    inset-inline: 8px;
+    min-width: 0;
+  }
   .workspace { padding-bottom: 74px; }
   .topbar {
     flex-wrap: wrap;

@@ -98,6 +98,10 @@ const diagnoser = createDiagnoser({
   getPageOrigin: () => location.origin,
 });
 let healthCheckSeq = 0;
+// The last three lights painted by an answer, kept so first-hand evidence
+// (a live turn that came back) can correct a stale probe without inventing
+// states for the lights it says nothing about. See noteLiveTurnAnswered().
+let lastHealth = { api: null, llm: null, db: null, label: "" };
 // Has any /health answer (success or failure) painted the lights yet?
 // The bell must not sit neutral while an unreachable dependency makes the
 // request hang, so boot watches this and raises the alarm if it stays false.
@@ -176,6 +180,14 @@ setTimeout(() => {
 }, 3000);
 tickClock();
 setInterval(tickClock, 1000);
+// The lights used to be painted ONCE, at boot: open the page before the API
+// is up (or lose it for a minute) and a red alarm stayed red for the rest of
+// the session, even after answers were coming back. One slow re-probe keeps
+// the bell honest without touching anything else; noteLiveTurnAnswered()
+// corrects it sooner, the first time a real answer lands.
+setInterval(() => {
+  if (state.mode === "live") refreshHealth();
+}, 60000);
 
 /* ── Theme / user menu ─────────────────────────────────────────────── */
 function wireTopbar() {
@@ -491,6 +503,7 @@ function setMode(mode) {
 // /health (h.llmDetail, h.dbDetail, forwarded to setHealth as `label`) are
 // never interpolated into markup here — see DESIGN-INVARIANTS.md §1.3.
 function setHealth(api_, llm, db, label) {
+  lastHealth = { api: api_, llm, db, label };
   const dot = (ok) => (ok === null ? "unknown" : ok ? "ok" : "down");
   const host = $("health");
   host.replaceChildren(
@@ -575,6 +588,20 @@ async function refreshHealth() {
     // A newer check started while this one was probing: its answer wins.
     if (seq === healthCheckSeq) showDiagnosisBanner($("api-diagnosis"), diagnosis, "analyst");
   }
+}
+
+/** A finished live turn is first-hand proof that the backend, the model and
+ * the database all answered: SQL came back from the model and rows came back
+ * from the warehouse. The lights used to be painted ONLY by /health, whose
+ * model probe asks the provider for a `/models` listing — a question a
+ * perfectly working OpenAI-compatible server may not implement — so the
+ * page could sit behind a blinking red alarm while the analyst asked
+ * questions and got answers. Evidence from a real answer wins over that
+ * probe; the next /health poll still has the final word (refreshHealth).
+ */
+function noteLiveTurnAnswered() {
+  if (lastHealth.api === true && lastHealth.llm === true && lastHealth.db === true) return;
+  setHealth(true, true, true, t("systemStatusOk"));
 }
 
 /* ── Sessions (sidebar) ────────────────────────────────────────────────
@@ -1561,6 +1588,9 @@ async function askLive(q) {
           // final turn -- no separate DOM lookup needed.
           scrollSettledResultAboveComposer(card.result || card.el);
           bumpActiveSessionMeta();
+          // Not an error turn: the model produced the SQL and the database
+          // produced the rows, whatever /health last claimed.
+          if (working && !working.error && (working.sql || working.result)) noteLiveTurnAnswered();
           break;
         case "error":
           working.error = data;
