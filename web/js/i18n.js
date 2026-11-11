@@ -307,6 +307,13 @@ export function applyLang(lang) {
   const composer = document.getElementById("question");
   if (composer) composer.dir = root.dir;
 
+  // Same reason for the top-bar search box: it keeps `dir="auto"` in the
+  // markup so a Latin conversation title still reads left-to-right, but an
+  // EMPTY field has no character to detect from — the placeholder and the
+  // caret then sat on the wrong edge of a right-aligned Persian toolbar.
+  const search = document.getElementById("session-search");
+  if (search) search.dir = root.dir;
+
   document.querySelectorAll("[data-i18n]").forEach((el) => {
     const key = el.getAttribute("data-i18n");
     if (key) el.textContent = t(key);

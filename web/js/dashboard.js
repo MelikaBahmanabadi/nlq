@@ -190,7 +190,10 @@ function renderChart() {
 
   const w = Math.max(280, host.clientWidth || 560);
   const h = Math.max(160, host.clientHeight || 240);
-  const pad = { top: 30, right: 6, bottom: 24, left: 34 };
+  // The side gutters are wider than the axis labels strictly need: the
+  // tooltip is centred on its point and is up to 230px wide, so a plot that
+  // ran edge to edge put the first and last readouts half outside the panel.
+  const pad = { top: 30, right: 34, bottom: 24, left: 40 };
   const innerW = w - pad.left - pad.right;
   const innerH = h - pad.top - pad.bottom;
 
@@ -312,7 +315,14 @@ function showTip(index) {
   const svg = host.querySelector("svg");
   const scale = svg ? svg.getBoundingClientRect().width / (svg.viewBox.baseVal.width || 1) : 1;
   tip.hidden = false;
-  tip.style.left = `${p.x * scale}px`;
+  // Keep the readout inside the panel: it is centred on its point, so at
+  // the first and last point half of it used to sit outside the chart.
+  const half = tip.offsetWidth / 2;
+  const left = Math.min(
+    Math.max(p.x * scale, half + 2),
+    Math.max(half + 2, hostRect.width - half - 2),
+  );
+  tip.style.left = `${left}px`;
   tip.style.top = `${p.y * scale}px`;
 }
 

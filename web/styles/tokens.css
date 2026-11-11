@@ -134,7 +134,12 @@
 
   /* ── Type ───────────────────────────────────────────────────────── */
   --font-sans: "Inter", "Vazirmatn", -apple-system, BlinkMacSystemFont, "Segoe UI", Tahoma, sans-serif;
-  --font-mono: "JetBrains Mono", "SFMono-Regular", ui-monospace, Consolas, "Liberation Mono", monospace;
+  /* Vazirmatn sits at the END of the mono stack: Latin letters and digits
+   * keep the mono face, and only glyphs that face does not carry (Persian
+   * text and Persian digits in a value label, a category name beside a
+   * figure) fall through to the Persian face instead of rendering as
+   * tofu boxes. */
+  --font-mono: "JetBrains Mono", "SFMono-Regular", ui-monospace, Consolas, "Liberation Mono", "Vazirmatn", monospace;
   --fs-xs: 11.5px;
   --fs-sm: 13px;
   --fs-md: 14px;

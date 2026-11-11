@@ -1318,6 +1318,11 @@ table.result-table tbody tr:hover { background: var(--accent-soft); }
 .record-grid dd { font-size: var(--fs-sm); color: var(--ink); font-weight: 600; overflow-wrap: anywhere; }
 
 /* ── Chart & figures ─────────────────────────────────────────────── */
+/* Story strip, chart, figures, view switch and export row are siblings
+ * with no margins of their own; without this gap the «نمودار / جدول»
+ * switch and the export row sat flush against the block above them and
+ * against the card's bottom edge. */
+.chart-block-wrap { display: flex; flex-direction: column; gap: 10px; }
 .chart-block {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
