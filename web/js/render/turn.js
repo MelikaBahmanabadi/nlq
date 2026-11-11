@@ -24,6 +24,7 @@
 "use strict";
 
 import { fmt } from "../num.js";
+import { icon } from "../icons.js";
 import { copySourceOfTruth, displaySqlForTurn, formatSqlForDisplay, highlightSql } from "../sql-display.js";
 
 import { renderPipeline, renderStageStrip } from "./pipeline.js";
@@ -37,6 +38,26 @@ function el(tag, className, text) {
   if (className) e.className = className;
   if (text !== undefined) e.textContent = text;
   return e;
+}
+
+/** The guard verdict's one word, per document language. Kept beside the
+ * card rather than in i18n.js for the reason the rest of render/* keeps its
+ * copy here: the turn card is deliberately standalone (its module graph in
+ * tests/web_ui carries no i18n import), and it reads the language the shell
+ * already set on <html lang> via i18n.js's applyLang. */
+const GUARD_WORD = { fa: ["مجاز", "غیرمجاز"], en: ["Allowed", "Blocked"] };
+
+/** The SQL guard's verdict as a shield plus ONE word — «مجاز» / «غیرمجاز»
+ * in Persian, "Allowed" / "Blocked" in English — instead of the sentence
+ * «گارد مجاز». The shield is what says "guard"; the word says only whether
+ * it passed, so the verdict reads at a glance and never repeats the noun
+ * beside its own icon. */
+function guardBadge(className, ok) {
+  const lang = document.documentElement && document.documentElement.lang === "en" ? "en" : "fa";
+  const badge = el("span", className);
+  badge.appendChild(icon("shield", { size: 13 }));
+  badge.appendChild(document.createTextNode(GUARD_WORD[lang][ok ? 0 : 1]));
+  return badge;
 }
 
 /**
@@ -177,9 +198,8 @@ export function createTurnCard(turn, ctx) {
 
     const meta = el("div", "sql-meta");
     if (turn.guard) {
-      const guardPill = el("span", `guard-pill ${turn.guard.verdict}`,
-        turn.guard.verdict === "allowed" ? "✓ مجاز" : "✕ رد شد");
-      meta.appendChild(guardPill);
+      meta.appendChild(guardBadge(
+        `guard-pill ${turn.guard.verdict}`, turn.guard.verdict === "allowed"));
       if (turn.guard.injected_top !== null && turn.guard.injected_top !== undefined) {
         meta.appendChild(el("span", "meta-tag", `TOP ${turn.guard.injected_top}`));
       }
@@ -1007,8 +1027,7 @@ function buildOutcomeLine(turn) {
   const row = el("div", "turn-outcome");
   if (turn.guard) {
     const ok = turn.guard.verdict === "allowed";
-    row.appendChild(el("span", ok ? "outcome-ok" : "outcome-bad",
-      ok ? "✓ گارد مجاز" : "✕ گارد رد شد"));
+    row.appendChild(guardBadge(ok ? "outcome-ok" : "outcome-bad", ok));
   }
   if (turn.result && turn.result.row_count !== undefined && turn.result.row_count !== null) {
     row.appendChild(el("span", "outcome-sep", "·"));
