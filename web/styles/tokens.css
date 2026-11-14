@@ -138,11 +138,11 @@
    * so a button reads as a physical key rather than a flat AI gradient.
    * Colours stay semantic (accent, status) — only the depth changes. */
   --btn-radius: var(--radius-pill);
-  --btn-shadow-color: rgba(11, 21, 38, .16);
-  --btn-shadow-deep: rgba(11, 21, 38, .32);
+  --btn-shadow-color: rgba(11, 21, 38, .18);
+  --btn-shadow-deep: rgba(11, 21, 38, .34);
   --btn-highlight: inset 0 1px 0 rgba(255, 255, 255, .55);
-  --btn-shadow: 0 10px 20px -10px var(--btn-shadow-deep), 0 2px 4px -1px var(--btn-shadow-color), var(--btn-highlight);
-  --btn-shadow-hover: 0 16px 28px -14px var(--btn-shadow-deep), 0 3px 6px -2px var(--btn-shadow-color), var(--btn-highlight);
+  --btn-shadow: 0 7px 14px -6px var(--btn-shadow-deep), 0 2px 3px -1px var(--btn-shadow-color), var(--btn-highlight), inset 0 -1px 0 var(--btn-shadow-color);
+  --btn-shadow-hover: 0 12px 22px -10px var(--btn-shadow-deep), 0 3px 5px -2px var(--btn-shadow-color), var(--btn-highlight), inset 0 -1px 0 var(--btn-shadow-color);
   --btn-shadow-press: 0 2px 5px -2px var(--btn-shadow-color), inset 0 2px 6px var(--btn-shadow-color);
 
   /* ── Type ───────────────────────────────────────────────────────── */

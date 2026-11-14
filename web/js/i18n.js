@@ -166,7 +166,7 @@ const STRINGS = {
     liveApi: "Live API",
     themeQuick: "Toggle theme",
     askLabel: "Ask a question in natural language",
-    askPlaceholder: "e.g. “Top cement-ring customers by trade value”",
+    askPlaceholder: "e.g. “Show monthly transactions by customer”",
     ask: "Ask",
     interpret: "Interpret result",
     samples: "Sample stories:",

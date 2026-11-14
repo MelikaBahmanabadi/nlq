@@ -564,7 +564,7 @@ input:focus, textarea:focus, select:focus {
  * they hold their place against the panel around them. */
 .card-title {
   display: block;
-  font-size: 12.5px;
+  font-size: 13.5px;
   font-weight: 700;
   color: var(--ink-2);
   text-transform: uppercase;
@@ -596,7 +596,7 @@ input:focus, textarea:focus, select:focus {
   border-color: var(--border-strong);
 }
 .composer:focus-within { border-color: var(--accent-line); box-shadow: var(--shadow-lg), var(--glow); }
-.composer .card-title { margin-bottom: 8px; color: var(--ink-2); text-transform: none; letter-spacing: 0; font-size: var(--fs-sm); }
+.composer .card-title { margin-bottom: 8px; color: var(--ink-2); text-transform: none; letter-spacing: 0; font-size: 14px; }
 .composer .card-title::before {
   content: "";
   display: inline-block;
@@ -979,10 +979,11 @@ input:focus, textarea:focus, select:focus {
  * glyph, and heavy enough to read as a path rather than punctuation. */
 .step-arrow, .stage-strip-arrow {
   color: var(--muted);
-  font-size: 15px;
+  font-size: 17px;
   font-weight: 700;
   line-height: 1;
   user-select: none;
+  opacity: .85;
 }
 :root[dir="rtl"] .step-arrow,
 :root[dir="rtl"] .stage-strip-arrow { transform: scaleX(-1); }
