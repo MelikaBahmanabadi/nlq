@@ -287,11 +287,6 @@ const SCENARIO = {
             prompt: "«برتر» بر اساس کدام معیار؟",
             options: ["ارزش ریالی معامله", "حجم معامله", "تعداد قرارداد"],
           },
-          {
-            field: "ring",
-            prompt: "منظور کدام تالار است؟",
-            options: ["همهٔ تالارها", "تالار سیمان", "تالار فلزات", "تالار پتروشیمی"],
-          },
         ],
       },
       guard: { verdict: "allowed", rule: null, injected_top: 10, tables_touched: ["Order", "Customer", "Ring", "Date"] },

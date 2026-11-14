@@ -35,6 +35,11 @@ const PATHS = {
   // of the set — kept purely geometric (no emoji glyph variance across
   // platforms) so the delete action reads identically everywhere.
   trash: "M4 7h16M9 7V4h6v3M6 7l1 13a2 2 0 002 2h6a2 2 0 002-2l1-13M10 11v6m4-6v6",
+  // The answer-rating pair: one thumb up, one thumb down. Drawn on the same
+  // stroke grid as the rest of the set so the two read as a matched pair
+  // beside the result instead of as two different button styles.
+  thumbUp: "M7 10v12 M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2a3.13 3.13 0 0 1 3 3.88Z",
+  thumbDown: "M17 14V2 M9 18.12 10 14H4.17a2 2 0 0 1-1.92-2.56l2.33-8A2 2 0 0 1 6.5 2H20a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2.76a2 2 0 0 0-1.79 1.11L12 22a3.13 3.13 0 0 1-3-3.88Z",
 };
 
 /**

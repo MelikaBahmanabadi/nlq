@@ -450,11 +450,11 @@ body {
 .um-section { padding: 10px 0; }
 .um-section + .um-section { border-block-start: 1px solid var(--border); }
 .um-label {
-  font-size: 10.5px;
+  font-size: 12px;
   font-weight: 700;
-  letter-spacing: .1em;
+  letter-spacing: .07em;
   text-transform: uppercase;
-  color: var(--faint);
+  color: var(--ink-2);
   margin-bottom: 8px;
 }
 .um-segment {
@@ -548,7 +548,13 @@ body {
   padding: 16px 16px 12px;
   background: transparent;
 }
-.sidebar-head h2 { font-size: var(--fs-md); font-weight: 700; }
+.sidebar-head h2 {
+  font-size: var(--fs-lg);
+  font-weight: 700;
+  color: var(--ink);
+  text-transform: none;
+  letter-spacing: 0;
+}
 .btn-new-session {
   height: 34px;
   padding: 0 14px;
@@ -770,7 +776,7 @@ body {
   line-height: 1.2;
   white-space: nowrap;
 }
-.kpi-label { font-size: 11px; color: var(--muted); line-height: 1.4; }
+.kpi-label { font-size: 12.5px; color: var(--ink-2); line-height: 1.45; }
 .kpi-value-status { display: inline-flex; align-items: center; gap: 7px; }
 .kpi-value-status .dot { width: 8px; height: 8px; border-radius: 50%; }
 
@@ -790,7 +796,7 @@ body {
   letter-spacing: -.03em;
   color: var(--ink);
 }
-.chart-total-label { font-size: 11px; color: var(--muted); }
+.chart-total-label { font-size: 12.5px; color: var(--ink-2); }
 
 .chart-host { position: relative; height: 240px; }
 .chart-host svg { display: block; width: 100%; height: 100%; overflow: visible; }
@@ -843,7 +849,7 @@ body {
 .chart-tip-value { font-size: var(--fs-lg); font-weight: 700; display: block; }
 .chart-tip-label { color: var(--muted); display: block; }
 
-.chart-foot { margin-top: 4px; font-size: 11px; color: var(--faint); }
+.chart-foot { margin-top: 4px; font-size: 12px; color: var(--muted); }
 
 /* ── Assistant ──────────────────────────────────────────────────────── */
 .assistant {
@@ -912,9 +918,9 @@ body {
   box-shadow: 0 0 0 4px rgba(50, 197, 255, .12), inset 0 1px 0 rgba(255, 255, 255, .08);
 }
 .assistant .composer .card-title {
-  color: #9db8d4;
-  font-size: var(--fs-xs);
-  font-weight: 600;
+  color: #cfe3f7;
+  font-size: var(--fs-sm);
+  font-weight: 700;
   letter-spacing: 0;
   text-transform: none;
   margin-bottom: 10px;
@@ -984,7 +990,6 @@ body {
   color: #cfe6ff;
 }
 .assistant-state .dot { width: 7px; height: 7px; border-radius: 50%; }
-.assistant-hint { font-size: 10.5px; color: #7f97b3; }
 
 /* ── Recent queries ─────────────────────────────────────────────────── */
 .recent-list { display: flex; flex-direction: column; gap: 4px; list-style: none; margin: 0; padding: 0; }
@@ -1284,4 +1289,165 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .recent-dot.running { animation: none; }
   .sidebar { transition: none; }
+}
+
+/* ── Buttons: one tactile pill language ───────────────────────────────
+ * Modern, not "AI": the gradient-and-glow call to action is gone. A
+ * button is a pill with a flat semantic fill, a lit top edge and a soft
+ * drop to the bottom-right, so it reads as a physical key. It lifts a hair
+ * on hover and presses in on click. Only shape and depth change here —
+ * every colour stays the product's own accent / status token, so the
+ * treatment is identical in Persian (RTL) and English (LTR) and in both
+ * the light and dark themes. */
+:is(
+  .btn, .btn-ask, .assistant .btn-ask, .btn-new-session, .btn-primary, .btn-ghost,
+  .sample, .start-example, .clarify-opt, .chip-editor .btn-apply, .chip-editor .btn-cancel,
+  .btn-copy, .btn-export, .view-btn, .story-opt, .failure-action-btn, .feedback-submit,
+  .live-key-save, .live-key-change, .live-key-clear,
+  .memory-save-btn, .memory-clear-btn, .memory-clear-all-btn, .rows-omitted-rerun-btn,
+  .confirm-toggle, .flag-shortcut,
+  .icon-btn, .rail-btn, .status-panel-close, .memory-panel-close, .um-segment button
+) {
+  border-radius: var(--btn-radius);
+  box-shadow: var(--btn-shadow);
+  font-weight: 700;
+  transition:
+    transform var(--dur-fast) var(--ease),
+    box-shadow var(--dur-fast) var(--ease),
+    background var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
+}
+
+:is(
+  .btn, .btn-ask, .assistant .btn-ask, .btn-new-session, .btn-primary, .btn-ghost,
+  .sample, .start-example, .clarify-opt, .chip-editor .btn-apply, .chip-editor .btn-cancel,
+  .btn-copy, .btn-export, .view-btn, .story-opt, .failure-action-btn, .feedback-submit,
+  .live-key-save, .live-key-change, .live-key-clear,
+  .memory-save-btn, .memory-clear-btn, .memory-clear-all-btn, .rows-omitted-rerun-btn,
+  .icon-btn, .rail-btn, .status-panel-close, .memory-panel-close, .um-segment button
+):hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: var(--btn-shadow-hover);
+}
+
+:is(
+  .btn, .btn-ask, .assistant .btn-ask, .btn-new-session, .btn-primary, .btn-ghost,
+  .sample, .start-example, .clarify-opt, .chip-editor .btn-apply, .chip-editor .btn-cancel,
+  .btn-copy, .btn-export, .view-btn, .story-opt, .failure-action-btn, .feedback-submit,
+  .live-key-save, .live-key-change, .live-key-clear,
+  .memory-save-btn, .memory-clear-btn, .memory-clear-all-btn, .rows-omitted-rerun-btn,
+  .confirm-toggle, .flag-shortcut,
+  .icon-btn, .rail-btn, .status-panel-close, .memory-panel-close, .um-segment button
+):active:not(:disabled) {
+  transform: translateY(1px);
+  box-shadow: var(--btn-shadow-press);
+}
+
+/* Keyboard focus must still be visible above the raised shadow. */
+:is(
+  .btn, .btn-ask, .assistant .btn-ask, .btn-new-session, .btn-primary, .btn-ghost,
+  .sample, .start-example, .clarify-opt, .chip-editor .btn-apply, .chip-editor .btn-cancel,
+  .btn-copy, .btn-export, .view-btn, .story-opt, .failure-action-btn, .feedback-submit,
+  .live-key-save, .live-key-change, .live-key-clear,
+  .memory-save-btn, .memory-clear-btn, .memory-clear-all-btn, .rows-omitted-rerun-btn,
+  .confirm-toggle, .flag-shortcut,
+  .icon-btn, .rail-btn, .status-panel-close, .memory-panel-close, .um-segment button
+):focus-visible {
+  outline: none;
+  box-shadow: var(--btn-shadow), var(--focus-ring);
+}
+
+/* Primary fills stay flat: one colour, no gradient, no glow. */
+.btn-primary {
+  background: var(--teal);
+  color: var(--on-accent);
+}
+.btn-primary:hover { background: var(--teal-d); }
+/* A pill beside the composer, not a stretched lozenge: the ask button sits
+ * on the field's bottom edge and keeps the pill's own height. */
+.assistant .btn-ask {
+  align-self: flex-end;
+  min-inline-size: 104px;
+  block-size: 46px;
+  border-radius: var(--btn-radius);
+  background: #34d399;
+  color: #052033;
+}
+.assistant .btn-ask:hover { background: #6ee7b7; }
+
+/* The active rail item is a pressed pill, not a glowing one. */
+.rail-btn.is-active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  box-shadow: var(--btn-shadow), inset 0 0 0 1px color-mix(in srgb, var(--accent-bright) 32%, transparent);
+}
+
+/* Segmented time range: a raised track with a raised active pill. */
+.range-tabs { border-color: transparent; box-shadow: var(--btn-shadow); }
+
+/* ── Answer rating: like / dislike ────────────────────────────────────
+ * Two icon-only buttons under the answer. The pair answers with colour on
+ * hover — green for the like, red for the dislike — and the chosen one
+ * fills. The words live in each button's accessible name (see
+ * render/confirmation.js and render/turn.js). */
+.confirm-toggle,
+.flag-shortcut {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  inline-size: 44px;
+  min-inline-size: 0;
+  block-size: 36px;
+  min-block-size: 36px;
+  padding: 0;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--muted);
+}
+.confirm-toggle svg,
+.flag-shortcut svg { width: 18px; height: 18px; }
+
+.confirm-toggle:hover:not(:disabled) {
+  border-color: var(--status-good);
+  background: var(--status-good-bg);
+  color: var(--status-good-ink);
+  box-shadow: var(--btn-shadow-hover), 0 0 0 3px color-mix(in srgb, var(--status-good) 20%, transparent);
+}
+.confirm-toggle[aria-pressed="true"] {
+  border-width: 1px;
+  border-color: var(--status-good);
+  background: var(--status-good);
+  color: #fff;
+  padding: 0;
+  box-shadow: var(--btn-shadow), 0 0 0 3px color-mix(in srgb, var(--status-good) 18%, transparent);
+}
+.flag-shortcut:hover:not(:disabled) {
+  border-color: var(--status-critical);
+  background: var(--status-critical-bg);
+  color: var(--status-critical-ink);
+  box-shadow: var(--btn-shadow-hover), 0 0 0 3px color-mix(in srgb, var(--status-critical) 20%, transparent);
+}
+.flag-shortcut[aria-pressed="true"],
+.flag-shortcut.is-flagged {
+  border-width: 1px;
+  border-color: var(--status-critical);
+  background: var(--status-critical);
+  color: #fff;
+  padding: 0;
+  box-shadow: var(--btn-shadow), 0 0 0 3px color-mix(in srgb, var(--status-critical) 18%, transparent);
+}
+
+/* Motion preferences: no lift, no press travel, no gold shine. */
+@media (prefers-reduced-motion: reduce) {
+  .step.is-gold.running,
+  .stage-strip-item.is-gold.running { animation: none; }
+  :is(
+    .btn, .btn-ask, .assistant .btn-ask, .btn-new-session, .btn-primary, .btn-ghost,
+    .sample, .start-example, .clarify-opt, .btn-copy, .btn-export, .view-btn, .story-opt,
+    .failure-action-btn, .feedback-submit, .live-key-save, .live-key-change, .live-key-clear,
+    .memory-save-btn, .memory-clear-btn, .memory-clear-all-btn,
+    .confirm-toggle, .flag-shortcut, .icon-btn, .rail-btn, .status-panel-close,
+    .memory-panel-close, .um-segment button
+  ) { transition: none; }
 }
