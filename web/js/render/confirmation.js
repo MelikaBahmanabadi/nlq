@@ -11,12 +11,11 @@
  * a confirmation of anything else with a 409, and a button that can only
  * fail is worse than none.
  *
- * Accessibility: a real <button> (keyboard reachable, Enter/Space) showing
- * only a thumb-up glyph, with `aria-pressed` carrying the state and an
- * `aria-label` naming the action (plus its withdraw variant). The visible
- * state is a filled green surface, a ring and a pressed shadow — not colour
- * alone. Failures are written into a role="status" line, so a screen reader
- * hears them.
+ * Accessibility: a real <button> (keyboard reachable, Enter/Space), with
+ * `aria-pressed` carrying the state. The label stays the same word in both
+ * states — the ARIA toggle-button pattern — and the visible state is a
+ * check mark plus a border, not colour alone. Failures are written into a
+ * role="status" line, so a screen reader hears them.
  *
  * Mirrors appdb/confirmations.py; the endpoint is
  * POST/DELETE /v2/sessions/{sid}/turns/{tid}/confirmation.
@@ -24,25 +23,8 @@
 
 "use strict";
 
-import { icon } from "../icons.js";
-
-/** The control is icon-only (a like button, beside a dislike one), so the
- * wording lives in its accessible name rather than on the surface. */
-const LABELS = {
-  fa: {
-    confirm: "پاسخ درست است",
-    confirmed: "پاسخ درست است — برای برداشتن تأیید بزنید",
-  },
-  en: {
-    confirm: "This answer is correct",
-    confirmed: "Marked correct — press to withdraw",
-  },
-};
-
-/** @returns {"fa"|"en"} the language the shell set on <html lang>. */
-function lang() {
-  return document.documentElement && document.documentElement.lang === "en" ? "en" : "fa";
-}
+const LABEL = "پاسخ درست است";
+const CHECK = "✓";
 
 function el(tag, className, text) {
   const e = document.createElement(tag);
@@ -92,7 +74,6 @@ export function renderConfirmationControl(turn, handlers) {
 
   const button = el("button", "confirm-toggle");
   button.type = "button";
-  button.appendChild(icon("thumbUp", { size: 17 }));
   root.appendChild(button);
 
   const status = el("div", "confirmation-status");
@@ -103,12 +84,9 @@ export function renderConfirmationControl(turn, handlers) {
   let confirmed = false;
 
   function paint() {
-    const words = LABELS[lang()];
-    const name = confirmed ? words.confirmed : words.confirm;
     button.setAttribute("aria-pressed", String(confirmed));
     button.className = confirmed ? "confirm-toggle is-confirmed" : "confirm-toggle";
-    button.setAttribute("aria-label", name);
-    button.title = name;
+    button.textContent = confirmed ? `${CHECK} ${LABEL}` : LABEL;
   }
 
   function setConfirmed(value) {

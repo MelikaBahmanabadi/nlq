@@ -5,10 +5,9 @@
 "use strict";
 
 /* The interpretation stage is the product's premium step — the one that
- * costs the analyst rows of their own result — so it gets its own mark (a
- * brain). It otherwise sits in the same row of plain stage pills as the
- * mechanics; the gold shine below is applied by the stylesheet only while
- * the run is ON this step. */
+ * costs the analyst rows of their own result — so it gets its own mark
+ * (a brain) and the gold treatment instead of sitting in the same row of
+ * plain stage pills as the mechanics. */
 const BRAIN_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/></svg>';
 
 const STEPS = [
@@ -16,7 +15,7 @@ const STEPS = [
   { key: "generate", label: "تولید — ساخت SQL با مدل زبانی محلی" },
   { key: "validate", label: "اعتبارسنجی — لایهٔ نگهبانی امنیتی و سقف ردیف" },
   { key: "execute", label: "اجرا — روی پایگاه‌داده" },
-  { key: "interpret", label: "تفسیر — خلاصهٔ ساده‌شدهٔ نتیجه", icon: BRAIN_ICON, gold: true },
+  { key: "interpret", label: "تفسیر — خلاصهٔ ساده‌شدهٔ نتیجه", gold: true, icon: BRAIN_ICON },
 ];
 
 /** The connector between two stages: an arrow, never a number — the

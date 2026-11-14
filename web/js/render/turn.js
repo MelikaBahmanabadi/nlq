@@ -47,25 +47,6 @@ function el(tag, className, text) {
  * already set on <html lang> via i18n.js's applyLang. */
 const GUARD_WORD = { fa: ["مجاز", "غیرمجاز"], en: ["Allowed", "Blocked"] };
 
-/** Accessible names for the two answer-rating buttons, per document language.
- * Both are icon-only (thumb up / thumb down), so the words live in the
- * button's name instead of on its surface. */
-const RATING_WORD = {
-  fa: {
-    dislike: "پاسخ نادرست است",
-    dislikeFlagged: "گزارش شد — برای دیدن فرم گزارش بزنید",
-  },
-  en: {
-    dislike: "This answer is wrong",
-    dislikeFlagged: "Reported — open the report form",
-  },
-};
-
-/** @returns {"fa"|"en"} */
-function uiLang() {
-  return document.documentElement && document.documentElement.lang === "en" ? "en" : "fa";
-}
-
 /** The card's own chrome (panel titles and the buttons inside them), per
  * document language — same reason and same source as GUARD_WORD. Only the
  * shell around the answer is translated; the answer itself, the SQL and
@@ -522,12 +503,10 @@ function isGuardRejected(turn) {
 
 /**
  * The «پاسخ نادرست است» button in the result footer, beside «پاسخ درست
- * است». It is icon-only — a thumb down twin of the thumb-up confirmation —
- * and pressing it calls *onOpen*, which opens the flag form further down
- * the card; the report itself is still sent from that form. Once a report
- * is sent the button fills red with a ring and its accessible name says so
- * (state never rests on colour alone); a later confirmation that replaces
- * the report clears it again.
+ * است». Pressing it calls *onOpen*, which opens the flag form further down
+ * the card; the report itself is still sent from that form. Once a report is sent
+ * the button says so with a check mark (text, not colour alone); a later
+ * confirmation that replaces the report clears it again.
  *
  * @param {() => void} onOpen
  * @returns {HTMLButtonElement} carrying `setFlagged(boolean)`.
@@ -535,14 +514,9 @@ function isGuardRejected(turn) {
 function renderFlagShortcut(onOpen) {
   const button = el("button", "flag-shortcut");
   button.type = "button";
-  button.appendChild(icon("thumbDown", { size: 17 }));
   function setFlagged(flagged) {
-    const words = RATING_WORD[uiLang()];
     button.className = flagged ? "flag-shortcut is-flagged" : "flag-shortcut";
-    button.setAttribute("aria-pressed", String(flagged));
-    const name = flagged ? words.dislikeFlagged : words.dislike;
-    button.setAttribute("aria-label", name);
-    button.title = name;
+    button.textContent = flagged ? "✓ گزارش شد" : "پاسخ نادرست است";
   }
   button.addEventListener("click", () => onOpen());
   setFlagged(false);
